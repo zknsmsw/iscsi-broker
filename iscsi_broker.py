@@ -1398,6 +1398,11 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 return
             self._do_mkdir(form, s)
             return
+        if path == "/web/delete":
+            if not self._role_gate(s, "user"):
+                return
+            self._do_delete(form, s)
+            return
         if path in ("/web/users/quota", "/web/settings", "/web/common/delete",
                     "/web/create", "/web/password"):
             if not self._role_gate(s, "admin"):
@@ -1534,12 +1539,19 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             cloud_store.VIRTUAL_COMMON + "/")
         rows = []
         for f in listing["folders"]:
-            rows.append('<tr><td><a href="/web/drive?p=' + urllib.parse.quote(f["rel"], safe="")
-                        + '">' + html.escape(f["name"]) + '/</a></td><td>—</td><td></td></tr>')
+            cell = ('<a href="/web/drive?p=' + urllib.parse.quote(f["rel"], safe="")
+                    + '">' + html.escape(f["name"]) + '/</a>')
+            if f["rel"] == cloud_store.VIRTUAL_COMMON:
+                # 虚拟“通用文件”入口：只读区，不提供删除
+                rows.append('<tr><td>' + cell + '</td><td>—</td><td></td></tr>')
+            else:
+                rows.append('<tr><td>' + cell + '</td><td>—</td><td>'
+                            + self._delete_form(f["rel"], folder=True) + '</td></tr>')
         for fl in listing["files"]:
             rows.append('<tr><td>' + html.escape(fl["name"]) + '</td><td>'
                         + _human_size(fl["size"]) + '</td><td><a href="/web/download?p='
-                        + urllib.parse.quote(fl["rel"], safe="") + '">下载</a></td></tr>')
+                        + urllib.parse.quote(fl["rel"], safe="") + '">下载</a>'
+                        + self._delete_form(fl["rel"]) + '</td></tr>')
         for it in listing["common"]:
             p = cloud_store.resolve(user, it["rel"])
             if p is not None and os.path.isdir(p):
@@ -1555,7 +1567,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                  + table_rows + '</table>')
         msg_html = ''
         if msg:
-            cls = 'ok' if (msg.startswith("上传成功") or msg.startswith("创建成功")) else 'err'
+            cls = 'ok' if (msg.startswith("上传成功") or msg.startswith("创建成功")
+                           or msg.startswith("删除成功")) else 'err'
             msg_html = '<p class="' + cls + '">' + html.escape(msg) + '</p>'
         if in_common:
             # 通用文件区只读：无上传/新建表单
@@ -1607,6 +1620,36 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         rel = form.get("p", [""])[0]
         _ok, msg = cloud_store.create_folder(s["user"], rel, name)
         back = "/web/drive" + (("?p=" + urllib.parse.quote(rel, safe="")) if rel else "")
+        self._redirect(back + (("&" if "?" in back else "?") + "msg="
+                               + urllib.parse.quote(msg, safe="")))
+
+    def _delete_form(self, rel, folder=False):
+        """网盘条目删除表单（POST /web/delete）：隐藏路径 + CSRF + 确认提示。"""
+        s = self._session()
+        if not s or not rel:
+            return ""
+        tip = "确定删除该文件夹及其全部内容？此操作不可恢复" if folder \
+            else "确定删除该文件？此操作不可恢复"
+        return ('<form method="post" action="/web/delete" class="inline-form" '
+                'onsubmit="return confirm(\'' + tip + '\')">'
+                + self._csrf_hidden()
+                + '<input type="hidden" name="p" value="' + html.escape(rel) + '">'
+                + '<input type="submit" value="' + ('删除文件夹' if folder else '删除')
+                + '"></form>')
+
+    def _do_delete(self, form, s):
+        rel = form.get("p", [""])[0]
+        target = cloud_store.resolve(s["user"], rel)
+        if target is not None and os.path.isdir(target) and not os.path.islink(target):
+            _ok, msg = cloud_store.delete_folder(s["user"], rel)
+        else:
+            _ok, msg = cloud_store.delete_file(s["user"], rel)
+        # 删除后回到父目录（被删的文件夹本身已不存在，不能停留其中）；
+        # rel 含 ".." 等非法成分时父目录也非法，退回根目录显示错误消息
+        parent = os.path.dirname(rel.rstrip("/")) if rel else ""
+        if parent and cloud_store.resolve(s["user"], parent) is None:
+            parent = ""
+        back = "/web/drive" + (("?p=" + urllib.parse.quote(parent, safe="")) if parent else "")
         self._redirect(back + (("&" if "?" in back else "?") + "msg="
                                + urllib.parse.quote(msg, safe="")))
 

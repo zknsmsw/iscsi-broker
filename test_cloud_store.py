@@ -233,6 +233,108 @@ if symlink_ok:
           all(f["name"] != "link_out" for f in r["folders"] + r["files"]))
     os.unlink(os.path.join(base, "link_out"))
 
+# ---------- 用户删除：delete_file / delete_folder ----------
+ok, msg = upload("alice", "", [("file", b"del_a.txt", b"AAA")], 10**9)
+check("删除测试准备上传", ok)
+ok, msg = upload("alice", "docs", [("file", b"del_sub.txt", b"BBB")], 10**9)
+check("删除测试准备上传子目录", ok)
+ok, msg = cs.create_folder("alice", "", "del_dir")
+check("删除测试准备建目录", ok)
+ok, msg = upload("alice", "del_dir", [("file", b"inner.bin", b"IIIIII")], 10**9)
+check("删除测试准备上传目录内", ok)
+
+ok, msg = cs.delete_file("alice", "del_a.txt")
+check("delete_file 成功", ok and msg == "删除成功"
+      and not os.path.exists(os.path.join(base, "del_a.txt")))
+ok, msg = cs.delete_file("alice", "del_a.txt")
+check("delete_file 不存在", not ok and msg == "文件不存在")
+ok, msg = cs.delete_file("alice", "docs/del_sub.txt")
+check("delete_file 子目录文件", ok
+      and not os.path.exists(os.path.join(base, "docs", "del_sub.txt")))
+ok, msg = cs.delete_file("alice", "docs")
+check("delete_file 目录被拒", not ok and msg == "文件不存在")
+ok, msg = cs.delete_file("alice", "")
+check("delete_file 根被拒", not ok and msg == "路径不合法")
+ok, msg = cs.delete_file("alice", "通用文件")
+check("delete_file 通用文件只读", not ok and msg == "通用文件为只读")
+ok, msg = cs.delete_file("alice", "通用文件/x.txt")
+check("delete_file 通用文件只读2", not ok and msg == "通用文件为只读")
+ok, msg = cs.delete_file("alice", "../bob/x")
+check("delete_file 拒绝 ..", not ok and msg == "路径不合法")
+ok, msg = cs.delete_file("alice", "a/../b")
+check("delete_file 拒绝 a/../b", not ok and msg == "路径不合法")
+ok, msg = cs.delete_file("alice", "/etc/passwd")
+check("delete_file 拒绝绝对路径", not ok and msg == "路径不合法")
+ok, msg = cs.delete_file("alice", "a\\..\\x")
+check("delete_file 拒绝反斜杠", not ok and msg == "路径不合法")
+ok, msg = cs.delete_file("alice", "bad\x00name")
+check("delete_file 拒绝空字节", not ok and msg == "路径不合法")
+
+ok, msg = cs.delete_folder("alice", "del_dir")
+check("delete_folder 递归成功", ok and msg == "删除成功"
+      and not os.path.exists(os.path.join(base, "del_dir")))
+ok, msg = cs.delete_folder("alice", "del_dir")
+check("delete_folder 不存在", not ok and msg == "文件夹不存在")
+ok, msg = upload("alice", "", [("file", b"del_b.txt", b"B")], 10**9)
+ok, msg = cs.delete_folder("alice", "del_b.txt")
+check("delete_folder 文件被拒", not ok and msg == "文件夹不存在")
+ok, msg = cs.delete_file("alice", "del_b.txt")
+check("delete_folder 文件被拒后清理", ok)
+ok, msg = cs.delete_folder("alice", "")
+check("delete_folder 根被拒", not ok and msg == "路径不合法")
+ok, msg = cs.delete_folder("alice", ".")
+check("delete_folder 点被拒", not ok and msg == "路径不合法")
+ok, msg = cs.delete_folder("alice", "通用文件")
+check("delete_folder 通用文件只读", not ok and msg == "通用文件为只读")
+ok, msg = cs.delete_folder("alice", "../bob")
+check("delete_folder 拒绝 ..", not ok and msg == "路径不合法")
+ok, msg = cs.delete_folder("alice", "/tmp")
+check("delete_folder 拒绝绝对路径", not ok and msg == "路径不合法")
+ok, msg = cs.delete_folder("alice", "a\\b")
+check("delete_folder 拒绝反斜杠", not ok and msg == "路径不合法")
+
+# 删除不影响其他用户 / 通用文件区
+ok, msg = upload("alice", "docs", [("file", b"del_sub.txt", b"BBB")], 10**9)
+check("跨用户测试准备重新上传", ok)
+ok, msg = cs.delete_file("bob", "docs/del_sub.txt")
+check("delete_file 他人文件不可删", not ok)
+check("他人文件仍在", os.path.exists(os.path.join(base, "docs", "del_sub.txt")))
+
+# 删除后配额回落
+q0 = cs.quota_used("alice")
+with open(os.path.join(base, "docs", "q.bin"), "wb") as f:
+    f.write(b"0123456789")
+ok, msg = cs.delete_file("alice", "docs/q.bin")
+check("删除后配额回落", ok and cs.quota_used("alice") == q0)
+
+if symlink_ok:
+    # 1) 目标本身是符号链接：拒绝删除
+    os.symlink(ROOT, os.path.join(base, "link_out"))
+    ok, msg = cs.delete_file("alice", "link_out")
+    check("delete_file 拒绝符号链接", not ok and msg == "不支持删除符号链接")
+    ok, msg = cs.delete_folder("alice", "link_out")
+    check("delete_folder 拒绝符号链接", not ok and msg == "不支持删除符号链接")
+    os.unlink(os.path.join(base, "link_out"))
+    # 2) 中间成分符号链接指向目录外：realpath 二次校验拒绝，目标不被删除
+    os.makedirs(os.path.join(ROOT, "outside"), exist_ok=True)
+    outside_f = os.path.join(ROOT, "outside", "secret.txt")
+    with open(outside_f, "wb") as f:
+        f.write(b"SECRET")
+    os.symlink(os.path.join(ROOT, "outside"), os.path.join(base, "sub_link"))
+    ok, msg = cs.delete_file("alice", "sub_link/secret.txt")
+    check("delete_file 中间链接逃逸拒绝", not ok and msg == "路径不合法")
+    check("delete_file 逃逸目标未删", os.path.exists(outside_f))
+    ok, msg = cs.delete_folder("alice", "sub_link")
+    check("delete_folder 中间链接逃逸拒绝", not ok and msg == "不支持删除符号链接")
+    check("delete_folder 逃逸目标未删", os.path.exists(os.path.join(ROOT, "outside")))
+    os.unlink(os.path.join(base, "sub_link"))
+    # 3) 目录内嵌套符号链接：递归删除只删链接本身，不进入其目标
+    os.makedirs(os.path.join(base, "nested"), exist_ok=True)
+    os.symlink(os.path.join(ROOT, "outside"), os.path.join(base, "nested", "sl"))
+    ok, msg = cs.delete_folder("alice", "nested")
+    check("delete_folder 嵌套链接安全删除", ok)
+    check("delete_folder 链接目标未删", os.path.exists(os.path.join(ROOT, "outside")))
+
 # ---------- quota_used ----------
 before = cs.quota_used("alice")
 with open(os.path.join(base, "docs", "size.bin"), "wb") as f:

@@ -21,7 +21,9 @@ cloud_store.py —— 个人网盘（云盘）存储模块（供 iscsi_broker.py
 使用前必须先调用 setup(cloud_root) 完成初始化。
 """
 
+import inspect
 import os
+import shutil
 import tempfile
 import urllib.parse
 
@@ -31,6 +33,15 @@ TMP_DIR_NAME = ".tmp"         # 上传临时目录名
 VIRTUAL_COMMON = "通用文件"   # 通用文件的虚拟文件夹名（rel 前缀）
 _CHUNK = 64 * 1024            # 流式读取分块大小
 _MAX_HEADER = 64 * 1024       # 单个 multipart part 头最大字节数（防滥用）
+
+# rmtree 的“不跟随符号链接”参数随 Python 版本变化：
+#   3.3–3.11：symlinks=False（默认即不跟随）
+#   3.12：    重写为 fd 安全实现（is_dir(follow_symlinks=False)+unlink），无该参数，默认即不跟随
+#   3.13+：   follow_symlinks（若默认跟随则必须显式传 False）
+# 这里在模块加载时探测一次，删除目录时显式要求“不跟随”，避免个别版本默认行为差异。
+_RMTREE_NOFOLLOW_KW = next(
+    (kw for kw in ("follow_symlinks", "symlinks")
+     if kw in inspect.signature(shutil.rmtree).parameters), None)
 
 
 class _QuotaExceeded(Exception):
@@ -91,16 +102,14 @@ def _inside(path, base) -> bool:
         return False
 
 
-def resolve(user: str, rel: str) -> str | None:
-    """把用户视角相对路径 rel 映射为磁盘绝对路径。
+def _map_path(user: str, rel: str):
+    """把 rel 映射为 (base_abs, norm_abs)；非法返回 None。
 
-    rel 为相对路径（"" = 根，子目录用 "/" 分隔）。安全规则：
+    base 为所在区域根目录（用户私有目录或 _common），norm 为 normpath 后的
+    绝对路径（未做 realpath，可能仍含符号链接成分）。安全规则与 resolve 一致：
     拒绝绝对路径、含 ".." 段、含反斜杠、含空字节；
-    normpath 后 commonpath 校验包含关系，再 realpath 二次校验（防符号链接逃逸）。
-    特殊：rel 为 "通用文件" 或 "通用文件/..." 时映射到 _common 下（只读区域）。
-    不合法返回 None。
+    normpath 后 commonpath 校验包含关系。
     """
-    _require_setup()
     rel = rel if rel is not None else ""
     if not isinstance(rel, str):
         return None
@@ -121,10 +130,27 @@ def resolve(user: str, rel: str) -> str | None:
     if any(p == ".." for p in parts):
         return None
     if not sub:
-        return os.path.abspath(base)
+        return os.path.abspath(base), os.path.abspath(base)
     norm = os.path.normpath(os.path.join(base, sub))
     if not _inside(norm, base):
         return None
+    return os.path.abspath(base), norm
+
+
+def resolve(user: str, rel: str) -> str | None:
+    """把用户视角相对路径 rel 映射为磁盘绝对路径。
+
+    rel 为相对路径（"" = 根，子目录用 "/" 分隔）。安全规则：
+    拒绝绝对路径、含 ".." 段、含反斜杠、含空字节；
+    normpath 后 commonpath 校验包含关系，再 realpath 二次校验（防符号链接逃逸）。
+    特殊：rel 为 "通用文件" 或 "通用文件/..." 时映射到 _common 下（只读区域）。
+    不合法返回 None。
+    """
+    _require_setup()
+    mapped = _map_path(user, rel)
+    if mapped is None:
+        return None
+    base, norm = mapped
     real = os.path.realpath(norm)
     if not _inside(real, os.path.realpath(base)):
         return None
@@ -630,6 +656,70 @@ def delete_common(name: str) -> (bool, str):
         return False, "文件不存在"
     try:
         os.unlink(target)
+    except OSError as e:
+        return False, "删除失败：%s" % e
+    return True, "删除成功"
+
+
+def delete_file(user: str, rel: str) -> (bool, str):
+    """删除用户私有目录下的普通文件（含子目录内文件）。
+
+    安全规则：拒绝根目录 / 通用文件只读区 / 绝对路径 / ".." 段 / 反斜杠 /
+    空字节 / 符号链接；删除前再经 realpath 二次校验，防止中间路径成分的
+    符号链接把删除目标引到用户目录之外。删除只作用于用户自己的目录，
+    不影响 _common 与其他用户。
+    """
+    _require_setup()
+    if not isinstance(rel, str) or rel in ("", ".", None):
+        return False, "路径不合法"
+    if rel == VIRTUAL_COMMON or rel.startswith(VIRTUAL_COMMON + "/"):
+        return False, "通用文件为只读"
+    mapped = _map_path(user, rel)
+    if mapped is None:
+        return False, "路径不合法"
+    base, norm = mapped
+    if os.path.islink(norm):
+        return False, "不支持删除符号链接"
+    if not os.path.isfile(norm):
+        return False, "文件不存在"
+    real = os.path.realpath(norm)
+    if not _inside(real, os.path.realpath(base)):
+        return False, "路径不合法"
+    try:
+        os.unlink(norm)
+    except OSError as e:
+        return False, "删除失败：%s" % e
+    return True, "删除成功"
+
+
+def delete_folder(user: str, rel: str) -> (bool, str):
+    """递归删除用户私有目录下的文件夹（含子目录内）。
+
+    安全规则同 delete_file；递归删除不跟随符号链接（follow_symlinks=False，
+    目录内的符号链接只删除链接本身、不进入其指向的目录），防止链接逃逸。
+    拒绝删除用户根目录。
+    """
+    _require_setup()
+    if not isinstance(rel, str) or rel in ("", ".", None):
+        return False, "路径不合法"
+    if rel == VIRTUAL_COMMON or rel.startswith(VIRTUAL_COMMON + "/"):
+        return False, "通用文件为只读"
+    mapped = _map_path(user, rel)
+    if mapped is None:
+        return False, "路径不合法"
+    base, norm = mapped
+    if os.path.islink(norm):
+        return False, "不支持删除符号链接"
+    if not os.path.isdir(norm):
+        return False, "文件夹不存在"
+    real = os.path.realpath(norm)
+    if not _inside(real, os.path.realpath(base)):
+        return False, "路径不合法"
+    try:
+        if _RMTREE_NOFOLLOW_KW:
+            shutil.rmtree(norm, **{_RMTREE_NOFOLLOW_KW: False})
+        else:
+            shutil.rmtree(norm)  # Python 3.12：fd 安全实现本身不跟随符号链接
     except OSError as e:
         return False, "删除失败：%s" % e
     return True, "删除成功"
