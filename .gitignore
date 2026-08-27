@@ -1,0 +1,20 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- 开发期测试残留空目录（Windows ACL 锁定的 mkdtemp 遗留，服务器端不存在）----
+probe_*/
+cloud_store_test_*/
+t4_selftest_*/
+p_mkdir_700/
+
+# ---- AgentTeams 插件内部状态（不入库）----
+.agent-teams/
+
+# ---- 运行时生成数据（服务器端产生，不入库）----
+*.tmp
+overlay_*.raw
+overlay_*.qcow2
