@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.parse, subprocess, os, datetime, hashlib, threading, glob, time, re, secrets, html, ssl
-import users_auth, cloud_store  # 本地模块：多账号认证（users_auth）+ 个人网盘/通用文件存储（cloud_store）
+import users_auth, cloud_store, netctrl  # 本地模块：多账号认证（users_auth）+ 个人网盘（cloud_store）+ 联网控制（netctrl）
 
 # ========== 请修改为你的实际绝对路径 ==========
 BASE_DIR = "/home/prts/server"   # 例如 /home/user/server
@@ -60,6 +60,19 @@ HTTPS_ENABLED = False
 HTTPS_CERT = ""   # 例如 /etc/letsencrypt/live/example.com/fullchain.pem
 HTTPS_KEY = ""    # 例如 /etc/letsencrypt/live/example.com/privkey.pem
 # ===================================================
+
+# =================== 联网控制（按 MAC 控制客户机上网） ===================
+# 服务器担任客户机网关（FORWARD 转发 + MASQUERADE）。本功能在 FORWARD 最前面挂
+# 专用链 NETCTRL，按客户机 MAC 放行/拒绝“内网→外网”流量；客户机开机自动建规则、
+# 关机规则空转、巡检自动清理，Web 后台可设默认行为与逐机开关。
+NETCTRL_ENABLED = True            # 是否启用联网控制
+NETCTRL_LAN_IF = ""               # 内网卡（接交换机）；留空自动探测（带默认路由的网卡=外网卡）
+NETCTRL_WAN_IF = ""               # 外网卡（接外网）；留空自动探测
+NETCTRL_FULL_TAKEOVER = True      # True=启动时清空并重建 FORWARD/POSTROUTING（旧的转发/NAT 手工规则被替换）
+                                  # False=只管理自己的 NETCTRL 链，不碰其他规则（与现有规则共存）
+NETCTRL_REJECT = True             # True=REJECT（客户机立即报“无法连接”）；False=DROP（静默丢弃，卡到超时才失败）
+NETCTRL_RECONCILE_INTERVAL = 30   # 规则巡检间隔（秒）：自动补齐新开机客户机规则、清理离线机器
+# ========================================================================
 
 # ------- 以下配置只影响“路线 B（qcow2 回退）”；路线 A 自动使用最合适的设置 -------
 QCOW2_CLUSTER_SIZE = "64K"        # qcow2 簇大小（默认 64K），与默认一致，无副作用
@@ -626,6 +639,16 @@ def idle_cleanup_worker():
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{now}] [ERROR] idle_cleanup_worker: {e}")
 
+def netctrl_reconcile_worker():
+    """联网控制巡检：周期对齐转发规则（新开机/离线客户机自动增删规则）。"""
+    while True:
+        time.sleep(NETCTRL_RECONCILE_INTERVAL)
+        try:
+            netctrl.reconcile_once(list(get_client_ips()))
+        except Exception as e:
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{now}] [ERROR] netctrl_reconcile_worker: {e}")
+
 # =================== Web 管理后台：会话与页面辅助 ===================
 SESSION_TTL = 12 * 3600       # 后台登录会话有效期（秒）
 
@@ -689,7 +712,7 @@ a{color:#2563eb;text-decoration:none;margin-right:14px}
 NAV_ADMIN = ('<p><a href="/">客户机名单</a><a href="/web/create">创建空白盘</a>'
              '<a href="/web/password">修改密码</a><a href="/web/users">用户与配额</a>'
              '<a href="/web/common">通用文件</a><a href="/web/settings">默认配额</a>'
-             '<a href="/web/logout">退出登录</a></p>')
+             '<a href="/web/netctrl">联网控制</a><a href="/web/logout">退出登录</a></p>')
 NAV_USER = ('<p><a href="/web/drive">我的网盘</a><a href="/web/logout">退出登录</a></p>')
 
 def _page_html(title, body, nav=None):
@@ -882,6 +905,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(400)
                 return
 
+            # 联网控制：客户机开机（PXE 请求供给）即确保/覆写其转发规则
+            try:
+                netctrl.on_client_boot(mac)
+            except Exception:
+                pass
+
             # 镜像名：来自 URL 参数 ?img=xxx，仅取文件名部分防止路径穿越（如 ../../etc）
             img_name = os.path.basename(params.get("img", [DEFAULT_IMAGE])[0])
             base_img = os.path.join(IMAGES_DIR, f"{img_name}.raw")
@@ -1064,6 +1093,11 @@ class Handler(BaseHTTPRequestHandler):
             mac = params.get("mac", [""])[0].replace(":", "").strip().lower()
             tok = params.get("tok", [""])[0]
             img_name = os.path.basename(params.get("img", [""])[0])
+            # 联网控制：回写模式开机同样触发规则对齐
+            try:
+                netctrl.on_client_boot(mac)
+            except Exception:
+                pass
             host = self.headers['Host']
             if not mac or not admin_token_ok(mac, tok):
                 now_dbg = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1348,7 +1382,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._do_download(s)
             return
         if path in ("/web/users", "/web/settings", "/web/common", "/web/create",
-                    "/web/password", "/web/common/download"):
+                    "/web/password", "/web/common/download", "/web/netctrl"):
             s = self._session()
             if not self._role_gate(s, "admin"):
                 return
@@ -1360,6 +1394,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._users_page(params.get("msg", [""])[0] or None)
             elif path == "/web/settings":
                 self._settings_page(params.get("msg", [""])[0] or None)
+            elif path == "/web/netctrl":
+                self._netctrl_page(params.get("msg", [""])[0] or None)
             elif path == "/web/common":
                 self._common_page(params.get("msg", [""])[0] or None)
             else:
@@ -1404,13 +1440,18 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             self._do_delete(form, s)
             return
         if path in ("/web/users/quota", "/web/settings", "/web/common/delete",
-                    "/web/create", "/web/password"):
+                    "/web/create", "/web/password",
+                    "/web/netctrl/default", "/web/netctrl/mac"):
             if not self._role_gate(s, "admin"):
                 return
             if path == "/web/users/quota":
                 self._do_users_quota(form)
             elif path == "/web/settings":
                 self._do_settings(form)
+            elif path == "/web/netctrl/default":
+                self._do_netctrl_default(form)
+            elif path == "/web/netctrl/mac":
+                self._do_netctrl_mac(form)
             elif path == "/web/common/delete":
                 self._do_common_delete(form)
             elif path == "/web/create":
@@ -1759,6 +1800,88 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             _ok, msg = users_auth.set_default_quota(bytes_n)
         self._redirect("/web/settings?msg=" + urllib.parse.quote(msg, safe=""))
 
+    # ---------- 管理员：联网控制 ----------
+    def _netctrl_page(self, msg=None):
+        if not netctrl.ready():
+            body = ('<div class="card"><p class="err">联网控制未启用。</p>'
+                    '<p class="small">原因可能是 NETCTRL_ENABLED=False，或启动时网卡自动探测失败'
+                    '（请查看服务器日志，或在配置里显式指定 NETCTRL_LAN_IF / NETCTRL_WAN_IF）。</p></div>')
+            self._send_html(_page_html("联网控制", body, NAV_ADMIN))
+            return
+        cur = netctrl.get_default()
+        msg_html = ''
+        if msg:
+            ok = not (msg.startswith("MAC") or msg.startswith("参数"))
+            msg_html = '<p class="' + ('ok' if ok else 'err') + '">' + html.escape(msg) + '</p>'
+        def_radio = ''.join(
+            '<label><input type="radio" name="default" value="' + v + '"'
+            + (' checked' if cur == v else '') + '>' + label + '</label>&nbsp;&nbsp;'
+            for v, label in (("allow", "默认允许联网"), ("deny", "默认禁止联网")))
+        body = ('<div class="card"><h2>默认行为（未手动设置的客户机）</h2>' + msg_html
+                + '<form method="post" action="/web/netctrl/default">' + self._csrf_hidden()
+                + '<p>' + def_radio + '</p>'
+                + '<p><input type="submit" value="保存默认行为"></p></form></div>')
+        conns = get_client_ips()   # mac -> ip（当前有 iSCSI 连接的客户机）
+        rows = []
+        for r in netctrl.known_clients(conns):
+            mac = r["mac"]
+            st = '<span class="ok">在线</span>' if r["online"] else '离线'
+            pol = (('允许' if r["policy"] == "allow" else '禁止') + '（' + r["src"] + '）')
+            acts = ('<form method="post" action="/web/netctrl/mac" class="inline-form">'
+                    + self._csrf_hidden()
+                    + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
+                    + '<input type="hidden" name="action" value="allow">'
+                    + '<input type="submit" value="允许"></form>'
+                    + '<form method="post" action="/web/netctrl/mac" class="inline-form">'
+                    + self._csrf_hidden()
+                    + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
+                    + '<input type="hidden" name="action" value="deny">'
+                    + '<input type="submit" value="禁止"></form>')
+            if r["src"] == "手动":
+                acts += ('<form method="post" action="/web/netctrl/mac" class="inline-form">'
+                         + self._csrf_hidden()
+                         + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
+                         + '<input type="hidden" name="action" value="remove">'
+                         + '<input type="submit" value="恢复默认"></form>')
+            rows.append('<tr><td>' + html.escape(mac) + '</td><td>' + html.escape(r["ip"])
+                        + '</td><td>' + st + '</td><td>' + pol + '</td><td>' + acts + '</td></tr>')
+        table = ('<table><tr><th>MAC</th><th>IP</th><th>状态</th><th>生效策略</th><th>操作</th></tr>'
+                 + ("".join(rows) if rows else '<tr><td colspan="5">暂无客户机记录</td></tr>')
+                 + '</table>')
+        body += ('<div class="card"><h2>客户机联网控制</h2>' + table
+                 + '<p class="small">列表 = 手动设置过的机器 + 当前在线机器。'
+                 + '“允许/禁止”立即生效；“恢复默认”后按上面的默认行为执行。'
+                 + '客户机开机时规则自动建立，关机自动清理。</p></div>')
+        body += ('<div class="card"><h2>手动添加客户机</h2>'
+                 + '<form method="post" action="/web/netctrl/mac">' + self._csrf_hidden()
+                 + '<p>MAC（支持 aa:bb:cc:dd:ee:ff 或 aabbccddeeff）：'
+                 + '<input type="text" name="mac" placeholder="aa:bb:cc:dd:ee:ff" maxlength="17"></p>'
+                 + '<p><select name="action"><option value="allow">允许联网</option>'
+                 + '<option value="deny">禁止联网</option></select>'
+                 + '&nbsp;<input type="submit" value="添加/设置"></p></form>'
+                 + '<p class="small">手动添加用于：从未上线的机器（如未装机的新客户机）预先设好策略。</p></div>')
+        sts = netctrl.status_texts()
+        body += ('<div class="card"><h2>当前转发规则（只读）</h2>'
+                 + '<p class="small">本模块托管 FORWARD 与 POSTROUTING；接管/改动前自动备份到 netctrl_backup/。</p>'
+                 + '<h2>FORWARD</h2><pre>' + html.escape(sts["forward"]) + '</pre>'
+                 + '<h2>NETCTRL（联网控制）</h2><pre>' + html.escape(sts["netctrl"]) + '</pre>'
+                 + '<h2>NAT POSTROUTING</h2><pre>' + html.escape(sts["nat"]) + '</pre></div>')
+        self._send_html(_page_html("联网控制", body, NAV_ADMIN))
+
+    def _do_netctrl_default(self, form):
+        mode = form.get("default", [""])[0]
+        msg = netctrl.set_default(mode)
+        self._redirect("/web/netctrl?msg=" + urllib.parse.quote(msg, safe=""))
+
+    def _do_netctrl_mac(self, form):
+        mac = form.get("mac", [""])[0].strip()
+        action = form.get("action", [""])[0]
+        if action == "remove":
+            msg = netctrl.remove_mac(mac)
+        else:
+            msg = netctrl.set_mac(mac, action)
+        self._redirect("/web/netctrl?msg=" + urllib.parse.quote(msg, safe=""))
+
     # ---------- 管理员：通用文件 ----------
     def _common_page(self, msg=None):
         files = cloud_store.common_list()
@@ -1836,6 +1959,13 @@ if __name__ == "__main__":
     users_auth.setup(OVERLAY_DIR, lambda pwd: verify_password(pwd, ADMIN_PW_STORED))
     cloud_store.setup(os.path.join(BASE_DIR, "cloud"))
     print(f"[{datetime.datetime.now()}] [START] Cloud drive: {os.path.join(BASE_DIR, 'cloud')}")
+
+    # 联网控制：接管转发/NAT（按客户机 MAC 控制上网），并启动规则巡检线程
+    if NETCTRL_ENABLED:
+        netctrl.setup(BASE_DIR, NETCTRL_LAN_IF, NETCTRL_WAN_IF,
+                      full_takeover=NETCTRL_FULL_TAKEOVER, reject=NETCTRL_REJECT)
+        if netctrl.init():
+            threading.Thread(target=netctrl_reconcile_worker, daemon=True).start()
 
     if os.geteuid() != 0:
         print("[WARN] 当前不是 root 运行！qemu-nbd 打开 /dev/nbdX 需要 root 权限。"

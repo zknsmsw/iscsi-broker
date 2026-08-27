@@ -10,6 +10,8 @@ probe_*/
 cloud_store_test_*/
 t4_selftest_*/
 p_mkdir_700/
+.test_tmp/
+tmp*/
 
 # ---- AgentTeams 插件内部状态（不入库）----
 .agent-teams/
@@ -23,3 +25,7 @@ overlay_*.qcow2
 #个人配置文件
 admin.conf
 users.conf
+
+#联网控制运行时数据（服务器端产生，不入库）
+netctrl.conf
+netctrl_backup/

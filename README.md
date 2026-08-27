@@ -31,10 +31,19 @@
 - **用户与配额**：逐用户调整存储配额。
 - **默认配额**：修改新注册账号的默认空间大小。
 - **通用文件**：上传 / 下载 / 删除通用文件。
+- **联网控制**：默认行为（允许/禁止）+ 逐客户机 允许/禁止/恢复默认，页面底部只读展示当前 FORWARD/NETCTRL/NAT 规则。
 
 ### 5. 空闲自动清理
 - 客户机正常 logout 后 target 空闲超时（默认 5 分钟）自动回收；
 - 无流量检测（`ss` lastrcv + `arping` L2 确认）识别关机/断电不主动断连的客户机，防资源泄漏。
+
+### 6. 联网控制（按 MAC 控制客户机上网）
+- 服务器担任客户机网关（FORWARD 转发 + MASQUERADE），本功能在 FORWARD 最前面挂专用链 **NETCTRL**，按客户机 **MAC** 放行/拒绝“内网→外网”流量；
+- **默认行为**：允许或禁止（对未手动设置的客户机生效）；
+- **逐机开关**：Web 后台可对每台客户机单独 允许 / 禁止 / 恢复默认，改动立即生效；
+- 客户机开机（iPXE 请求供给）自动建立/覆写规则，关机规则空转、巡检（默认 30 秒）自动清理“离线且无手动设置”的机器；
+- 被禁机器仍可 PXE/iPXE 无盘启动并使用 iSCSI 盘（只禁外网，不碰服务器自身服务）；客户机互访不受影响；
+- 规则改动前自动 `iptables-save` 快照备份到 `netctrl_backup/`（保留最近 20 份）。
 
 ---
 
@@ -45,7 +54,9 @@
 | `iscsi_broker.py` | **主程序**：两个 HTTP 服务（端口 5000 iPXE 供给脚本 / 端口 8080 Web 管理后台）+ iSCSI 供给、叠加盘、空闲清理、账号与网盘页面。 |
 | `users_auth.py` | **账号认证模块**：注册 / 登录校验 / 配额管理 / 默认配额，用户数据持久化到 `users.conf`、`cloud.conf`。 |
 | `cloud_store.py` | **网盘存储模块**：目录列表、上传（流式 multipart 解析）、下载、建文件夹、配额统计、通用文件管理，含路径穿越与符号链接防护。 |
+| `netctrl.py` | **联网控制模块**：`netctrl.conf` 状态读写、FORWARD/NAT 规则托管（iptables 按 MAC 过滤 + MASQUERADE）、开机/巡检规则对齐、改动前自动备份。 |
 | `test_cloud_store.py` | 网盘模块自测脚本（75 项断言），回归用。 |
+| `test_netctrl.py` | 联网控制模块逻辑自测（纯逻辑，不依赖 root/iptables）。 |
 
 ---
 
@@ -57,6 +68,8 @@
 ├── admin.conf                       ← 管理员密码（加盐 SHA256 哈希）
 ├── users.conf                       ← 注册用户列表（每行 用户名$sha256$salt$digest$配额）
 ├── cloud.conf                       ← 默认配额（一行 default_quota=<字节>）
+├── netctrl.conf                     ← 联网控制配置（一行 default=allow|deny + 每 MAC 一行 <mac>=allow|deny）
+├── netctrl_backup/                  ← iptables-save 快照（接管/改动前自动备份，保留最近 20 份）
 ├── cloud/                           ← 网盘数据根
 │   ├── <用户名>/                    ← 每个用户的私有目录
 │   ├── _common/                     ← 通用文件（对所有账号只读展示为"通用文件"）
@@ -80,6 +93,7 @@
 | Linux `nbd` 内核模块 | 路线 B 的 `/dev/nbdX` 块设备（`modprobe nbd max_part=8 nbds_max=16`） |
 | `iproute2`（`ss`、`ip`） | 无流量检测、路由选网卡 |
 | `arping`（iputils-arping） | L2 层在线确认 |
+| `iptables`（iptables-nft） | 联网控制：FORWARD 按 MAC 过滤 + NAT MASQUERADE |
 | `findmnt`（util-linux） | 检测文件系统类型（reflink 支持） |
 | `sysctl` | 启动时网络缓冲调优 |
 | XFS/btrfs 文件系统 | 路线 A reflink 直出（不支持自动回退路线 B） |
@@ -136,9 +150,26 @@ sudo python3 iscsi_broker.py
 | `NBD_MAX` | 16 | 路线 B 最大并发客户机数 |
 | `WEB_ENABLED` | `True` | 是否启用 Web 管理后台 |
 | `HTTPS_ENABLED` / `HTTPS_CERT` / `HTTPS_KEY` | `False` | 可选 HTTPS |
+| `NETCTRL_ENABLED` | `True` | 是否启用联网控制 |
+| `NETCTRL_LAN_IF` / `NETCTRL_WAN_IF` | 自动探测 | 内网卡（接交换机）/ 外网卡（接外网）；留空自动探测 |
+| `NETCTRL_FULL_TAKEOVER` | `True` | `True`=启动时清空并重建 FORWARD/POSTROUTING（旧转发/NAT 手工规则被替换）；`False`=只管理自己的链，与现有规则共存 |
+| `NETCTRL_REJECT` | `True` | `True`=REJECT（客户机立即报“无法连接”）；`False`=DROP（静默丢弃，卡到超时） |
+| `NETCTRL_RECONCILE_INTERVAL` | `30` | 规则巡检间隔（秒） |
 | 默认配额 | 1 GiB | 新注册账号配额，管理员可在后台修改 |
 
 **账号规则**：用户名 3-32 位 `[A-Za-z0-9_-]`（保留 `admin`）；密码 6-32 位同字符集；配额 1 字节 ~ 8 TiB。
+
+---
+
+## 六点五、联网控制说明
+
+- **原理**：客户机以服务器为网关，出外网流量必经 FORWARD。本功能在 FORWARD 第 1 条挂专用链 `NETCTRL`，按客户机 MAC 判定“内网→外网”流量：手动设置优先，其余按默认行为（allow/deny）兜底；NAT 回程（`RELATED,ESTABLISHED`）与 `MASQUERADE` 一并托管。
+- **规则生命周期**：客户机开机（PXE/iPXE 请求、ARP 邻居表出现、iSCSI 连接）→ 立即建立/覆写规则；关机 → 规则空转无害；巡检线程（`NETCTRL_RECONCILE_INTERVAL` 秒）自动清理“离线且无手动设置”的机器；Web 改策略立即生效并写入 `netctrl.conf`。
+- **接管模式**：`NETCTRL_FULL_TAKEOVER=True`（默认）时，启动会**清空 FORWARD 与 POSTROUTING 并重建托管规则**——旧的转发/NAT 手工规则（如原来手写的 `-A FORWARD ... ACCEPT`、`MASQUERADE`）会被替换，无需手动清理；如需与其他规则共存，设为 `False`（只管理自己的链）。
+- **REJECT vs DROP**：`NETCTRL_REJECT=True` 时被禁客户机**立即**收到“无法连接”（推荐）；`False` 时静默丢包，客户机卡到超时才失败。
+- **IPv6**：客户机不分配 IPv6；启动时关闭 IPv6 转发（`net.ipv6.conf.all.forwarding=0`），防止走 IPv6 绕过。
+- **限制**：MAC 可被伪造（二层局域网通病）；只控制“出外网”方向，不控制客户机互访；需 root 运行（项目本身要求）。
+- **备份**：接管/重建前自动 `iptables-save` 快照到 `netctrl_backup/`（保留 20 份），随时可还原。
 
 ---
 
@@ -157,10 +188,11 @@ sudo python3 iscsi_broker.py
 
 ```bash
 python test_cloud_store.py   # 网盘模块 75 项断言
-python -m py_compile iscsi_broker.py users_auth.py cloud_store.py
+python test_netctrl.py       # 联网控制模块逻辑断言（不依赖 root/iptables）
+python -m py_compile iscsi_broker.py users_auth.py cloud_store.py netctrl.py
 ```
 
-开发期验证记录：模块单测 75/75、Web 端到端（真实 HTTP 服务）35/35、账号/网盘/配额/通用文件冒烟 34/34 全部通过。
+开发期验证记录：模块单测 75/75、Web 端到端（真实 HTTP 服务）35/35、账号/网盘/配额/通用文件冒烟 34/34、联网控制逻辑 30 项全部通过。
 
 ---
 
