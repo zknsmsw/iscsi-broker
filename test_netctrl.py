@@ -139,15 +139,40 @@ def test_on_boot_and_reconcile():
     reset(_tmp())
     netctrl._ready = True
     cmds = []
-    restore = fake_runner(cmds, "10.0.1.5 dev lan0 lladdr 11:22:33:44:55:66 REACHABLE\n")
+    restore = fake_runner(cmds, "10.0.1.5 dev lan0 lladdr 00:11:22:33:44:55 REACHABLE\n")
     try:
-        netctrl.on_client_boot("112233445566")
-        check("开机记入缓存", "112233445566" in netctrl._recent_boots)
+        netctrl.on_client_boot("001122334455")
+        check("开机记入缓存", "001122334455" in netctrl._recent_boots)
         check("开机触发规则", any("--mac-source" in c for c in cmds))
         cmds.clear()
         netctrl._recent_boots.clear()
         netctrl.reconcile_once(["aabbccddeeff"])
         check("巡检合并连接+邻居表", any("--mac-source" in c and "aabbccddeeff" in c for c in cmds))
+    finally:
+        restore()
+
+def test_is_unicast():
+    print("[is_unicast]")
+    check("单播", netctrl._is_unicast("001122334455") is True)
+    check("组播(首字节奇数)", netctrl._is_unicast("333300000001") is False)
+    check("组播(0x11奇数)", netctrl._is_unicast("112233445566") is False)
+    check("广播", netctrl._is_unicast("ffffffffffff") is False)
+    check("空/非法", netctrl._is_unicast("") is False and netctrl._is_unicast(None) is False)
+
+def test_ignore_multicast_neighbor():
+    print("[ignore multicast neighbor]")
+    reset(_tmp(), default="allow", macs={})
+    netctrl._ready = True
+    cmds = []
+    # 邻居表同时出现 IPv6 组播(33:33:...) 和一台真实客户机单播 MAC
+    out = ("fe80::1 dev lan0 lladdr 33:33:00:00:00:01 router REACHABLE\n"
+           "10.0.1.5 dev lan0 lladdr 00:11:22:33:44:55 REACHABLE\n")
+    restore = fake_runner(cmds, out)
+    try:
+        netctrl._sync_locked()
+        mac_rules = [c for c in cmds if "--mac-source" in c]
+        check("只生成单播规则", len(mac_rules) == 1 and "001122334455" in mac_rules[0])
+        check("不生成组播规则", not any("333300000001" in c for c in cmds))
     finally:
         restore()
 
@@ -168,13 +193,13 @@ def test_known_clients():
     print("[known_clients]")
     reset(_tmp(), default="allow", macs={"001122334455": "deny"})
     netctrl._ready = True
-    restore = fake_runner([], "10.0.1.9 dev lan0 lladdr 99:88:77:66:55:44 REACHABLE\n")
+    restore = fake_runner([], "10.0.1.9 dev lan0 lladdr 00:99:88:77:66:55 REACHABLE\n")
     try:
         rows = netctrl.known_clients({"aabbccddeeff": "10.0.1.8"})
         macs = {r["mac"] for r in rows}
-        check("包含手动+在线+连接", {"001122334455", "998877665544", "aabbccddeeff"} <= macs)
+        check("包含手动+在线+连接", {"001122334455", "009988776655", "aabbccddeeff"} <= macs)
         by = {r["mac"]: r for r in rows}
-        check("在线状态", by["998877665544"]["online"] is True and by["001122334455"]["online"] is False)
+        check("在线状态", by["009988776655"]["online"] is True and by["001122334455"]["online"] is False)
         check("IP来源", by["aabbccddeeff"]["ip"] == "10.0.1.8")
         check("策略来源", by["001122334455"]["src"] == "手动" and by["aabbccddeeff"]["src"] == "默认")
     finally:
@@ -190,6 +215,8 @@ def main():
         test_reject_drop_switch()
         test_set_mac_and_remove()
         test_on_boot_and_reconcile()
+        test_is_unicast()
+        test_ignore_multicast_neighbor()
         test_build_base_rules()
         test_known_clients()
         print()

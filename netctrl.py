@@ -72,6 +72,12 @@ def normalize_mac(mac):
     return m if _MAC_RE.match(m) else None
 
 
+def _is_unicast(mac12):
+    """仅接受单播 MAC。iptables `--mac-source` 会拒绝组播/广播地址（如 IPv6 邻居表里的 33:33:xx），
+    这里在写入规则前过滤掉，避免一条坏 MAC 让整条链构建失败。"""
+    return bool(mac12) and len(mac12) == 12 and not (int(mac12[:2], 16) & 1)
+
+
 # ---------- 初始化 / 配置读写 ----------
 
 def setup(base_dir, lan_if="", wan_if="", full_takeover=True, reject=True):
@@ -209,7 +215,7 @@ def _neigh_macs():
             m = re.search(r"lladdr\s+([0-9a-f:]+)", line)
             if m:
                 mac = normalize_mac(m.group(1))
-                if mac:
+                if mac and _is_unicast(mac):
                     macs.add(mac)
     except Exception:
         pass
@@ -226,7 +232,7 @@ def _desired_rules():
         else:
             macs.add(m)
     macs |= _neigh_macs()
-    rules = sorted((m, _effective_locked(m)) for m in macs)
+    rules = sorted((m, _effective_locked(m)) for m in macs if _is_unicast(m))
     return rules, _cfg["default"]
 
 
@@ -396,7 +402,7 @@ def known_clients(conns=None):
             m = re.search(r"lladdr\s+([0-9a-f:]+)", line)
             if m:
                 mac = normalize_mac(m.group(1))
-                if mac:
+                if mac and _is_unicast(mac):
                     ipm = re.search(r"^(\S+)", line)
                     neigh[mac] = ipm.group(1) if ipm else ""
     except Exception:
