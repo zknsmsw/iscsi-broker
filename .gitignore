@@ -18,3 +18,8 @@ p_mkdir_700/
 *.tmp
 overlay_*.raw
 overlay_*.qcow2
+*.raw
+
+#个人配置文件
+admin.conf
+users.conf
