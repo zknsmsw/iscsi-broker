@@ -78,6 +78,12 @@ def _is_unicast(mac12):
     return bool(mac12) and len(mac12) == 12 and not (int(mac12[:2], 16) & 1)
 
 
+def _mac_colon(mac12):
+    """12 位 hex -> 冒号分隔。iptables `--mac-source` 严格要求 XX:XX:XX:XX:XX:XX 格式，
+    不接受无冒号的 12 位 hex（会报 'Invalid MAC address specified'）。"""
+    return ":".join(mac12[i:i + 2] for i in range(0, 12, 2))
+
+
 # ---------- 初始化 / 配置读写 ----------
 
 def setup(base_dir, lan_if="", wan_if="", full_takeover=True, reject=True):
@@ -247,7 +253,7 @@ def _sync_locked():
     try:
         _sh(["iptables", "-F", "NETCTRL"])
         for mac, verdict in rules:
-            _sh(["iptables", "-A", "NETCTRL", "-m", "mac", "--mac-source", mac,
+            _sh(["iptables", "-A", "NETCTRL", "-m", "mac", "--mac-source", _mac_colon(mac),
                  "-j", _verdict_target(verdict)])
         _sh(["iptables", "-A", "NETCTRL", "-j", _verdict_target(fallback)])
         # 钩子保证在 FORWARD 第 1 条（先删后插，幂等）

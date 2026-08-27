@@ -77,7 +77,8 @@ def test_sync_rules_default_allow():
     try:
         netctrl._sync_locked()
         mac_rules = [c for c in cmds if "--mac-source" in c]
-        check("deny规则1条", len(mac_rules) == 1 and mac_rules[0][-1] == "REJECT")
+        check("deny规则1条(冒号格式)", len(mac_rules) == 1 and mac_rules[0][-1] == "REJECT"
+              and mac_rules[0][mac_rules[0].index("--mac-source") + 1] == "00:11:22:33:44:55")
         fallback = [c for c in cmds if c[:3] == ["iptables", "-A", "NETCTRL"] and "--mac-source" not in c]
         check("兜底ACCEPT", len(fallback) == 1 and fallback[0][-1] == "ACCEPT")
         hook = [c for c in cmds if c[:3] == ["iptables", "-I", "FORWARD"]]
@@ -147,7 +148,7 @@ def test_on_boot_and_reconcile():
         cmds.clear()
         netctrl._recent_boots.clear()
         netctrl.reconcile_once(["aabbccddeeff"])
-        check("巡检合并连接+邻居表", any("--mac-source" in c and "aabbccddeeff" in c for c in cmds))
+        check("巡检合并连接+邻居表", any("--mac-source" in c and "aa:bb:cc:dd:ee:ff" in c for c in cmds))
     finally:
         restore()
 
@@ -158,6 +159,11 @@ def test_is_unicast():
     check("组播(0x11奇数)", netctrl._is_unicast("112233445566") is False)
     check("广播", netctrl._is_unicast("ffffffffffff") is False)
     check("空/非法", netctrl._is_unicast("") is False and netctrl._is_unicast(None) is False)
+
+def test_mac_colon():
+    print("[mac_colon]")
+    check("冒号格式化", netctrl._mac_colon("001122334455") == "00:11:22:33:44:55")
+    check("全零", netctrl._mac_colon("000000000000") == "00:00:00:00:00:00")
 
 def test_ignore_multicast_neighbor():
     print("[ignore multicast neighbor]")
@@ -171,8 +177,9 @@ def test_ignore_multicast_neighbor():
     try:
         netctrl._sync_locked()
         mac_rules = [c for c in cmds if "--mac-source" in c]
-        check("只生成单播规则", len(mac_rules) == 1 and "001122334455" in mac_rules[0])
-        check("不生成组播规则", not any("333300000001" in c for c in cmds))
+        check("只生成单播规则", len(mac_rules) == 1
+              and "00:11:22:33:44:55" in mac_rules[0])
+        check("不生成组播规则", not any("333300000001" in c or "33:33:00:00:00:01" in c for c in cmds))
     finally:
         restore()
 
@@ -216,6 +223,7 @@ def main():
         test_set_mac_and_remove()
         test_on_boot_and_reconcile()
         test_is_unicast()
+        test_mac_colon()
         test_ignore_multicast_neighbor()
         test_build_base_rules()
         test_known_clients()
