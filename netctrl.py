@@ -256,6 +256,13 @@ def _sync_locked():
         print(f"[{_now()}] [ERROR] netctrl 规则同步失败: {e}")
 
 
+def _build_base_rules(lan, wan):
+    """NAT 回程放行 + 出外网 MASQUERADE（完全接管模式下，按用户要求重建）。"""
+    _sh(["iptables", "-A", "FORWARD", "-i", wan, "-o", lan,
+         "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+    _sh(["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", wan, "-j", "MASQUERADE"])
+
+
 def init():
     """启动接管：探测网卡 → 读配置 → 备份 → 清空并重建 FORWARD/POSTROUTING → 应用 NETCTRL。
     成功返回 True；失败（无 root、网卡探测失败等）返回 False，客户机上网不受影响。"""
@@ -267,6 +274,7 @@ def init():
                 print(f"[{_now()}] [ERROR] netctrl: 网卡探测失败（配置 lan={_cfg_lan!r} wan={_cfg_wan!r}），联网控制未启用")
                 return False
             _ifs = ifs
+            lan, wan = _ifs
             _load()
             _backup()
             _sh(["sysctl", "-w", "net.ipv4.ip_forward=1"])
@@ -283,10 +291,7 @@ def init():
                 # 完全接管：清空旧的手工转发/NAT 规则（按用户要求“现有的完全删除”）
                 _sh(["iptables", "-F", "FORWARD"])
                 _sh(["iptables", "-t", "nat", "-F", "POSTROUTING"])
-                # NAT 回程放行 + 出外网伪装（MASQUERADE）
-                _sh(["iptables", "-A", "FORWARD", "-i", wan, "-o", lan,
-                     "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
-                _sh(["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", wan, "-j", "MASQUERADE"])
+                _build_base_rules(lan, wan)   # NAT 回程 + MASQUERADE
             _last_fp = None
             _sync_locked()
             _ready = True

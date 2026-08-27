@@ -151,6 +151,19 @@ def test_on_boot_and_reconcile():
     finally:
         restore()
 
+def test_build_base_rules():
+    print("[build_base_rules]")
+    cmds = []
+    restore = fake_runner(cmds)
+    try:
+        netctrl._build_base_rules("ens18", "ens19")
+        ret = [c for c in cmds if c[:3] == ["iptables", "-A", "FORWARD"] and "conntrack" in c]
+        check("NAT回程放行(lan/wan正确)", len(ret) == 1 and "ens19" in ret[0] and "ens18" in ret[0])
+        masq = [c for c in cmds if c[:3] == ["iptables", "-t", "nat"] and "MASQUERADE" in c]
+        check("MASQUERADE出外网(wan正确)", len(masq) == 1 and "ens19" in masq[0])
+    finally:
+        restore()
+
 def test_known_clients():
     print("[known_clients]")
     reset(_tmp(), default="allow", macs={"001122334455": "deny"})
@@ -177,6 +190,7 @@ def main():
         test_reject_drop_switch()
         test_set_mac_and_remove()
         test_on_boot_and_reconcile()
+        test_build_base_rules()
         test_known_clients()
         print()
         if _failures:
