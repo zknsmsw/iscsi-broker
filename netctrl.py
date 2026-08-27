@@ -212,20 +212,35 @@ def _verdict_target(verdict):
     return "REJECT" if _reject else "DROP"
 
 
-def _neigh_macs():
-    """内网卡 ARP 邻居表中带 MAC 的机器（含 REACHABLE/STALE/DELAY/PROBE；FAILED 无 lladdr 自动跳过）。"""
-    macs = set()
+# 邻居条目视为“在线”的状态：REACHABLE=刚确认可达；DELAY/PROBE=确认后进入过期前的过渡态（仍活着）。
+# 关键：STALE 是“曾在线但已离开/未确认”的残留条目（关机/拔线的机器会在邻居表滞留），
+# 不能算在线，否则会把早已不存在的机器当客户机显示并生成规则。
+_NEIGH_ONLINE = frozenset({"REACHABLE", "DELAY", "PROBE"})
+
+
+def _neigh_entries():
+    """解析内网卡邻居表，返回 {mac12: (ip, state)}；仅含带 lladdr 的单播条目。"""
+    res = {}
     try:
         out = _out(["ip", "neigh", "show", "dev", _ifs[0]])
         for line in out.splitlines():
             m = re.search(r"lladdr\s+([0-9a-f:]+)", line)
-            if m:
-                mac = normalize_mac(m.group(1))
-                if mac and _is_unicast(mac):
-                    macs.add(mac)
+            if not m:
+                continue  # FAILED/INCOMPLETE 无 lladdr，跳过
+            mac = normalize_mac(m.group(1))
+            if not mac or not _is_unicast(mac):
+                continue
+            ipm = re.search(r"^(\S+)", line)
+            state = line.split()[-1].upper()
+            res[mac] = (ipm.group(1) if ipm else "", state)
     except Exception:
         pass
-    return macs
+    return res
+
+
+def _neigh_macs():
+    """仅返回确认在线的单播邻居 MAC（REACHABLE/DELAY/PROBE），排除 STALE 等残留条目。"""
+    return {mac for mac, (_ip, state) in _neigh_entries().items() if state in _NEIGH_ONLINE}
 
 
 def _desired_rules():
@@ -397,22 +412,14 @@ def reconcile_once(extra_macs=()):
 
 
 def known_clients(conns=None):
-    """Web 展示用：{mac, ip, online, policy, src}。在线来源 = ARP 邻居表 + iSCSI 连接。"""
+    """Web 展示用：{mac, ip, online, policy, src}。在线来源 = ARP 邻居表（仅确认在线状态）+ iSCSI 连接。"""
     if not _ready:
         return []
     conns = conns or {}
     neigh = {}
-    try:
-        out = _out(["ip", "neigh", "show", "dev", _ifs[0]])
-        for line in out.splitlines():
-            m = re.search(r"lladdr\s+([0-9a-f:]+)", line)
-            if m:
-                mac = normalize_mac(m.group(1))
-                if mac and _is_unicast(mac):
-                    ipm = re.search(r"^(\S+)", line)
-                    neigh[mac] = ipm.group(1) if ipm else ""
-    except Exception:
-        pass
+    for mac, (ip, state) in _neigh_entries().items():
+        if state in _NEIGH_ONLINE:
+            neigh[mac] = ip
     with _lock:
         macs = set(_cfg["macs"]) | set(neigh) | set(_recent_boots) | set(conns)
         src_map = {m: ("手动" if m in _cfg["macs"] else "默认") for m in macs}

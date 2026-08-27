@@ -183,6 +183,24 @@ def test_ignore_multicast_neighbor():
     finally:
         restore()
 
+def test_stale_neighbor_excluded():
+    print("[stale neighbor excluded]")
+    reset(_tmp(), default="allow", macs={})
+    netctrl._ready = True
+    cmds = []
+    out = ("10.0.1.100 dev lan0 lladdr 00:11:22:33:44:55 REACHABLE\n"
+           "10.0.1.180 dev lan0 lladdr 00:aa:bb:cc:dd:ee STALE\n")
+    restore = fake_runner(cmds, out)
+    try:
+        netctrl._sync_locked()
+        mac_rules = [c for c in cmds if "--mac-source" in c]
+        check("STALE 不生成规则", len(mac_rules) == 1 and "00:11:22:33:44:55" in mac_rules[0])
+        rows = netctrl.known_clients({})
+        macs = {r["mac"] for r in rows}
+        check("STALE 不显示为在线", "00aabbccddee" not in macs and "001122334455" in macs)
+    finally:
+        restore()
+
 def test_build_base_rules():
     print("[build_base_rules]")
     cmds = []
@@ -225,6 +243,7 @@ def main():
         test_is_unicast()
         test_mac_colon()
         test_ignore_multicast_neighbor()
+        test_stale_neighbor_excluded()
         test_build_base_rules()
         test_known_clients()
         print()
