@@ -28,6 +28,7 @@
 
 ### 4. Web 管理后台（端口 8080，仅 admin）
 - 客户机名单（在线状态、回写占用）、创建空白盘、修改管理员密码。
+- **iSCSI 挂载**：把任意一张“未在使用的镜像（母盘 .raw）”直接导出为 iSCSI target（**写直达母盘**，等同回写语义），页面**写出 IQN** 供任意 iSCSI 发起端（Windows 发起程序 / iscsiadm）手动连接，并支持一键卸载；挂载中的镜像不可再被 PXE 叠加启动或回写，反之亦然（同一镜像同一时刻仅一种使用方式）。
 - **用户与配额**：逐用户调整存储配额。
 - **默认配额**：修改新注册账号的默认空间大小。
 - **通用文件**：上传 / 下载 / 删除通用文件。
@@ -57,6 +58,7 @@
 | `netctrl.py` | **联网控制模块**：`netctrl.conf` 状态读写、FORWARD/NAT 规则托管（iptables 按 MAC 过滤 + MASQUERADE）、开机/巡检规则对齐、改动前自动备份。 |
 | `test_cloud_store.py` | 网盘模块自测脚本（75 项断言），回归用。 |
 | `test_netctrl.py` | 联网控制模块逻辑自测（纯逻辑，不依赖 root/iptables）。 |
+| `test_iscsi_export.py` | 后台手动 iSCSI 挂载模块逻辑自测（纯逻辑，不依赖 root/tgtadm）。 |
 
 ---
 
@@ -126,7 +128,8 @@ sudo python3 iscsi_broker.py
 
 ### 3. Web 使用流程
 浏览器访问 `http://<服务器IP>:8080/`：
-- **管理员**：用户名 `admin` + 密码（默认 `admin123`，**部署前务必修改**）→ 管理后台（客户机名单 / 创建空白盘 / 修改密码 / 用户与配额 / 默认配额 / 通用文件）。
+- **管理员**：用户名 `admin` + 密码（默认 `admin123`，**部署前务必修改**）→ 管理后台（客户机名单 / 创建空白盘 / iSCSI 挂载 / 修改密码 / 用户与配额 / 默认配额 / 通用文件 / 联网控制）。
+  - **iSCSI 挂载**页：选一张“空闲”的母盘点挂载 → 页面返回 IQN → 在任意机器上用 iSCSI 发起端连接该 IQN（服务器 IP:3260）即得到一块写直达母盘的可写盘；用完回后台点“卸载”。
 - **普通用户**：先"注册账号"（用户名 + 密码）→ 登录 → 我的网盘：
   - 上传文件（单文件，受配额限制）、下载文件、新建文件夹；
   - 根目录可见"通用文件"文件夹（只读，内容由管理员维护）。
@@ -189,6 +192,7 @@ sudo python3 iscsi_broker.py
 ```bash
 python test_cloud_store.py   # 网盘模块 75 项断言
 python test_netctrl.py       # 联网控制模块逻辑断言（不依赖 root/iptables）
+python test_iscsi_export.py  # 后台手动 iSCSI 挂载模块逻辑断言（不依赖 root/tgtadm）
 python -m py_compile iscsi_broker.py users_auth.py cloud_store.py netctrl.py
 ```
 

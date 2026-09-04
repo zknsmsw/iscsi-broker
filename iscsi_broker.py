@@ -110,6 +110,18 @@ mac_state = {}  # mac -> {"nbd_dev":..., "overlay":...} 记录每个 mac 当前�
 writeback_active = {}  # img_name -> mac：正以“回写模式”直接使用该母盘的客户机。同一母盘同一时刻只允许一台回写，防止互相覆盖写坏母盘
 global_lock = threading.Lock()
 
+# =================== 后台手动 iSCSI 挂载（母盘直出，写直达母盘） ===================
+# 与 iPXE 无盘/回写流程互相独立但互斥：Web 后台把一张“未在使用的镜像”直接导出为
+# iSCSI target（等同回写语义，客户机写入直达母盘 .raw），页面显示 IQN 供任意
+# iSCSI 发起端（Windows 发起程序 / iscsiadm）手动连接。同一镜像同一时刻只能有
+# 一种使用方式：回写、被客户机做叠加盘、后台手动挂载，三者互斥。
+WEB_EXPORT_TID_BASE = 2_000_000   # 手动挂载 tid 起点：与 PXE 客户机 tid 区间
+                                  # [TID_BASE, TID_BASE + TID_SPACE)（即 10 ~ 1_000_010）
+                                  # 完全错开——PXE 流程按 stable_tid 删 target 永远不会误删手动挂载盘
+WEB_EXPORT_TID_SLOTS = 4096       # 手动挂载并发槽位数（服务重启后全部失效，足够日常使用）
+web_export_lock = threading.Lock()
+web_exported = {}  # img_name -> {"tid","iqn","path","size","created"}（内存态，重启清空）
+
 IDLE_CHECK_INTERVAL = 30    # 每隔多少秒巡检一次
 IDLE_TIMEOUT_SECONDS = 300  # target 连续空闲(无 I_T nexus)超过这个时长就自动清理，5分钟
 MIN_FREE_GB = 5   # OVERLAY_DIR 剩余空间低于该值(GB)时拒绝新 provision
@@ -710,7 +722,8 @@ a{color:#2563eb;text-decoration:none;margin-right:14px}
 .inline-form input[type=submit]{padding:2px 8px;font-size:12px}"""
 
 NAV_ADMIN = ('<p><a href="/">客户机名单</a><a href="/web/create">创建空白盘</a>'
-             '<a href="/web/password">修改密码</a><a href="/web/users">用户与配额</a>'
+             '<a href="/web/export">iSCSI 挂载</a><a href="/web/password">修改密码</a>'
+             '<a href="/web/users">用户与配额</a>'
              '<a href="/web/common">通用文件</a><a href="/web/settings">默认配额</a>'
              '<a href="/web/netctrl">联网控制</a><a href="/web/logout">退出登录</a></p>')
 NAV_USER = ('<p><a href="/web/drive">我的网盘</a><a href="/web/logout">退出登录</a></p>')
@@ -850,6 +863,90 @@ def collect_client_info():
                      "detail": detail})
     return rows
 
+def _tgt_force_delete(tid):
+    """尽力删除某个 target（不抛异常；带 --force，即使仍有连接也能删）。"""
+    subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "delete",
+                    "--force", "--tid", str(tid)], stderr=subprocess.DEVNULL, timeout=3)
+
+def _file_size_or_none(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+def _image_busy_reason_unlocked(img_name):
+    """返回母盘镜像当前被占用的原因；空闲返回 None。调用方必须已持有 global_lock。"""
+    wb = writeback_active.get(img_name)
+    if wb:
+        return f"镜像正被客户机 {wb} 以回写模式使用"
+    overlay_users = [m for m, s in mac_state.items()
+                     if s.get("overlay") and _overlay_img(m, s["overlay"]) == img_name]
+    if overlay_users:
+        return f"镜像正被客户机 {overlay_users[0]} 以叠加模式使用" + (
+            f"（共 {len(overlay_users)} 台）" if len(overlay_users) > 1 else "")
+    if img_name in web_exported:
+        return "镜像已被后台手动挂载（见下方列表）"
+    return None
+
+def image_busy_reason(img_name):
+    """供页面展示用的带锁版本：返回占用原因或 None。"""
+    with global_lock:
+        return _image_busy_reason_unlocked(img_name)
+
+def _alloc_web_export_tid():
+    with web_export_lock:
+        used = {rec["tid"] for rec in web_exported.values()}
+        for i in range(WEB_EXPORT_TID_SLOTS):
+            tid = WEB_EXPORT_TID_BASE + i
+            if tid not in used:
+                return tid
+    raise RuntimeError("manual iSCSI export slots exhausted")
+
+def export_image_mount(img_name):
+    """后台手动挂载：把一张空闲母盘 .raw 直接导出为 iSCSI target（写直达母盘）。
+    返回 (True, iqn) 或 (False, 原因)。挂载成功前先登记占用，PXE/回写流程
+    并发请求同一镜像会被拒绝；tgt 建失败则回滚登记并清理。"""
+    base_img = os.path.join(IMAGES_DIR, f"{img_name}.raw")
+    if not img_name or os.path.basename(img_name) != img_name or not os.path.isfile(base_img):
+        return False, f"镜像不存在：{img_name or '（空）'}"
+    iqn = f"iqn.2026-07.storage:web-{img_name}"
+    try:
+        tid = _alloc_web_export_tid()
+    except RuntimeError as e:
+        return False, str(e)
+    with global_lock:
+        reason = _image_busy_reason_unlocked(img_name)
+        if reason:
+            return False, reason
+        web_exported[img_name] = {"tid": tid, "iqn": iqn, "path": base_img,
+                                  "size": _file_size_or_none(base_img),
+                                  "created": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    try:
+        tgt_new_target(tid, iqn)
+        tgt_new_lun(tid, base_img, None)   # 文件后端默认缓冲 I/O，直接读写母盘文件
+        tgt_bind_target(tid)
+    except Exception as e:
+        with global_lock:
+            web_exported.pop(img_name, None)
+        _tgt_force_delete(tid)
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] [ERROR] Manual iSCSI export failed for {img_name}: {e}")
+        return False, f"挂载失败：{e}"
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] [SUCCESS] Manual iSCSI export: {iqn} -> {base_img} (tid={tid})")
+    return True, iqn
+
+def export_image_unmount(img_name):
+    """卸载后台手动挂载的盘：删除 target 并释放该镜像占用。返回 (True, 消息)/(False, 原因)。"""
+    with global_lock:
+        rec = web_exported.pop(img_name, None)
+    if not rec:
+        return False, f"镜像未处于后台挂载状态：{img_name or '（空）'}"
+    _tgt_force_delete(rec["tid"])
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] [SUCCESS] Manual iSCSI export removed: {rec['iqn']} (tid={rec['tid']})")
+    return True, f"已卸载：{rec['iqn']}"
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): return
 
@@ -940,6 +1037,15 @@ class Handler(BaseHTTPRequestHandler):
                 if wb_owner:
                     print(f"[{now}] [ERROR] {mac}: image {img_name} is in write-back use by {wb_owner}, refuse")
                     self.send_error(503, f"Image {img_name} is in write-back use by {wb_owner}")
+                    return
+
+                # 后台手动挂载互斥：母盘正被后台导出（外部 iSCSI 发起端在写盘）时，
+                # 禁止再对它建叠加盘，避免快照与并发写入混杂出脏数据
+                with global_lock:
+                    exported_iqn = web_exported.get(img_name, {}).get("iqn")
+                if exported_iqn:
+                    print(f"[{now}] [ERROR] {mac}: image {img_name} is manually exported ({exported_iqn}), refuse")
+                    self.send_error(503, f"Image {img_name} is manually exported via web; unmount it in admin UI first")
                     return
 
                 try:
@@ -1114,6 +1220,12 @@ class Handler(BaseHTTPRequestHandler):
                     owner = writeback_active.get(img_name)
                 if owner not in (None, mac):
                     self._admin_denied(host, f"Image {img_name} is in write-back use by {owner}. Please try again later.")
+                    return
+                # 后台手动挂载互斥：该母盘正被后台导出（外部发起端写盘）时禁止回写
+                with global_lock:
+                    exported_iqn = web_exported.get(img_name, {}).get("iqn")
+                if exported_iqn:
+                    self._admin_denied(host, f"Image {img_name} is manually exported via web ({exported_iqn}). Unmount it in web admin first.")
                     return
                 # 提示性告警：其他客户机仍持有该母盘的叠加盘时回写，旧叠加盘将保持快照状态
                 with global_lock:
@@ -1306,6 +1418,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             for r in rows) or '<tr><td colspan="6">暂无客户机记录</td></tr>'
         wb_items = "".join(f"{html.escape(k)} ← {html.escape(v)}<br>"
                            for k, v in sorted(writeback_active.items())) or "无"
+        exp_items = "".join(f"{html.escape(k)} → {html.escape(v.get('iqn', ''))}<br>"
+                            for k, v in sorted(web_exported.items())) or "无"
         body = (
             '<div class="card"><h2>客户机名单</h2>'
             '<table><tr><th>MAC</th><th>镜像</th><th>模式</th><th>状态</th><th>IP</th><th>资源</th></tr>'
@@ -1313,6 +1427,9 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             '<p class="small">“在线”表示当前有 iSCSI 连接（I_T nexus）；服务重启后内存记录会清空。</p></div>'
             '<div class="card"><h2>回写模式占用</h2><p>' + wb_items + '</p>'
             '<p class="small">回写模式会直接修改母盘，同一母盘同一时刻只允许一台机器回写。</p></div>'
+            '<div class="card"><h2>后台手动挂载（iSCSI）</h2><p>' + exp_items + '</p>'
+            '<p class="small">管理入口：<a href="/web/export">iSCSI 挂载</a>。'
+            '挂载中的镜像不可再被 PXE 叠加启动或回写。</p></div>'
         )
         self._send_html(_page_html(WEB_TITLE, body, NAV_ADMIN))
 
@@ -1342,6 +1459,63 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         body += ('<p><input type="submit" value="保存"></p></form></div>'
                  '<p class="small">iPXE 启动菜单的管理员模式与本后台共用同一密码。</p>')
         self._send_html(_page_html("修改密码", body, NAV_ADMIN))
+
+    # ---------- 管理员：iSCSI 手动挂载（把空闲母盘直出为 iSCSI 盘，写直达母盘） ----------
+    def _export_page(self, msg=None):
+        rows = []
+        for name in list_images():
+            path = os.path.join(IMAGES_DIR, name + ".raw")
+            size = _human_size(_file_size_or_none(path))  # 读取失败返回 "?"
+            reason = image_busy_reason(name)
+            if reason is None:
+                st = '<span class="ok">空闲</span>'
+                act = ('<form method="post" action="/web/export" class="inline-form" '
+                       'onsubmit="return confirm(\'确定挂载？该盘写直达母盘镜像，'
+                       '请确认镜像当前未被其他机器使用。\')">'
+                       + self._csrf_hidden()
+                       + '<input type="hidden" name="img" value="' + html.escape(name) + '">'
+                       + '<input type="submit" value="挂载"></form>')
+            else:
+                st = html.escape(reason)
+                act = '—'
+            rows.append('<tr><td>' + html.escape(name) + '</td><td>' + size
+                        + '</td><td>' + st + '</td><td>' + act + '</td></tr>')
+        table = ('<table><tr><th>镜像</th><th>大小</th><th>状态</th><th>操作</th></tr>'
+                 + ("".join(rows) if rows else '<tr><td colspan="4">暂无镜像（images/ 目录为空）</td></tr>')
+                 + '</table>')
+        msg_html = ''
+        if msg:
+            cls = 'ok' if (msg.startswith("挂载成功") or msg.startswith("已卸载")) else 'err'
+            msg_html = '<p class="' + cls + '">' + html.escape(msg) + '</p>'
+        body = ('<div class="card"><h2>母盘镜像（空闲才可挂载）</h2>' + msg_html + table
+                + '<p class="small">“挂载”= 把该母盘 .raw 直接导出为 iSCSI target（写直达母盘），'
+                + '挂载成功后 IQN 见下表。挂载中的镜像不可再被 PXE 叠加启动或回写。</p></div>')
+        exp_rows = []
+        for name in sorted(web_exported):
+            rec = web_exported[name]
+            exp_rows.append(
+                '<tr><td>' + html.escape(name) + '</td><td><b>' + html.escape(rec.get("iqn", ""))
+                + '</b></td><td>' + html.escape(rec.get("created") or '')
+                + '</td><td><form method="post" action="/web/export/unmount" class="inline-form" '
+                + 'onsubmit="return confirm(\'确定卸载该 iSCSI 盘？正在连接的机器会立即断开，'
+                + '未落盘的数据可能丢失。\')">'
+                + self._csrf_hidden()
+                + '<input type="hidden" name="img" value="' + html.escape(name) + '">'
+                + '<input type="submit" value="卸载"></form></td></tr>')
+        exp_table = ('<table><tr><th>镜像</th><th>IQN（发起端连这个）</th><th>挂载时间</th><th>操作</th></tr>'
+                     + ("".join(exp_rows) if exp_rows else '<tr><td colspan="4">暂无手动挂载的盘</td></tr>')
+                     + '</table>')
+        body += ('<div class="card"><h2>当前手动挂载的 iSCSI 盘</h2>' + exp_table
+                 + '<p class="small">客户机 iSCSI 发起端连接：服务器地址 <b>服务器IP:3260</b>，'
+                 + '目标 IQN 取上表。服务重启后挂载列表会清空，需重新挂载。</p></div>')
+        body += ('<div class="card"><h2>连接示例</h2>'
+                 + '<p class="small">Linux（open-iscsi）：</p><pre>'
+                 + 'iscsiadm -m discovery -t sendtargets -p 服务器IP\n'
+                 + 'iscsiadm -m node -T iqn.2026-07.storage:web-镜像名 -p 服务器IP --login\n'
+                 + 'iscsiadm -m node -T iqn.2026-07.storage:web-镜像名 -p 服务器IP --logout</pre>'
+                 + '<p class="small">Windows：打开“iSCSI 发起程序”→“目标”→“连接”，'
+                 + '填服务器 IP 后在上表选择要连的 IQN（写直达母盘，请谨慎操作）。</p></div>')
+        self._send_html(_page_html("iSCSI 挂载", body, NAV_ADMIN))
 
     # ---------- GET ----------
     def do_GET(self):
@@ -1382,7 +1556,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._do_download(s)
             return
         if path in ("/web/users", "/web/settings", "/web/common", "/web/create",
-                    "/web/password", "/web/common/download", "/web/netctrl"):
+                    "/web/password", "/web/common/download", "/web/netctrl", "/web/export"):
             s = self._session()
             if not self._role_gate(s, "admin"):
                 return
@@ -1396,6 +1570,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._settings_page(params.get("msg", [""])[0] or None)
             elif path == "/web/netctrl":
                 self._netctrl_page(params.get("msg", [""])[0] or None)
+            elif path == "/web/export":
+                self._export_page(params.get("msg", [""])[0] or None)
             elif path == "/web/common":
                 self._common_page(params.get("msg", [""])[0] or None)
             else:
@@ -1441,7 +1617,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             return
         if path in ("/web/users/quota", "/web/settings", "/web/common/delete",
                     "/web/create", "/web/password",
-                    "/web/netctrl/default", "/web/netctrl/mac"):
+                    "/web/netctrl/default", "/web/netctrl/mac",
+                    "/web/export", "/web/export/unmount"):
             if not self._role_gate(s, "admin"):
                 return
             if path == "/web/users/quota":
@@ -1456,6 +1633,10 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._do_common_delete(form)
             elif path == "/web/create":
                 self._do_create(form)
+            elif path == "/web/export":
+                self._do_export_mount(form)
+            elif path == "/web/export/unmount":
+                self._do_export_unmount(form)
             else:
                 self._do_password(form)
             return
@@ -1486,6 +1667,17 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         size = form.get("size", [""])[0].strip()
         msg = self._create_blank(name, size)
         self._redirect("/web/create?msg=" + urllib.parse.quote(msg, safe=""))
+
+    def _do_export_mount(self, form):
+        img = form.get("img", [""])[0].strip()
+        ok, res = export_image_mount(img)
+        msg = f"挂载成功，IQN：{res}" if ok else res
+        self._redirect("/web/export?msg=" + urllib.parse.quote(msg, safe=""))
+
+    def _do_export_unmount(self, form):
+        img = form.get("img", [""])[0].strip()
+        _ok, res = export_image_unmount(img)
+        self._redirect("/web/export?msg=" + urllib.parse.quote(res, safe=""))
 
     def _create_blank(self, name, size):
         """校验并创建空白盘，返回给用户展示的结果消息。"""
