@@ -56,8 +56,6 @@
 | `users_auth.py` | **账号认证模块**：注册 / 登录校验 / 配额管理 / 默认配额，用户数据持久化到 `users.conf`、`cloud.conf`。 |
 | `cloud_store.py` | **网盘存储模块**：目录列表、上传（流式 multipart 解析）、下载、建文件夹、配额统计、通用文件管理，含路径穿越与符号链接防护。 |
 | `netctrl.py` | **联网控制模块**：`netctrl.conf` 状态读写、FORWARD/NAT 规则托管（iptables 按 MAC 过滤 + MASQUERADE）、开机/巡检规则对齐、改动前自动备份。 |
-| `test_cloud_store.py` | 网盘模块自测脚本（75 项断言），回归用。 |
-| `test_netctrl.py` | 联网控制模块逻辑自测（纯逻辑，不依赖 root/iptables）。 |
 
 ---
 
@@ -102,7 +100,7 @@
 ### Python 依赖
 **纯标准库**（无第三方包）：`http.server`、`urllib.parse`、`subprocess`、`os`、`datetime`、`hashlib`、`threading`、`glob`、`time`、`re`、`secrets`、`html`、`ssl`、`tempfile`。
 
-> 注意：Windows 上可编译、可 import、可跑模块测试（`test_cloud_store.py`），但完整运行（tgt/qemu-nbd/modprobe）仅限 Linux。
+> 注意：Windows 上可编译、可 import，但完整运行（tgt/qemu-nbd/modprobe）仅限 Linux。
 
 ---
 
@@ -186,19 +184,7 @@ sudo python3 iscsi_broker.py
 
 ---
 
-## 八、测试
-
-```bash
-python test_cloud_store.py   # 网盘模块 75 项断言
-python test_netctrl.py       # 联网控制模块逻辑断言（不依赖 root/iptables）
-python -m py_compile iscsi_broker.py users_auth.py cloud_store.py netctrl.py
-```
-
-开发期验证记录：模块单测 75/75、Web 端到端（真实 HTTP 服务）35/35、账号/网盘/配额/通用文件冒烟 34/34、联网控制逻辑 30 项全部通过。
-
----
-
-## 九、已知限制
+## 八、已知限制
 
 - `images/` 母盘目录不会自动创建，需手动放置 `.raw`。
 - 母盘 `images/*.raw` 会被视为启动菜单镜像；网盘数据在 `cloud/` 下，与母盘隔离。
