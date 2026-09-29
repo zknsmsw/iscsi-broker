@@ -154,7 +154,33 @@ sudo python3 iscsi_broker.py
 
 dnsmasq 一台机器同时干三件事：给客户机分配 IP、用 TFTP 把 **iPXE 引导器**推给客户机的网卡 PXE，iPXE 起来后再 chain 到本程序的 HTTP 接口取启动菜单。
 
-**（1）先确认内网只有一个 DHCP**：`dnsmasq` 要和 systemd-networkd / NetworkManager / isc-dhcp-server / 上级路由器 DHCP 抢答会互相打架。同一广播域只留一个 DHCP（dnsmasq），其余关掉或排除该网段。
+**（1）先确认内网只有一个 DHCP**：同一广播域里如果有第二个 DHCP（systemd-networkd / NetworkManager 自带的 dnsmasq / isc-dhcp-server / kea / udhcpd / 上级路由器），会和你的 dnsmasq 抢答——客户机可能拿到别的网段 IP、拿不到 iPXE 引导文件，表现就是 PXE 启动时好时坏。按下面四步查一遍，确认应答的只有你的 dnsmasq（示例网卡 `enp3s0`、服务器 LAN IP `192.168.10.1`）：
+
+```bash
+# ① 本机谁在监听 67/UDP：应该只有你自己的 dnsmasq 一个
+sudo ss -lunp | grep ':67'
+
+# ② 本机有几个 dnsmasq 实例（NetworkManager 会另起一个，参数里带 --conf-file=/var/lib/NetworkManager/...）
+ps -ef | grep '[d]nsmasq'
+
+# ③ 其他 DHCP 服务是否开着；systemd-networkd 的 DHCPServer= 是否被打开
+systemctl is-active isc-dhcp-server kea-dhcp4-server udhcpd 2>/dev/null
+grep -rs 'DHCPServer' /etc/systemd/network/ /run/systemd/network/ 2>/dev/null
+
+# ④ 广播域里到底有几台 DHCP 在应答（nmap / dhcpdump 需 apt 安装）
+sudo nmap --script broadcast-dhcp-discover -e enp3s0   # 打印所有应答的 Server Identifier
+sudo dhcpdump -i enp3s0                                # 实时看 DHCP 交互，含 option 54
+sudo journalctl -u dnsmasq -f                          # 同时确认是你的 dnsmasq 在发 OFFER
+```
+
+**判定标准**：第 ④ 步只应出现一个 `Server Identifier`，且等于服务器 LAN IP（`192.168.10.1`），dnsmasq 日志里能看到对应 MAC 的 `DHCPDISCOVER`/`DHCPOFFER`（配置里加 `log-dhcp` 日志更全）。
+
+查出来有第二个时，二选一处理：
+
+- **关掉它**：路由器/交换机在管理页关 DHCP；`systemctl disable --now isc-dhcp-server`；NetworkManager 自带的把该连接改成静态（`nmcli con mod <连接名> ipv4.method manual`，别用 `ipv4.method shared`，它会在本机起一个 DHCP）；systemd-networkd 把对应 `.network` 里的 `DHCPServer=yes` 改成 `no`。
+- **隔离开**：让客户机网络（接服务器 LAN 口的交换机）与上级路由器的 LAN 不在同一广播域（换网段 + VLAN 或物理分开），上级路由器 DHCP 就影响不到客户机。
+
+另外服务器 LAN 口自己别再跑 DHCP 客户端（`ip addr` 显示的地址不该是 dynamic）：`nmcli con mod <连接名> ipv4.method manual` 或直接删掉该接口的 dhclient 配置。
 
 **（2）把 iPXE 引导文件放进 TFTP 根目录**：
 
