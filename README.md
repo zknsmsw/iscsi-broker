@@ -191,7 +191,7 @@ reg unload HKLM\OFF
 ```
 
 - 网卡驱动服务名（如 `e1i63x64`、`rt640x64`、`mlx5`）可以在 PE 里 `reg query "HKLM\OFF\ControlSet001\Services" /s /v ImagePath` 找，或看已装系统的“设备管理器 → 网卡 → 属性 → 驱动程序 → 服务名”。
-- **不需要**在注册表里预置 TCP/IP（IP / 网关 / DNS）：iPXE 在引导阶段已经 DHCP 好，并把**网卡地址、目标 portal、target IQN** 一起写进 **iBFT** 交给 Windows，Windows 启动时直接从这里取（DHCP 客户端服务还没起来也无所谓）。微软文档的说法是：用网卡做 iSCSI 启动时，**iBFT 必须在安装时和每次重启时都存在**——iPXE 的 `sanboot` 正好负责这件事（微软把这种归为“第三方程序生成 iBFT、通过 PXE 传给本机”的那类）。
+- 不用在注册表里配 IP / 网关 / DNS：iPXE 已经 DHCP 好，并把这些和目标信息一起通过 iBFT 交给 Windows。
 
 **5）第一次启动**：用客户机的 iPXE `sanboot` 起（不是本地盘），能进系统就说明母盘成立。进系统后再做模板化收尾：
 
