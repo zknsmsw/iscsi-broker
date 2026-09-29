@@ -200,15 +200,22 @@ net start msiscsi            :: 服务起来后，磁盘管理里应能看到那
 - **只能用官方安装程序装**：别用 Dism++/dism 释放 `install.wim` 造这块盘——不经 Setup 就不会登记 iSCSI 启动信息，装出来起不来。母盘做完要批量发，再 `sysprep` + 捕获镜像，且只能发给同型号网卡的机器。
 - 用 `iscsicli`（QAddTargetPortal → ListTargets → QLoginTarget）手动连上来的盘能看见，但 Setup 会拒装（报"硬件可能不支持启动到此磁盘"）——所以盘必须由 iPXE sanhook 挂、带 iBFT。
 
-**5）装完先别重启**；官方安装程序正常会登记好 iSCSI 启动，起不来时再补注册表：
+**5）装完先别重启，在 PE 里改两处注册表**：
 
 ```cmd
 reg load HKLM\OFF C:\Windows\System32\config\SYSTEM
-:: iSCSI 发起端随内核启动（默认 3=按需）
+
+:: ① 关掉页面文件：iSCSI 盘上放 pagefile，Win10 第一次启动会 PAGE_FAULT_IN_NONPAGED_AREA 蓝屏
+reg delete "HKLM\OFF\ControlSet001\Control\Session Manager\Memory Management" /v PagingFiles /f
+reg delete "HKLM\OFF\ControlSet001\Control\Session Manager\Memory Management" /v ExistingPageFiles /f
+
+:: ② iSCSI 发起端随内核启动（默认 3=按需；官方安装程序一般已登记好，起不来再改）
 reg add "HKLM\OFF\ControlSet001\Services\msiscsi" /v Start /t REG_DWORD /d 0 /f
+
 reg unload HKLM\OFF
 ```
 
+- 页面文件那条是**必做**（等价于 PE 里 regedit 把 `PagingFiles` 清空并删掉 `ExistingPageFiles`）；客户机有本地盘的话，更好的做法是把页面文件放本地盘：`PagingFiles` 写成 `D:\pagefile.sys 4096 8192`。
 - 还起不来，再把 iBFT 里那块网卡的驱动也设成 `Start=0`。服务名查法：PE 里 `wmic nic where "NetEnabled=true" get Name,ServiceName`；或离线 `reg query "HKLM\OFF\ControlSet001\Enum\PCI" /s /v Driver | findstr /i 4d36e972`，再看该设备实例的 `Service`（本机实测网卡 `rtwlane6` 就是这么查出来的）。
 
 **6）回后台「iSCSI 挂载」页点卸载**，把这块盘从 iSCSI 上摘下来。
@@ -279,6 +286,7 @@ fdisk -l /home/prts/server/images/win11.raw        # 确认分区表、活动分
 - **PE 要带客户机的网卡驱动**：官方 `boot.wim` 在 KVM/Proxmox 的 virtio 网卡上没有驱动，装系统要用 FirPE / LefPE for KVM 这类，并把它的 WIM 用 wimboot 起。
 - **PE 不能占 SAN 盘**：走菜单进 PE 会让 PE 自己占一块 SAN 盘，和要装的盘冲突（`0x032320` 盘号冲突 / `0x1d8520` 读盘 I/O 错），所以 PE 走 wimboot（或光驱）起。
 - **启动网卡上别装网络过滤驱动**（VPN / 防火墙 / 带网络过滤的杀软）。
+- **页面文件不能放 iSCSI 盘**：Win10（1703 起）第一次启动会 `PAGE_FAULT_IN_NONPAGED_AREA` 蓝屏，装完在 PE 里就把 `PagingFiles` 清空（有本地盘就放到本地盘）。
 - **iSCSI 启动不能休眠/睡眠**，装完就 `powercfg /h off`。
 
 ### 4. dnsmasq 部署（DHCP + TFTP + iPXE 推送）
