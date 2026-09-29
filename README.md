@@ -161,25 +161,9 @@ sudo python3 iscsi_broker.py
 
 #### Windows 母盘：在 iPXE 引导的 WinPE 里装到 iSCSI 盘
 
-**1）做 WinPE，并塞进客户机网卡驱动**（PE 里没有网卡驱动就连不上 iSCSI）：
+**1）准备 PE**：直接用现成的**带网卡驱动的 PE**（网络版 PE 遍地都是，微PE / 优启通这类就行），**不用**自己拿 ADK + imagex/dism 去做，也不用往 `boot.wim` 里塞驱动。把 PE 文件按你平时的做法放到服务器（丢进 `images/` 就行），iPXE 菜单里选它启动进 PE。
 
-```cmd
-copype amd64 C:\temp\winpe
-imagex /mountrw C:\temp\winpe\amd64\media\sources\boot.wim 1 C:\temp\winpe\amd64\mount
-dism /image:C:\temp\winpe\amd64\mount /add-driver /driver:C:\temp\winpe\drivers /recurse
-imagex /unmount /commit C:\temp\winpe\amd64\mount
-```
-
-把 `wimboot`、`boot.wim` 放到 Web/TFTP 目录，交给 iPXE 引导（iPXE 官方 WinPE 文档的写法）：
-
-```
-#!ipxe
-kernel wimboot
-initrd boot.wim boot.wim
-boot
-```
-
-**2）在 PE 里连上服务器的 iSCSI 目标，把系统装到这块盘上**：
+**2）PE 里连上服务器的 iSCSI 目标**：
 
 ```cmd
 wpeinit
@@ -188,44 +172,28 @@ iscsicli QLoginTarget iqn.2026-07.storage:web-win11
 diskpart                       :: list disk → 应能看到这块 iSCSI 盘
 ```
 
-（也可以先在 iPXE 里 `sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn...` 把盘挂上，再引导 PE。）
+（PE 里有图形版 iSCSI 发起程序的话，点两下也一样；也可以在 iPXE 侧先 `sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn...` 把盘挂上再进 PE。）
 
-装系统两种做法：
+**3）把 Windows 装到这块盘上**：
 
-```cmd
-:: A. 图形安装：在 PE 里跑安装程序，"安装到哪里"选那块 iSCSI 盘（分区按固件来：BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）
-\\server\installers\win11\setup.exe
+- **推荐：直接跑安装程序**。在 PE 里执行 `\\server\installers\win11\setup.exe`，"安装到哪里"选那块 iSCSI 盘（分区按固件来：BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）。这么装，**PE 里已经加载的网卡驱动会自动带进新系统**，不用另外注入。
+- **或者离线展开**：用 **Dism++**"文件 → 释放映像"把 `install.wim` 释放到那块盘，再用 Dism++ 的"引导修复"写引导（命令行等价物是 `dism /Apply-Image` + `bcdboot`）。离线展开时网卡驱动不会自动带进去，需要在 Dism++ 里打开刚释放的系统 → 驱动管理 → 添加驱动（等价命令：`dism /Image:C:\ /Add-Driver /Driver:D:\drivers\nic /Recurse`），否则内核启动阶段没网卡驱动，照样连不上 iSCSI。
 
-:: B. 直接展开镜像
-dism /Apply-Image /ImageFile:install.wim /Index:1 /ApplyDir:C:\
-bcdboot C:\Windows /s C: /f BIOS        :: BIOS 写进系统分区；UEFI 则把 ESP 挂到 S:，用 /s S: /f UEFI
-
-:: 无论哪种，都要把客户机网卡驱动注入到刚装好的系统里（否则内核启动阶段没网卡驱动，照样连不上 iSCSI）
-dism /Image:C:\ /Add-Driver /Driver:D:\drivers\nic /Recurse
-```
-
-**3）装完先别重启**，在 PE 里离线改注册表，让 iSCSI 服务和网卡跟内核一起启动：
+**4）装完先别重启**，在 PE 里把 iSCSI 发起端设成随内核启动（PE 里用 regedit 挂载目标系统的 `C:\Windows\System32\config\SYSTEM`，或直接敲下面命令）：
 
 ```cmd
 reg load HKLM\OFF C:\Windows\System32\config\SYSTEM
-:: iSCSI 发起端：Windows 默认是 3（按需启动），必须改成 0（内核启动）
+:: iSCSI 发起端：Windows 默认是 3（按需启动），改成 0（随内核启动）
 reg add "HKLM\OFF\ControlSet001\Services\msiscsi" /v Start /t REG_DWORD /d 0 /f
-:: 客户机实际用的那块网卡驱动服务也要 0（不然内核起来时网卡还没加载，iSCSI 连不上）
+:: 客户机用的那块网卡驱动也要随内核加载（一般装驱动后就是 boot-start，不是再改成 0）
 reg add "HKLM\OFF\ControlSet001\Services\<网卡驱动服务名>" /v Start /t REG_DWORD /d 0 /f
-:: 给启动网卡预置 TCP/IP：内核阶段 DHCP 客户端服务还没起来，这些值必须先在
-reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v EnableDHCP /t REG_DWORD /d 1 /f
-reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v DhcpIPAddress /t REG_SZ /d 10.1.1.100 /f
-reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v DhcpSubnetMask /t REG_SZ /d 255.255.255.0 /f
-reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v DhcpDefaultGateway /t REG_SZ /d 10.1.1.1 /f
-reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v DhcpNameServer /t REG_SZ /d 10.1.1.1 /f
 reg unload HKLM\OFF
 ```
 
-- `{网卡GUID}`：`...\Tcpip\Parameters\Interfaces\` 下对应启动网卡的那一项；网卡驱动服务名（如 `e1i63x64`、`rt640x64`、`mlx5`）可以在 PE 里 `reg query "HKLM\OFF\ControlSet001\Services" /s /v ImagePath`，或已装系统的"设备管理器 → 网卡 → 属性 → 驱动程序 → 服务名"里看；
-- 不想用 DHCP，也可以把这些值改成静态的 `IPAddress` / `SubnetMask` / `DefaultGateway` / `NameServer`；
-- Windows 若从 iPXE 的 iBFT 拿到了目标信息，会据此重连；如果你的 iPXE/固件不提供 iBFT，就得自己写持久目标（`HKLM\SYSTEM\CurrentControlSet\Services\MSiSCSI\Parameters`，或在 PE 里用 `iscsicli AddPersistentTarget`）。
+- 网卡驱动服务名（如 `e1i63x64`、`rt640x64`、`mlx5`）可以在 PE 里 `reg query "HKLM\OFF\ControlSet001\Services" /s /v ImagePath` 找，或看已装系统的“设备管理器 → 网卡 → 属性 → 驱动程序 → 服务名”。
+- **不需要**在注册表里预置 TCP/IP（IP / 网关 / DNS）：iPXE 在引导阶段已经 DHCP 好，并把**网卡地址、目标 portal、target IQN** 一起写进 **iBFT** 交给 Windows，Windows 启动时直接从这里取（DHCP 客户端服务还没起来也无所谓）。微软文档的说法是：用网卡做 iSCSI 启动时，**iBFT 必须在安装时和每次重启时都存在**——iPXE 的 `sanboot` 正好负责这件事（微软把这种归为“第三方程序生成 iBFT、通过 PXE 传给本机”的那类）。
 
-**4）第一次启动**：用客户机的 iPXE `sanboot` 起（不是本地盘），能进系统就说明母盘成立。进系统后再做模板化收尾：
+**5）第一次启动**：用客户机的 iPXE `sanboot` 起（不是本地盘），能进系统就说明母盘成立。进系统后再做模板化收尾：
 
 ```cmd
 powercfg /h off                          :: 关快速启动/休眠，避免克隆机被当成异常关机
@@ -283,7 +251,10 @@ fdisk -l /home/prts/server/images/win11.raw        # 确认分区表、活动分
 - **母盘只是模板**：客户机默认从它 reflink 出各自的叠加盘，谁都不写母盘；但“回写模式”和后台“iSCSI 挂载”是**直接写母盘**的，别拿唯一一份去试，留备份。
 - **容量一次定好**：母盘多大，客户机看到的盘就多大（如 64G）；盘内别塞满，留空间给客户机自己用。
 - **一种固件一张盘**：BIOS 母盘只能给 BIOS 客户机，UEFI 母盘只能给 UEFI 客户机。
-- **网卡要匹配**：Windows 母盘里没有客户机那块网卡的驱动，第一次启动就会卡在找不到盘；机型不统一就把常用网卡驱动都注入进去。
+- **装机时机器上别接本地盘**（微软 iSCSI Boot 文档明确写了：有本地盘时引导文件可能落到本地盘，做出来就是一块起不来的盘）。
+- **网卡要匹配**：iSCSI 启动绑定安装时那块网卡，微软文档的说法是“**换网卡就得重装**”；所以母盘只部署到同型号网卡的机器，机型杂就把常用网卡驱动都注入进去。
+- **启动网卡上别装网络过滤驱动**（VPN / 防火墙 / 带网络过滤的杀软），微软文档明确不支持。
+- **iSCSI 启动不能休眠/睡眠**（微软文档），所以装完就 `powercfg /h off`。
 - **装完别急着重启**：注册表（Windows）/ initramfs（Linux）没配好就重启，等于给自己造一块启动不了的盘。
 
 ### 4. dnsmasq 部署（DHCP + TFTP + iPXE 推送）
