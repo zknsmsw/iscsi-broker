@@ -93,6 +93,8 @@
 | `iproute2`（`ss`、`ip`） | 无流量检测、路由选网卡 |
 | `arping`（iputils-arping） | L2 层在线确认 |
 | `iptables`（iptables-nft） | 联网控制：FORWARD 按 MAC 过滤 + NAT MASQUERADE |
+| `dnsmasq` | 客户机 DHCP + TFTP，把 iPXE 引导器推给客户机（见第五节） |
+| `ipxe`（提供 `undionly.kpxe` / `ipxe.efi`） | 客户机 PXE 阶段加载的 iPXE 引导器文件 |
 | `findmnt`（util-linux） | 检测文件系统类型（reflink 支持） |
 | `sysctl` | 启动时网络缓冲调优 |
 | XFS/btrfs 文件系统 | 路线 A reflink 直出（不支持自动回退路线 B） |
@@ -104,26 +106,120 @@
 
 ---
 
-## 五、部署与使用
+## 五、网络架构与部署
 
-### 1. 部署
+### 1. 架构：客户机只连服务器，服务器连外网
+
+```
+              ┌─────────── 外网 / 上级路由 ───────────┐
+              │                                       │
+         [ WAN 口 ]
+   ┌──────────────────── 服务器（Linux，root 运行） ───────────────────┐
+   │  dnsmasq：DHCP(67) + TFTP(69)，只监听 LAN 口                      │
+   │  iPXE 供给 HTTP(5000)   Web 后台(8080)   iSCSI target(3260)       │
+   │  FORWARD + MASQUERADE（客户机唯一出口）+ NETCTRL（按 MAC 放行/禁止）│
+   │  images/*.raw 母盘、叠加盘、cloud/ 网盘数据                       │
+   └──────[ LAN 口 ]───────────┬───────────────────────┬─────────────┘
+                              │ 交换机                 │
+                       ┌──────┴──────┐         ┌──────┴──────┐
+                       │  客户机 A   │         │  客户机 B   │
+                       └─────────────┘         └─────────────┘
+```
+
+- **客户机**：不接外网、也不需要外网。开机只做三件事——向服务器要 IP 和引导文件（DHCP）、取 iPXE（TFTP）、取启动脚本并连 iSCSI 盘（HTTP 5000 + iSCSI 3260）。**客户机的所有流量都只到服务器 LAN 口**。
+- **客户机的默认网关必须指向服务器 LAN 口 IP**（由 dnsmasq 下发 `option:router`）。这样客户机出外网的流量才会经过服务器的 FORWARD + MASQUERADE，按 MAC 的联网控制（NETCTRL）才有意义；网关留空则客户机不能上网，但无盘启动照常。
+- **服务器**：WAN 口接外网 / 上级路由（默认路由所在的网卡）；LAN 口接交换机，配静态 IP（示例 `192.168.10.1/24`）。脚本会自动探测网卡（带默认路由的=外网卡，另一张有 IPv4 且 UP 的=内网卡），多网卡或探测不准时用 `NETCTRL_LAN_IF` / `NETCTRL_WAN_IF` 显式指定。
+- 脚本启动时会开启 `net.ipv4.ip_forward=1`、关闭 IPv6 转发（客户机不分配 IPv6，防止绕过联网控制），并按配置清空 / 重建 FORWARD、POSTROUTING 规则。
+- 用到的端口：`67/udp` DHCP、`69/udp` TFTP（均由 dnsmasq 提供，只开在 LAN 口）、`5000/tcp` iPXE 供给、`8080/tcp` Web 后台、`3260/tcp` iSCSI。若服务器开了 ufw / firewalld，需在 LAN 口放行这些端口。
+
+### 2. 服务器准备与启动
+
 ```bash
 # 1) 修改 iscsi_broker.py 顶部 BASE_DIR 为实际绝对路径
 # 2) 安装依赖（以 Debian/Ubuntu 为例）
-apt install python3 tgt qemu-utils iproute2 iputils-arping util-linux
+apt install python3 tgt qemu-utils iproute2 iputils-arping util-linux dnsmasq ipxe
 # 3) 准备母盘目录并放入镜像
 mkdir -p /home/prts/server/images
 #    把 xxx.raw 母盘放进去（如 win11.raw）
-# 4) 启动（需 root）
+# 4) 给 LAN 口配静态 IP（示例，网卡名按实际改）
+ip addr add 192.168.10.1/24 dev enp3s0
+ip link set enp3s0 up
+# 5) 启动（需 root）
 sudo python3 iscsi_broker.py
 ```
-启动后日志会打印当前模式（reflink / qcow2）与 Web 后台地址。
 
-### 2. DHCP / PXE 指向
-- DHCP 下发的引导文件指向 iPXE，首个链地址为 `http://<服务器IP>:5000/boot.ipxe`。
-- 若启用 HTTPS（`HTTPS_ENABLED`），该链地址需同步改为 `https://...`。
+启动后日志会打印当前模式（reflink / qcow2）、Web 后台地址和联网控制用的内/外网卡。
 
-### 3. Web 使用流程
+### 3. dnsmasq 部署（DHCP + TFTP + iPXE 推送）
+
+dnsmasq 一台机器同时干三件事：给客户机分配 IP、用 TFTP 把 **iPXE 引导器**推给客户机的网卡 PXE，iPXE 起来后再 chain 到本程序的 HTTP 接口取启动菜单。
+
+**（1）先确认内网只有一个 DHCP**：`dnsmasq` 要和 systemd-networkd / NetworkManager / isc-dhcp-server / 上级路由器 DHCP 抢答会互相打架。同一广播域只留一个 DHCP（dnsmasq），其余关掉或排除该网段。
+
+**（2）把 iPXE 引导文件放进 TFTP 根目录**：
+
+```bash
+mkdir -p /srv/tftp
+# Debian/Ubuntu 的 ipxe 包自带（装了 ipxe 就有）：
+cp /usr/lib/ipxe/undionly.kpxe /srv/tftp/     # 传统 BIOS 客户机
+cp /usr/lib/ipxe/ipxe.efi      /srv/tftp/     # UEFI 客户机
+# 也可以自己编译：
+#   git clone https://github.com/ipxe/ipxe && cd ipxe
+#   make bin/undionly.kpxe            # BIOS
+#   make bin-x86_64-efi/ipxe.efi      # UEFI
+```
+
+**（3）写 dnsmasq 配置**（`/etc/dnsmasq.d/pxe.conf`，把 IP / 网卡名换成自己的）：
+
+```conf
+# 只服务内网口（网卡名按实际改，别在 WAN 口开 DHCP）
+interface=enp3s0
+bind-dynamic
+# 客户机地址池：起止 + 掩码 + 租期
+dhcp-range=192.168.10.100,192.168.10.200,255.255.255.0,12h
+# 客户机默认网关 = 服务器 LAN 口 IP（必须，联网控制依赖它）
+dhcp-option=option:router,192.168.10.1
+# 客户机 DNS：走服务器（dnsmasq 同时做 DNS 时）或直接给上游 DNS
+dhcp-option=option:dns-server,192.168.10.1
+# TFTP 服务
+enable-tftp
+tftp-root=/srv/tftp
+# 按客户机固件架构下发不同的 iPXE 引导器（!ipxe = 还没跑到 iPXE 的网卡 PXE）
+dhcp-match=set:bios,option:client-arch,0
+dhcp-match=set:efi64,option:client-arch,7
+dhcp-match=set:efi64,option:client-arch,9
+dhcp-boot=tag:!ipxe,tag:bios,undionly.kpxe
+dhcp-boot=tag:!ipxe,tag:efi64,ipxe.efi
+# 二次启动：已经是 iPXE 的客户机，直接把 HTTP 脚本地址当"引导文件"发下去
+dhcp-userclass=set:ipxe,iPXE
+dhcp-boot=tag:ipxe,http://192.168.10.1:5000/boot.ipxe
+```
+
+> `tag:!ipxe` 这个排除条件别省：网卡自带的 PXE 只认 TFTP、不认 HTTP URL，必须先把它引导到 iPXE，再由 iPXE 去取 `http://...` 脚本。
+
+**（4）iPXE 推送流程（两跳）**：
+
+1. **第一跳**：客户机网卡 PXE 向 dnsmasq 要 IP → 下发的引导文件是 `undionly.kpxe`（BIOS）或 `ipxe.efi`（UEFI）→ 客户机用 TFTP 取回并运行 iPXE。
+2. **第二跳**：iPXE 会再发一次 DHCP，报上自己的 user-class `iPXE` → dnsmasq 命中 `tag:ipxe`，把**启动脚本 URL** `http://192.168.10.1:5000/boot.ipxe` 当引导文件发下去 → iPXE 用 HTTP 取回脚本并执行（本程序的 `/boot.ipxe` 会生成菜单，选择镜像后返回 `sanboot iscsi:...` 连盘启动）。
+
+所以 DHCP 里配置的**唯一** chain 地址就是 `http(s)://<服务器IP>:5000/boot.ipxe`；若开了 `HTTPS_ENABLED`，这里要同步改成 `https://`（TLS 只影响 HTTP 这一段，TFTP 不受影响）。
+
+> 如果 iPXE 没按 user-class 命中（老版本或想固定写死），可以给 iPXE 内置脚本：把 `#!ipxe`、`dhcp`、`chain http://192.168.10.1:5000/boot.ipxe` 三行存成 `embed.ipxe`，然后 `make bin/undionly.kpxe EMBED=embed.ipxe` 编译，用这个引导器替换 TFTP 根目录里的文件即可。
+
+**（5）沿用现有 DHCP 服务器（不改 DHCP）**：让现有 DHCP 下发 `next-server=<服务器IP>` + `filename=undionly.kpxe`（BIOS）/ `ipxe.efi`（UEFI），服务器上只跑 TFTP（dnsmasq 可只开 TFTP：`port=0` 关 DNS、不配 `dhcp-range`），第二跳用上面的 `EMBED=` 内置脚本方式，或在支持按 user-class / option 77 下发的 DHCP 上照第（4）步配置。若现有 DHCP 完全不能改，也可让 dnsmasq 以 **proxy-DHCP** 模式只回答 PXE 引导选项（`dhcp-range=192.168.10.0,proxy`），IP 仍由原 DHCP 分配。
+
+**（6）验证**：
+
+```bash
+dnsmasq --test                     # 校验配置语法
+systemctl restart dnsmasq
+journalctl -u dnsmasq -f           # 看 DHCP/TFTP 日志：DHCPDISCOVER / TFTP 传输
+curl -s tftp://192.168.10.1/undionly.kpxe -o /dev/null && echo "TFTP OK"
+```
+
+排查顺序：客户机是否拿到 IP（说明 DHCP 通）→ 是否取到 iPXE（TFTP 通）→ iPXE 是否拉到 `/boot.ipxe`（HTTP 5000 通）→ 是否连上 `3260` 的 iSCSI 盘。
+
+### 4. Web 使用流程
 浏览器访问 `http://<服务器IP>:8080/`：
 - **管理员**：用户名 `admin` + 密码（默认 `admin123`，**部署前务必修改**）→ 管理后台（客户机名单 / 创建空白盘 / iSCSI 挂载 / 修改密码 / 用户与配额 / 默认配额 / 通用文件 / 联网控制）。
   - **iSCSI 挂载**页：选一张“空闲”的母盘点挂载 → 页面返回 IQN → 在任意机器上用 iSCSI 发起端连接该 IQN（服务器 IP:3260）即得到一块写直达母盘的可写盘；用完回后台点“卸载”。
@@ -131,7 +227,7 @@ sudo python3 iscsi_broker.py
   - 上传文件（单文件，受配额限制）、下载文件、新建文件夹；
   - 根目录可见"通用文件"文件夹（只读，内容由管理员维护）。
 
-### 4. iPXE 使用流程
+### 5. iPXE 使用流程
 1. 客户机从网络引导进入启动菜单，选择镜像 → 服务器生成叠加盘并返回 `sanboot iscsi:...` 指令 → 连盘启动。
 2. 菜单中选 **Admin Mode** → 提示输入用户名（必须是 `admin`）与密码 → 选择镜像以**回写模式**启动（直接写母盘）。
 
