@@ -155,45 +155,44 @@ sudo python3 iscsi_broker.py
 “制作母盘”= 把系统**装进一块整盘 raw**，并让它在 iSCSI 上能自己启动：
 
 - 固件要匹配：BIOS→**MBR+活动分区**，UEFI→**GPT+ESP**；
-- iPXE 交棒后盘由**系统自己的 iSCSI 发起端**接管，所以系统里必须让 iSCSI 发起端和网卡驱动**随内核启动**（Windows 改注册表 `Start=0`，Linux 配 initramfs），否则卡 0x7B / `INACCESSIBLE_BOOT_DEVICE` / initramfs 找不到 root。不能先装到本地盘再转过来；
-- 客户机那块**网卡驱动必须在系统里**（跑安装程序装时会从 PE 带过去，Dism++ 离线释放就要自己加）。
+- Windows 必须用**官方安装程序直接装到 iSCSI 盘上**（盘由 iPXE 通过 iBFT 交给 Setup），装完系统里才会有 iSCSI 启动的登记；用 Dism++/dism 释放镜像装出来起不来。也不能先装到本地盘再转过来；
+- iPXE 交棒后盘由**系统自己的 iSCSI 发起端**接管，所以要让 iSCSI 发起端随内核启动（Windows 起不来时查 `msiscsi` 的 `Start`，Linux 配 initramfs），否则卡 0x7B / `INACCESSIBLE_BOOT_DEVICE` / initramfs 找不到 root。
 
 #### Windows 母盘：PE 里装到 iSCSI 盘
 
-**1）准备 PE**：用现成的网络版 PE（**FirPE**、**LefPE for KVM** 这类，自带网卡驱动），文件丢进 `images/`，iPXE 菜单里选它进 PE。
+**1）准备 PE**：用现成的网络版 PE（**FirPE**、**LefPE for KVM** 这类，自带网卡驱动），文件放到服务器上（丢进 `images/` 也行），按第 3 步的 iPXE 脚本启动它。
 
-**2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是 PE 里要连的目标。
+**2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是第 3 步 iPXE 脚本里要挂的目标。
 
-**3）PE 里连上这个目标，把 Windows 装进去**：
+**3）让 iPXE 把盘挂成 0x80 再进 PE，用官方安装程序装**：
 
-```cmd
-wpeinit
-iscsicli QAddTargetPortal 10.1.1.1        :: 先把门户加进去（发现动作在服务启动/刷新时做）
-iscsicli ListTargets                      :: 先搜到 IQN 再登录；列不出来就 iscsicli RefreshTargetPortal 10.1.1.1 3260
-iscsicli QLoginTarget iqn.2026-07.storage:web-win11
-diskpart                                  :: list disk → 应能看到这块 iSCSI 盘
+```
+sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
+kernel wimboot
+initrd boot.wim boot.wim
+boot
 ```
 
-图形界面同理：iSCSI 发起程序 →「发现」页添加门户 →「目标」页里选中 IQN → 连接。
+进 PE 后这块盘应该已经出现在"安装到哪里"里（iBFT 带给 Setup 的），选中它安装（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）：
 
-装法二选一：
+```cmd
+\\server\installers\win11\setup.exe
+```
 
-- **跑安装程序**：`\\server\installers\win11\setup.exe`，"安装到哪里"选那块 iSCSI 盘（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）。这么装，PE 里已加载的网卡驱动会自动带进新系统。
-- **Dism++ 离线展开**：释放映像到那块盘 → 引导修复写引导；离线方式要自己给目标系统加网卡驱动（Dism++ 驱动管理 → 添加驱动）。
+- **只能用官方安装程序装**：别用 Dism++/dism 释放 `install.wim` 来造这块盘——不经 Setup 就不会登记 iSCSI 启动信息，装出来启动不了。母盘做完要批量分发，再 `sysprep` + 捕获镜像，且只能发给同型号网卡的机器。
+- PE 里看不到盘，先 `net start msiscsi`；用 `iscsicli`（QAddTargetPortal → ListTargets → QLoginTarget）挂上来的盘能看见，但 Setup 会拒装（报"硬件可能不支持启动到此磁盘"），所以要走上面的 sanhook。
+- 不用在注册表里配 IP / 网关 / DNS：iPXE 已经 DHCP 好，并通过 iBFT 一起交给 Windows。
 
-**4）装完先别重启**，在 PE 里把 iSCSI 发起端设成随内核启动：
+**4）装完先别重启**；官方安装程序正常会登记好 iSCSI 启动，起不来时再补注册表：
 
 ```cmd
 reg load HKLM\OFF C:\Windows\System32\config\SYSTEM
-:: iSCSI 发起端：Windows 默认是 3（按需启动），改成 0（随内核启动）
+:: iSCSI 发起端随内核启动（默认 3=按需）
 reg add "HKLM\OFF\ControlSet001\Services\msiscsi" /v Start /t REG_DWORD /d 0 /f
-:: 客户机用的那块网卡驱动也要随内核加载（一般装驱动后就是 boot-start，不是再改成 0）
-reg add "HKLM\OFF\ControlSet001\Services\<网卡驱动服务名>" /v Start /t REG_DWORD /d 0 /f
 reg unload HKLM\OFF
 ```
 
-- 网卡驱动服务名（如 `e1i63x64`、`rt640x64`、`mlx5`）可以在 PE 里 `reg query "HKLM\OFF\ControlSet001\Services" /s /v ImagePath` 找，或看已装系统的“设备管理器 → 网卡 → 属性 → 驱动程序 → 服务名”。
-- 不用在注册表里配 IP / 网关 / DNS：iPXE 已经 DHCP 好，并把这些和目标信息一起通过 iBFT 交给 Windows。
+- 还起不来，再把 iBFT 里那块网卡的驱动也设成 `Start=0`。服务名查法：PE 里 `wmic nic where "NetEnabled=true" get Name,ServiceName`；或离线 `reg query "HKLM\OFF\ControlSet001\Enum\PCI" /s /v Driver | findstr /i 4d36e972`，再看该设备实例的 `Service`（本机实测网卡 `rtwlane6` 就是这么查出来的）。
 
 **5）回后台「iSCSI 挂载」页点卸载**，把这块盘从 iSCSI 上摘下来。
 
