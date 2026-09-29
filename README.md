@@ -182,7 +182,7 @@ exit
 net start msiscsi            :: 服务起来后，磁盘管理里应能看到那块 iSCSI 盘（iBFT 给的）
 ```
 
-然后挂上 Windows 安装 ISO（再挂一个光驱），在 PE 里打开"此电脑"**直接双击那个光驱运行 setup**（不用去找 `sources\setup.exe`），选那块 iSCSI 盘安装（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）。
+然后挂上 Windows 安装 ISO（再挂一个光驱），在 PE 里打开"此电脑"双击那个光驱运行 setup，选那块 iSCSI 盘安装（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）。
 
 - **只能用官方安装程序装**：别用 Dism++/dism 释放 `install.wim` 造这块盘——不经 Setup 就不会登记 iSCSI 启动信息，装出来起不来。母盘做完要批量发，再 `sysprep` + 捕获镜像，且只能发给同型号网卡的机器。
 - 用 `iscsicli`（QAddTargetPortal → ListTargets → QLoginTarget）手动连上来的盘能看见，但 Setup 会拒装（报"硬件可能不支持启动到此磁盘"）——所以盘必须由 iPXE sanhook 挂、带 iBFT。
