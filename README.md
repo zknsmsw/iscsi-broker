@@ -164,17 +164,28 @@ sudo python3 iscsi_broker.py
 
 **2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是下面 iPXE 里要挂的目标。
 
-**3）iPXE 里先 `dhcp`、再 `sanhook` 盘，然后走菜单进 PE**：
+**3）iPXE 里先 `dhcp`、把要装的盘挂到 0x81，再走菜单进 PE**：
 
 ```
 dhcp
-# 把要装系统的盘挂成 0x80（带 iBFT，Setup 才认）
-sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
+# 要装系统的盘挂 0x81：0x80 得留给菜单里的 PE，
+# 否则菜单的 sanboot 也用 0x80，iPXE 会直接报 0x032320（盘号被占用）
+sanhook --drive 0x81 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
 # 进菜单，选 PE 那一项进 PE
 chain http://10.1.1.1:5000/boot.ipxe
 ```
 
-（在 iPXE 提示符里敲，或做成脚本；PE 用来装系统的盘就是上面 sanhook 挂的 0x80。）
+（在 iPXE 提示符里敲，或做成脚本。）
+
+> 如果 Setup 只认 0x80 那块盘（报"硬件可能不支持启动到此磁盘"），就别走菜单，用 wimboot 直接起 PE，把 0x80 留给要装的盘：
+>
+> ```
+> dhcp
+> sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
+> kernel wimboot
+> initrd boot.wim boot.wim
+> boot
+> ```
 
 进 PE 后这块盘应该已经出现在"安装到哪里"里（iBFT 带给 Setup 的），选中它安装（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）：
 
