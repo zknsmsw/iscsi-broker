@@ -160,18 +160,21 @@ sudo python3 iscsi_broker.py
 
 #### Windows 母盘：PE 里装到 iSCSI 盘
 
-**1）准备 PE**：用现成的网络版 PE（**FirPE**、**LefPE for KVM** 这类，自带网卡驱动），文件放到服务器上（丢进 `images/` 也行），按第 3 步的 iPXE 脚本启动它。
+**1）准备 PE**：用现成的网络版 PE（**FirPE**、**LefPE for KVM** 这类，自带网卡驱动），文件丢进 `images/`，菜单里就会多出这一项。
 
-**2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是第 3 步 iPXE 脚本里要挂的目标。
+**2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是下面 iPXE 里要挂的目标。
 
-**3）让 iPXE 把盘挂成 0x80 再进 PE，用官方安装程序装**：
+**3）iPXE 里先 `dhcp`、再 `sanhook` 盘，然后走菜单进 PE**：
 
 ```
+dhcp
+# 把要装系统的盘挂成 0x80（带 iBFT，Setup 才认）
 sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
-kernel wimboot
-initrd boot.wim boot.wim
-boot
+# 进菜单，选 PE 那一项进 PE
+chain http://10.1.1.1:5000/boot.ipxe
 ```
+
+（在 iPXE 提示符里敲，或做成脚本；PE 用来装系统的盘就是上面 sanhook 挂的 0x80。）
 
 进 PE 后这块盘应该已经出现在"安装到哪里"里（iBFT 带给 Setup 的），选中它安装（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）：
 
