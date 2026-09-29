@@ -207,6 +207,9 @@ dhcp-range=192.168.10.100,192.168.10.200,255.255.255.0,12h
 dhcp-option=option:router,192.168.10.1
 # 客户机 DNS：走服务器（dnsmasq 同时做 DNS 时）或直接给上游 DNS
 dhcp-option=option:dns-server,192.168.10.1
+# 上游 DNS：系统用了 systemd-resolved 时，/etc/resolv.conf 里只有 127.0.0.53（本地 stub），
+# dnsmasq 不能拿它当上游（等于自己问自己，解析直接不工作）→ 必须读真实的上游文件
+resolv-file=/run/systemd/resolve/resolv.conf
 # TFTP 服务
 enable-tftp
 tftp-root=/srv/tftp
@@ -222,6 +225,8 @@ dhcp-boot=tag:ipxe,http://192.168.10.1:5000/boot.ipxe
 ```
 
 > `tag:!ipxe` 这个排除条件别省：网卡自带的 PXE 只认 TFTP、不认 HTTP URL，必须先把它引导到 iPXE，再由 iPXE 去取 `http://...` 脚本。
+
+> `resolv-file` 这行也别省：Debian/Ubuntu 默认跑 systemd-resolved，`/etc/resolv.conf` 里只有一个 `nameserver 127.0.0.53`（本地 stub）。dnsmasq 拿它当上游就是自己问自己——`journalctl -u dnsmasq` 里会出现 `ignoring nameserver 127.0.0.53` 之类提示，客户机即使拿到 IP 也解析不了域名。除了指向 `/run/systemd/resolve/resolv.conf`，也可以改用 `no-resolv` + 直接写上游：`server=223.5.5.5`、`server=119.29.29.29`。
 
 **（4）iPXE 推送流程（两跳）**：
 
@@ -241,6 +246,7 @@ dnsmasq --test                     # 校验配置语法
 systemctl restart dnsmasq
 journalctl -u dnsmasq -f           # 看 DHCP/TFTP 日志：DHCPDISCOVER / TFTP 传输
 curl -s tftp://192.168.10.1/undionly.kpxe -o /dev/null && echo "TFTP OK"
+dig @192.168.10.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解析出来才算通
 ```
 
 排查顺序：客户机是否拿到 IP（说明 DHCP 通）→ 是否取到 iPXE（TFTP 通）→ iPXE 是否拉到 `/boot.ipxe`（HTTP 5000 通）→ 是否连上 `3260` 的 iSCSI 盘。
