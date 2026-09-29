@@ -58,7 +58,6 @@
 | `netctrl.py` | **联网控制模块**：`netctrl.conf` 状态读写、FORWARD/NAT 规则托管（iptables 按 MAC 过滤 + MASQUERADE）、开机/巡检规则对齐、改动前自动备份。 |
 | `test_cloud_store.py` | 网盘模块自测脚本（75 项断言），回归用。 |
 | `test_netctrl.py` | 联网控制模块逻辑自测（纯逻辑，不依赖 root/iptables）。 |
-| `test_iscsi_export.py` | 后台手动 iSCSI 挂载模块逻辑自测（纯逻辑，不依赖 root/tgtadm）。 |
 
 ---
 
@@ -192,7 +191,6 @@ sudo python3 iscsi_broker.py
 ```bash
 python test_cloud_store.py   # 网盘模块 75 项断言
 python test_netctrl.py       # 联网控制模块逻辑断言（不依赖 root/iptables）
-python test_iscsi_export.py  # 后台手动 iSCSI 挂载模块逻辑断言（不依赖 root/tgtadm）
 python -m py_compile iscsi_broker.py users_auth.py cloud_store.py netctrl.py
 ```
 
