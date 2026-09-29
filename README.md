@@ -43,7 +43,7 @@
 - **默认行为**：允许或禁止（对未手动设置的客户机生效）；
 - **逐机开关**：Web 后台可对每台客户机单独 允许 / 禁止 / 恢复默认，改动立即生效；
 - 客户机开机（iPXE 请求供给）自动建立/覆写规则，关机规则空转、巡检（默认 30 秒）自动清理“离线且无手动设置”的机器；
-- 被禁机器仍可 PXE/iPXE 无盘启动并使用 iSCSI 盘（只禁外网，不碰服务器自身服务）；客户机互访不受影响；
+- 被禁机器仍可 PXE/iPXE 无盘启动并使用 iSCSI 盘（只禁外网，不碰服务器自身服务）；客户机互访不受影响；MAC 可被伪造（二层局域网通病）；
 - 规则改动前自动 `iptables-save` 快照备份到 `netctrl_backup/`（保留最近 20 份）。
 
 ---
@@ -77,7 +77,7 @@
 └── overlay_*.qcow2 / overlay_*.raw  ← 启动清理的遗留叠加盘
 ```
 
-> `BASE_DIR`、`images/`、`users.conf`、`cloud.conf`、`cloud/` 及其子目录中：**除 `images/` 外全部自动创建**。`images/` 需手动创建并放入母盘 `.raw` 文件（不放则启动菜单显示"无镜像"）。
+> 除 `images/` 外全部自动创建；`images/` 要手动建并放入母盘 `.raw`（不放则启动菜单显示“无镜像”）。
 
 ---
 
@@ -126,7 +126,7 @@
                        └─────────────┘         └─────────────┘
 ```
 
-- **客户机**：不接外网、也不需要外网。开机只做三件事——向服务器要 IP 和引导文件（DHCP）、取 iPXE（TFTP）、取启动脚本并连 iSCSI 盘（HTTP 5000 + iSCSI 3260）。**客户机的所有流量都只到服务器 LAN 口**。
+- **客户机**：不接外网，只跟服务器打交道——DHCP 要 IP 和引导文件、TFTP 取 iPXE、HTTP 5000 取启动脚本、3260 连 iSCSI 盘。
 - **客户机的默认网关必须指向服务器 LAN 口 IP**（由 dnsmasq 下发 `option:router`）。这样客户机出外网的流量才会经过服务器的 FORWARD + MASQUERADE，按 MAC 的联网控制（NETCTRL）才有意义；网关留空则客户机不能上网，但无盘启动照常。
 - **服务器**：WAN 口接外网 / 上级路由（默认路由所在的网卡）；LAN 口接交换机，配静态 IP（示例 `10.1.1.1/24`）。脚本会自动探测网卡（带默认路由的=外网卡，另一张有 IPv4 且 UP 的=内网卡），多网卡或探测不准时用 `NETCTRL_LAN_IF` / `NETCTRL_WAN_IF` 显式指定。
 - 脚本启动时会开启 `net.ipv4.ip_forward=1`、关闭 IPv6 转发（客户机不分配 IPv6，防止绕过联网控制），并按配置清空 / 重建 FORWARD、POSTROUTING 规则。
@@ -152,11 +152,11 @@ sudo python3 iscsi_broker.py
 
 ### 3. 母盘（镜像）制作：Linux / Windows
 
-“制作母盘”= 把一套系统**装进一块整盘镜像**，并让它在 **iSCSI 上能自己启动**：
+“制作母盘”= 把系统**装进一块整盘 raw**，并让它在 iSCSI 上能自己启动：
 
-- iPXE 的 `sanboot iscsi:...` 把盘挂成 0x80、给系统留一份 **iBFT**，随后撤掉自己的 hook；内核起来后这块盘要靠**系统自己的 iSCSI 发起端**重新连上。
-- 所以系统里必须有能在**内核启动阶段**跑起来的 iSCSI 发起端和网卡驱动，并让它们随内核启动；否则交棒后盘就“消失”（Windows 卡 0x7B / `INACCESSIBLE_BOOT_DEVICE`，Linux initramfs 找不到 root）。
-- 前提：成品是**整盘 raw**；固件要匹配（BIOS→**MBR+活动分区**，UEFI→**GPT+ESP**）；客户机那块**网卡驱动必须在系统里**（跑安装程序装时会从 PE 带过去，Dism++ 离线释放就要自己加）。
+- 固件要匹配：BIOS→**MBR+活动分区**，UEFI→**GPT+ESP**；
+- iPXE 交棒后盘由**系统自己的 iSCSI 发起端**接管，所以系统里必须让 iSCSI 发起端和网卡驱动**随内核启动**（Windows 改注册表 `Start=0`，Linux 配 initramfs），否则卡 0x7B / `INACCESSIBLE_BOOT_DEVICE` / initramfs 找不到 root。不能先装到本地盘再转过来；
+- 客户机那块**网卡驱动必须在系统里**（跑安装程序装时会从 PE 带过去，Dism++ 离线释放就要自己加）。
 
 #### Windows 母盘：PE 里装到 iSCSI 盘
 
@@ -215,7 +215,7 @@ iscsiadm -m node -T iqn.2026-07.storage:web-debian -p 10.1.1.1 --login
 
 分区按固件来（BIOS→MBR+活动分区，UEFI→GPT+ESP），把系统装到这块盘。
 
-**3）让 initramfs 支持从 iSCSI 启动**（关键，否则内核换成自己的驱动栈后找不到 root）：
+**3）让 initramfs 支持从 iSCSI 启动**：
 
 - dracut（RHEL / Fedora / openSUSE）：内核参数加
   ```
@@ -248,22 +248,19 @@ qemu-img info /home/prts/server/images/win11.raw   # raw 的 virtual size 就是
 fdisk -l /home/prts/server/images/win11.raw        # 确认分区表、活动分区 / ESP
 ```
 
-能不能真正启动，**只能用一台客户机走一遍 PXE/iSCSI 启动**来验证；用本机 `virt-install --import` 试没意义（本地盘没有 iSCSI 启动这条路，Windows 母盘还会因为启动网卡/发起端没接管而失败）。
+能不能启动，只能用一台客户机走一遍 PXE/iSCSI 启动来验证。
 
 #### 几个容易踩的坑
 
 - **母盘只是模板**：客户机默认从它 reflink 出各自的叠加盘，谁都不写母盘；但“回写模式”和后台“iSCSI 挂载”是**直接写母盘**的，别拿唯一一份去试，留备份。
 - **容量一次定好**：母盘多大，客户机看到的盘就多大（如 64G）；盘内别塞满，留空间给客户机自己用。
 - **一种固件一张盘**：BIOS 母盘只能给 BIOS 客户机，UEFI 母盘只能给 UEFI 客户机。
-- **装机时机器上别接本地盘**（微软 iSCSI Boot 文档明确写了：有本地盘时引导文件可能落到本地盘，做出来就是一块起不来的盘）。
-- **网卡要匹配**：iSCSI 启动绑定安装时那块网卡，微软文档的说法是“**换网卡就得重装**”；所以母盘只部署到同型号网卡的机器，机型杂就把常用网卡驱动都注入进去。
-- **启动网卡上别装网络过滤驱动**（VPN / 防火墙 / 带网络过滤的杀软），微软文档明确不支持。
-- **iSCSI 启动不能休眠/睡眠**（微软文档），所以装完就 `powercfg /h off`。
-- **装完别急着重启**：注册表（Windows）/ initramfs（Linux）没配好就重启，等于给自己造一块启动不了的盘。
+- **装机时机器上别接本地盘**：有本地盘时引导文件可能落到本地盘，做出来就是一块起不来的盘。
+- **网卡要匹配**：iSCSI 启动绑定安装时那块网卡，换网卡就得重装；机型杂就把常用网卡驱动都注入进去。
+- **启动网卡上别装网络过滤驱动**（VPN / 防火墙 / 带网络过滤的杀软）。
+- **iSCSI 启动不能休眠/睡眠**，装完就 `powercfg /h off`。
 
 ### 4. dnsmasq 部署（DHCP + TFTP + iPXE 推送）
-
-dnsmasq 一台机器同时干三件事：给客户机分配 IP、用 TFTP 把 **iPXE 引导器**推给客户机的网卡 PXE，iPXE 起来后再 chain 到本程序的 HTTP 接口取启动菜单。
 
 **（1）先确认内网只有一个 DHCP**：同一广播域里如果有第二个 DHCP（systemd-networkd / NetworkManager 自带的 dnsmasq / isc-dhcp-server / kea / udhcpd / 上级路由器），会和你的 dnsmasq 抢答——客户机可能拿到别的网段 IP、拿不到 iPXE 引导文件，表现就是 PXE 启动时好时坏。按下面四步查一遍，确认应答的只有你的 dnsmasq（示例网卡 `enp3s0`、服务器 LAN IP `10.1.1.1`）：
 
@@ -318,8 +315,7 @@ dhcp-range=10.1.1.100,10.1.1.200,255.255.255.0,12h
 dhcp-option=option:router,10.1.1.1
 # 客户机 DNS：走服务器（dnsmasq 同时做 DNS 时）或直接给上游 DNS
 dhcp-option=option:dns-server,10.1.1.1
-# 上游 DNS：系统用了 systemd-resolved 时，/etc/resolv.conf 里只有 127.0.0.53（本地 stub），
-# dnsmasq 不能拿它当上游（等于自己问自己，解析直接不工作）→ 必须读真实的上游文件
+# 上游 DNS：systemd-resolved 环境下 /etc/resolv.conf 只有 127.0.0.53，必须显式读真实上游
 resolv-file=/run/systemd/resolve/resolv.conf
 # TFTP 服务
 enable-tftp
@@ -335,16 +331,9 @@ dhcp-userclass=set:ipxe,iPXE
 dhcp-boot=tag:ipxe,http://10.1.1.1:5000/boot.ipxe
 ```
 
-> `tag:!ipxe` 这个排除条件别省：网卡自带的 PXE 只认 TFTP、不认 HTTP URL，必须先把它引导到 iPXE，再由 iPXE 去取 `http://...` 脚本。
+> `resolv-file` 这行别省：systemd-resolved 环境下 dnsmasq 拿 127.0.0.53 当上游就是自己问自己；也可以改用 `no-resolv` + `server=223.5.5.5`。
 
-> `resolv-file` 这行也别省：Debian/Ubuntu 默认跑 systemd-resolved，`/etc/resolv.conf` 里只有一个 `nameserver 127.0.0.53`（本地 stub）。dnsmasq 拿它当上游就是自己问自己——`journalctl -u dnsmasq` 里会出现 `ignoring nameserver 127.0.0.53` 之类提示，客户机即使拿到 IP 也解析不了域名。除了指向 `/run/systemd/resolve/resolv.conf`，也可以改用 `no-resolv` + 直接写上游：`server=223.5.5.5`、`server=119.29.29.29`。
-
-**（4）iPXE 推送流程（两跳）**：
-
-1. **第一跳**：客户机网卡 PXE 向 dnsmasq 要 IP → 下发的引导文件是 `undionly.kpxe`（BIOS）或 `ipxe.efi`（UEFI）→ 客户机用 TFTP 取回并运行 iPXE。
-2. **第二跳**：iPXE 会再发一次 DHCP，报上自己的 user-class `iPXE` → dnsmasq 命中 `tag:ipxe`，把**启动脚本 URL** `http://10.1.1.1:5000/boot.ipxe` 当引导文件发下去 → iPXE 用 HTTP 取回脚本并执行（本程序的 `/boot.ipxe` 会生成菜单，选择镜像后返回 `sanboot iscsi:...` 连盘启动）。
-
-所以 DHCP 里配置的**唯一** chain 地址就是 `http(s)://<服务器IP>:5000/boot.ipxe`；若开了 `HTTPS_ENABLED`，这里要同步改成 `https://`（TLS 只影响 HTTP 这一段，TFTP 不受影响）。
+**（4）流程**：网卡 PXE 从 DHCP 拿到 `undionly.kpxe` / `ipxe.efi`（TFTP）→ iPXE 再发一次 DHCP（user-class `iPXE`）拿到 `http://10.1.1.1:5000/boot.ipxe` 并执行。所以 DHCP 里**唯一**的 chain 地址就是 `http(s)://<服务器IP>:5000/boot.ipxe`（开了 `HTTPS_ENABLED` 就改 https，TFTP 那段不受影响）。
 
 > 如果 iPXE 没按 user-class 命中（老版本或想固定写死），可以给 iPXE 内置脚本：把 `#!ipxe`、`dhcp`、`chain http://10.1.1.1:5000/boot.ipxe` 三行存成 `embed.ipxe`，然后 `make bin/undionly.kpxe EMBED=embed.ipxe` 编译，用这个引导器替换 TFTP 根目录里的文件即可。
 
@@ -399,23 +388,3 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
 | 默认配额 | 1 GiB | 新注册账号配额，管理员可在后台修改 |
 
 **账号规则**：用户名 3-32 位 `[A-Za-z0-9_-]`（保留 `admin`）；密码 6-32 位同字符集；配额 1 字节 ~ 8 TiB。
-
----
-
-## 六点五、联网控制说明
-
-- **原理**：客户机以服务器为网关，出外网流量必经 FORWARD。本功能在 FORWARD 第 1 条挂专用链 `NETCTRL`，按客户机 MAC 判定“内网→外网”流量：手动设置优先，其余按默认行为（allow/deny）兜底；NAT 回程（`RELATED,ESTABLISHED`）与 `MASQUERADE` 一并托管。
-- **规则生命周期**：客户机开机（PXE/iPXE 请求、ARP 邻居表出现、iSCSI 连接）→ 立即建立/覆写规则；关机 → 规则空转无害；巡检线程（`NETCTRL_RECONCILE_INTERVAL` 秒）自动清理“离线且无手动设置”的机器；Web 改策略立即生效并写入 `netctrl.conf`。
-- **接管模式**：`NETCTRL_FULL_TAKEOVER=True`（默认）时，启动会**清空 FORWARD 与 POSTROUTING 并重建托管规则**——旧的转发/NAT 手工规则（如原来手写的 `-A FORWARD ... ACCEPT`、`MASQUERADE`）会被替换，无需手动清理；如需与其他规则共存，设为 `False`（只管理自己的链）。
-- **REJECT vs DROP**：`NETCTRL_REJECT=True` 时被禁客户机**立即**收到“无法连接”（推荐）；`False` 时静默丢包，客户机卡到超时才失败。
-- **IPv6**：客户机不分配 IPv6；启动时关闭 IPv6 转发（`net.ipv6.conf.all.forwarding=0`），防止走 IPv6 绕过。
-- **限制**：MAC 可被伪造（二层局域网通病）；只控制“出外网”方向，不控制客户机互访；需 root 运行（项目本身要求）。
-- **备份**：接管/重建前自动 `iptables-save` 快照到 `netctrl_backup/`（保留 20 份），随时可还原。
-
----
-
-## 七、已知限制
-
-- `images/` 母盘目录不会自动创建，需手动放置 `.raw`。
-- 母盘 `images/*.raw` 会被视为启动菜单镜像；网盘数据在 `cloud/` 下，与母盘隔离。
-- Web 登录目前仅 `sleep(1)` 防爆破，无 IP 级窗口限速。
