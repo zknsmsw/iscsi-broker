@@ -152,117 +152,139 @@ sudo python3 iscsi_broker.py
 
 ### 3. 母盘（镜像）制作：Linux / Windows
 
-"制作母盘"就是把一套系统**装进一块整盘镜像**里，并让它能独立引导——不是把现成文件拷来拷去。三条前提决定了怎么装：
+“制作母盘”= 把一套系统**装进一块整盘镜像**，并让它在 **iSCSI 上能自己启动**。先把原理说清楚，否则装出来的盘一定起不来：
 
-- 成品必须是**整盘 raw**（含分区表 + 引导记录），不是分区镜像、不是 qcow2/vmdk；
-- **固件匹配**：给 BIOS(Legacy) 客户机做的母盘要 **MBR + 活动分区**，给 UEFI 客户机做的要 **GPT + ESP(FAT32)**，两者不能互用；
-- 安装时磁盘控制器用 **SATA/AHCI**（不要 virtio）：客户机上由固件把 iSCSI 盘呈现成普通直连盘，系统里没有 virtio 驱动会 0x7B 蓝屏。
+- iPXE 的 `sanboot iscsi:...` 会把 SAN 盘挂成 0x80、给系统留一份 **iBFT**（iSCSI Boot Firmware Table，iPXE 文档明确说 SAN 盘会通过 iBFT 描述），随后**撤掉自己的 hook**；内核起来后，这块盘要靠**系统自己的 iSCSI 发起端**重新连上。
+- 所以系统里**必须**有能在“内核启动阶段”就跑起来的 iSCSI 发起端和网卡驱动，并且注册表/内核参数要让它们随内核启动。否则 iPXE 一交棒盘就“消失”：Windows 卡在 `INACCESSIBLE_BOOT_DEVICE` / 0x7B，Linux 是 initramfs 找不到 root。
+- 因此 Windows 母盘**不能**在普通虚拟机里对着本地盘装完再转过来——必须让安装程序**直接装在 iSCSI 盘上**，安装阶段才会把网卡和 iSCSI 发起端登记成启动设备。
+- 另外的前提：成品是**整盘 raw**；固件要匹配（BIOS→**MBR+活动分区**，UEFI→**GPT+ESP**）；**客户机网卡驱动必须进系统**（Windows 要手动注入，Linux 一般在 initramfs 里带上）。
 
-> 母盘里**不需要**装 iSCSI 发起端：连盘是 iPXE / 固件在操作系统启动之前完成的，系统只当它是一块本地盘。
+#### Windows 母盘：在 iPXE 引导的 WinPE 里装到 iSCSI 盘
 
-#### Windows 母盘
+**1）做 WinPE，并塞进客户机网卡驱动**（PE 里没有网卡驱动就连不上 iSCSI）：
 
-**1）建盘，用安装 ISO 引导安装（BIOS 装法）：**
-
-```bash
-qemu-img create -f qcow2 /tmp/win11-build.qcow2 64G
-virt-install --name build-win11 --ram 8192 --vcpus 4 \
-  --disk path=/tmp/win11-build.qcow2,format=qcow2,bus=sata \
-  --cdrom /data/iso/Win11.iso --network network=default \
-  --graphics vnc,listen=0.0.0.0
+```cmd
+copype amd64 C:\temp\winpe
+imagex /mountrw C:\temp\winpe\amd64\media\sources\boot.wim 1 C:\temp\winpe\amd64\mount
+dism /image:C:\temp\winpe\amd64\mount /add-driver /driver:C:\temp\winpe\drivers /recurse
+imagex /unmount /commit C:\temp\winpe\amd64\mount
 ```
 
-- 做 UEFI 母盘就加 `--boot uefi`（需要 OVMF），让安装程序自己建 GPT + ESP；
-- 分区按固件来：BIOS 母盘让 Windows 建 MBR + 活动分区，别留一块没有引导代码的盘。
+把 `wimboot`、`boot.wim` 放到 Web/TFTP 目录，交给 iPXE 引导（iPXE 官方 WinPE 文档的写法）：
 
-**2）装完后在系统里做"模板化"处理（这一步才是母盘制作的关键）：**
+```
+#!ipxe
+kernel wimboot
+initrd boot.wim boot.wim
+boot
+```
 
-- 装好客户机实际要用的驱动（网卡、芯片组）；存储控制器保持 AHCI/SATA 的通用驱动，别装只对某台机器有效的私有驱动；
-- 关休眠 / 快速启动，避免镜像里带休眠文件、克隆后被当成异常关机：
-  ```cmd
-  powercfg /h off
+**2）在 PE 里连上服务器的 iSCSI 目标，把系统装到这块盘上**：
+
+```cmd
+wpeinit
+iscsicli QAddTargetPortal 10.1.1.1
+iscsicli QLoginTarget iqn.2026-07.storage:web-win11
+diskpart                       :: list disk → 应能看到这块 iSCSI 盘
+```
+
+（也可以先在 iPXE 里 `sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn...` 把盘挂上，再引导 PE。）
+
+装系统两种做法：
+
+```cmd
+:: A. 图形安装：在 PE 里跑安装程序，"安装到哪里"选那块 iSCSI 盘（分区按固件来：BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）
+\\server\installers\win11\setup.exe
+
+:: B. 直接展开镜像
+dism /Apply-Image /ImageFile:install.wim /Index:1 /ApplyDir:C:\
+bcdboot C:\Windows /s C: /f BIOS        :: BIOS 写进系统分区；UEFI 则把 ESP 挂到 S:，用 /s S: /f UEFI
+
+:: 无论哪种，都要把客户机网卡驱动注入到刚装好的系统里（否则内核启动阶段没网卡驱动，照样连不上 iSCSI）
+dism /Image:C:\ /Add-Driver /Driver:D:\drivers\nic /Recurse
+```
+
+**3）装完先别重启**，在 PE 里离线改注册表，让 iSCSI 服务和网卡跟内核一起启动：
+
+```cmd
+reg load HKLM\OFF C:\Windows\System32\config\SYSTEM
+:: iSCSI 发起端：Windows 默认是 3（按需启动），必须改成 0（内核启动）
+reg add "HKLM\OFF\ControlSet001\Services\msiscsi" /v Start /t REG_DWORD /d 0 /f
+:: 客户机实际用的那块网卡驱动服务也要 0（不然内核起来时网卡还没加载，iSCSI 连不上）
+reg add "HKLM\OFF\ControlSet001\Services\<网卡驱动服务名>" /v Start /t REG_DWORD /d 0 /f
+:: 给启动网卡预置 TCP/IP：内核阶段 DHCP 客户端服务还没起来，这些值必须先在
+reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v EnableDHCP /t REG_DWORD /d 1 /f
+reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v DhcpIPAddress /t REG_SZ /d 10.1.1.100 /f
+reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v DhcpSubnetMask /t REG_SZ /d 255.255.255.0 /f
+reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v DhcpDefaultGateway /t REG_SZ /d 10.1.1.1 /f
+reg add "HKLM\OFF\ControlSet001\Services\Tcpip\Parameters\Interfaces\{网卡GUID}" /v DhcpNameServer /t REG_SZ /d 10.1.1.1 /f
+reg unload HKLM\OFF
+```
+
+- `{网卡GUID}`：`...\Tcpip\Parameters\Interfaces\` 下对应启动网卡的那一项；网卡驱动服务名（如 `e1i63x64`、`rt640x64`、`mlx5`）可以在 PE 里 `reg query "HKLM\OFF\ControlSet001\Services" /s /v ImagePath`，或已装系统的"设备管理器 → 网卡 → 属性 → 驱动程序 → 服务名"里看；
+- 不想用 DHCP，也可以把这些值改成静态的 `IPAddress` / `SubnetMask` / `DefaultGateway` / `NameServer`；
+- Windows 若从 iPXE 的 iBFT 拿到了目标信息，会据此重连；如果你的 iPXE/固件不提供 iBFT，就得自己写持久目标（`HKLM\SYSTEM\CurrentControlSet\Services\MSiSCSI\Parameters`，或在 PE 里用 `iscsicli AddPersistentTarget`）。
+
+**4）第一次启动**：用客户机的 iPXE `sanboot` 起（不是本地盘），能进系统就说明母盘成立。进系统后再做模板化收尾：
+
+```cmd
+powercfg /h off                          :: 关快速启动/休眠，避免克隆机被当成异常关机
+sysprep /oobe /generalize /shutdown      :: 泛化：每台克隆机重新识别硬件、生成自己的 SID/机器名
+```
+
+关机后母盘就绪，放进 `images/` 即可。
+
+#### Linux 母盘：装到 iSCSI 盘 + initramfs 里带 iSCSI
+
+**1）装到 iSCSI 盘上**：iPXE 引导安装 ISO（或先 `sanhook` 挂好盘），安装器里先登录目标再选盘：
+
+```bash
+iscsiadm -m discovery -t sendtargets -p 10.1.1.1
+iscsiadm -m node -T iqn.2026-07.storage:web-debian -p 10.1.1.1 --login
+```
+
+分区按固件来（BIOS→MBR+活动分区，UEFI→GPT+ESP），把系统装到这块盘。
+
+**2）让 initramfs 支持从 iSCSI 启动**（关键，否则内核换成自己的驱动栈后找不到 root）：
+
+- dracut（RHEL / Fedora / openSUSE）：内核参数加
   ```
-- 泛化：让每台克隆机首次开机重新识别硬件、生成自己的 SID 和计算机名：
-  ```cmd
-  sysprep /oobe /generalize /shutdown
+  rd.neednet=1 rd.iscsi.firmware=1 ip=ibft
   ```
-  想连 OOBE 也免掉，就用 `autounattend.xml` 应答文件（装的时候挂进虚拟机）自动完成分区、建账号等步骤。
-- 可选：开启自动登录 / 远程桌面，方便无盘客户机起来后直接用。
+  `rd.iscsi.firmware=1` = 从 iPXE 提供的 iBFT 读 iSCSI 参数；也可以显式写
+  `rd.iscsi.target.name=iqn.2026-07.storage:web-debian rd.iscsi.target.ip=10.1.1.1 rd.iscsi.target.port=3260 rd.iscsi.initiator=iqn.2026-07.storage:client`
+- initramfs-tools（Debian / Ubuntu）：装 `open-iscsi`，内核参数用经典写法
+  ```
+  iscsi_target_name=iqn.2026-07.storage:web-debian iscsi_target_ip=10.1.1.1 iscsi_target_port=3260 iscsi_initiator=iqn.2026-07.storage:client
+  ```
+  然后 `update-initramfs -u`（dracut 用 `dracut -f`）。
+- 客户机网卡驱动要在 initramfs 里：一般发行版自带；特殊网卡用 `dracut --add-drivers <模块>` 或写进 `/etc/initramfs-tools/modules`。
 
-**3）关机后转成整盘 raw：**
-
-```bash
-qemu-img convert -O raw -S 4k /tmp/win11-build.qcow2 /home/prts/server/images/win11.raw
-```
-
-#### Linux 母盘
-
-**做法一：安装 ISO（和 Windows 同一路子）**
+**3）系统里的收尾**：`fstab` 和内核 `root=` 用 **UUID**（`blkid` 查）；网络走 DHCP、别写死网卡名和静态 IP；清掉机器专属信息：
 
 ```bash
-qemu-img create -f qcow2 /tmp/debian-build.qcow2 32G
-virt-install --name build-debian --ram 4096 --vcpus 2 \
-  --disk path=/tmp/debian-build.qcow2,format=qcow2,bus=sata \
-  --cdrom /data/iso/debian-12-amd64-netinst.iso --network network=default --graphics vnc
-# 装完后在系统里：
-#   apt install -y openssh-server            # 需要远程就装
-#   网络交给 NetworkManager/systemd-networkd 走 DHCP，别写静态 IP、别写死网卡名
-#   systemctl set-default multi-user.target   # 不需要图形界面就省资源
-#   truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id   # 去掉机器专属 ID
-#   rm -f /etc/ssh/ssh_host_*                 # 让每台克隆机自己生成 host key
-# 关机后转 raw：
-qemu-img convert -O raw -S 4k /tmp/debian-build.qcow2 /home/prts/server/images/debian.raw
+truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id
+rm -f /etc/ssh/ssh_host_*
 ```
 
-**做法二：不用安装器，debootstrap 从零做一个干净母盘**
+**4）第一次启动**同样用客户机 iPXE `sanboot` 验证能进系统，再关机定稿。
 
-```bash
-# 建整盘 raw，BIOS 母盘：MBR + 活动分区
-truncate -s 20G /home/prts/server/images/debian.raw
-parted -s /home/prts/server/images/debian.raw mklabel msdos \
-  mkpart primary ext4 1MiB 100% set 1 boot on
-LOOP=$(losetup -Pf --show /home/prts/server/images/debian.raw)   # 例如 /dev/loop0
-export LOOP
-mkfs.ext4 "${LOOP}p1"
-mount "${LOOP}p1" /mnt
-# 装最小系统
-debootstrap --arch=amd64 bookworm /mnt http://deb.debian.org/debian
-for d in dev proc sys; do mount --bind /$d /mnt/$d; done
-# —— 以下在 chroot 里执行 ——
-chroot /mnt /bin/bash
-apt update && apt install -y linux-image-amd64 grub-pc openssh-server
-echo client01 > /etc/hostname
-grub-install --target=i386-pc --boot-directory=/boot "${LOOP}"
-exit
-# —— 回到宿主 ——
-umount /mnt/dev /mnt/proc /mnt/sys /mnt
-losetup -d "$LOOP"
-```
-
-- 做 UEFI 母盘：分区表用 GPT，另建一个 100~512MB 的 FAT32 分区作 ESP，`grub-install --target=x86_64-efi --efi-directory=/boot/efi --removable`；
-- `fstab` 和内核 `root=` 一律用 **UUID**（`blkid` 查），不要写 `/dev/sda` 这类设备名；
-- 网络走 DHCP，清掉 `machine-id` / SSH host key，别写死主机名和静态 IP。
-
-#### 做完自检
+#### 母盘自检
 
 ```bash
 qemu-img info /home/prts/server/images/win11.raw   # raw 的 virtual size 就是客户机看到的盘大小
 fdisk -l /home/prts/server/images/win11.raw        # 确认分区表、活动分区 / ESP
 ```
 
-用 `virt-install --import` 把母盘拉起来，验证它能自己引导进系统；**验证会写盘，务必用副本试，别拿正式母盘试**：
+能不能真正启动，**只能用一台客户机走一遍 PXE/iSCSI 启动**来验证；用本机 `virt-install --import` 试没意义（本地盘没有 iSCSI 启动这条路，Windows 母盘还会因为启动网卡/发起端没接管而失败）。
 
-```bash
-cp --reflink=auto /home/prts/server/images/win11.raw /tmp/win11-copy.raw   # 不支持 reflink 就直接 cp
-virt-install --name check-win11 --ram 4096 --vcpus 2 --import \
-  --disk path=/tmp/win11-copy.raw,format=raw,bus=sata \
-  --graphics vnc --boot uefi        # 试 BIOS 引导就去掉 --boot uefi
-```
+#### 几个容易踩的坑
 
-#### 两个容易踩的坑
-
-- **母盘只是模板**：客户机默认从它 reflink 出各自的叠加盘，谁都不写母盘；但"回写模式"和后台"iSCSI 挂载"是**直接写母盘**的，别拿唯一一份去试，留备份。
+- **母盘只是模板**：客户机默认从它 reflink 出各自的叠加盘，谁都不写母盘；但“回写模式”和后台“iSCSI 挂载”是**直接写母盘**的，别拿唯一一份去试，留备份。
 - **容量一次定好**：母盘多大，客户机看到的盘就多大（如 64G）；盘内别塞满，留空间给客户机自己用。
+- **一种固件一张盘**：BIOS 母盘只能给 BIOS 客户机，UEFI 母盘只能给 UEFI 客户机。
+- **网卡要匹配**：Windows 母盘里没有客户机那块网卡的驱动，第一次启动就会卡在找不到盘；机型不统一就把常用网卡驱动都注入进去。
+- **装完别急着重启**：注册表（Windows）/ initramfs（Linux）没配好就重启，等于给自己造一块启动不了的盘。
 
 ### 4. dnsmasq 部署（DHCP + TFTP + iPXE 推送）
 
