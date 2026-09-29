@@ -160,33 +160,20 @@ sudo python3 iscsi_broker.py
 
 #### Windows 母盘：PE 里装到 iSCSI 盘
 
-**1）准备 PE（必须是带网卡驱动的 PE）**：官方 `boot.wim` 在 KVM/Proxmox 的 virtio 网卡上没有驱动，PE 里连不到 iSCSI 盘，所以用 **FirPE** / **LefPE for KVM** 这类。服务器上取出它的 WIM，和 `wimboot` 一起放到一个静态 HTTP 目录：
-
-```bash
-mkdir -p /home/prts/server/pe && cd /home/prts/server/pe
-# 从 PE 的 ISO 里取 WIM（文件名可能是 boot.wim / FirPE.wim，看 sources/ 或根目录）
-mkdir -p /mnt/peiso && mount -o loop /path/FirPE.iso /mnt/peiso
-find /mnt/peiso -name '*.wim' -size +100M -exec cp {} ./boot.wim \;
-umount /mnt/peiso
-# wimboot（iPXE 用来起 WIM 的小程序）
-curl -L -o wimboot https://github.com/ipxe/wimboot/releases/latest/download/wimboot
-# 用服务器上现成的 python 起静态目录
-nohup python3 -m http.server 8000 >/tmp/pe_http.log 2>&1 &
-```
+**1）准备 PE（必须是带网卡驱动的 PE）**：官方 `boot.wim` 在 KVM/Proxmox 的 virtio 网卡上没有驱动，PE 里连不到 iSCSI 盘，所以用 **FirPE** / **LefPE for KVM** 这类，**把它的 ISO 挂到客户机（虚拟机）的光驱**——不用提 WIM、不用 wimboot、也不用另起 HTTP 服务。
 
 **2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是下面要挂的目标。
 
-**3）iPXE 里 `dhcp` → 把要装的盘挂成 0x80 → wimboot 起 PE**：
+**3）iPXE 里把要装的盘挂成 0x80，然后 `exit`，让 BIOS 接着从光驱启动 PE**：
 
 ```
 dhcp
 sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
-kernel http://10.1.1.1:8000/wimboot
-initrd http://10.1.1.1:8000/boot.wim boot.wim
-boot
+exit
 ```
 
-- PE 必须**跑在内存里、不占 SAN 盘**：走菜单进 PE 会让 PE 自己占一块 SAN 盘，和要装的盘冲突（抢盘号报 `0x032320`，错开又读盘 I/O 错 `0x1d8520`）。
+- `exit` = 退出 iPXE、继续走虚拟机的启动顺序，所以虚拟机的启动顺序要设成 **网络 → 光驱**。
+- PE 不能占 SAN 盘：走菜单进 PE 会让 PE 自己占一块 SAN 盘，和要装的盘冲突（抢盘号报 `0x032320`，错开又读盘 I/O 错 `0x1d8520`）。
 - 不用在注册表里配 IP / 网关 / DNS：iPXE 已经 DHCP 好，并通过 iBFT 一起交给 Windows。
 
 **4）进 PE 后确认盘、跑官方安装程序**：
@@ -283,8 +270,8 @@ fdisk -l /home/prts/server/images/win11.raw        # 确认分区表、活动分
 - **一种固件一张盘**：BIOS 母盘只能给 BIOS 客户机，UEFI 母盘只能给 UEFI 客户机。
 - **装机时机器上别接本地盘**：有本地盘时引导文件可能落到本地盘，做出来就是一块起不来的盘。
 - **网卡要匹配**：iSCSI 启动绑定安装时那块网卡，换网卡就得重装；机型杂就把常用网卡驱动都注入进去。
-- **PE 要带客户机的网卡驱动**：官方 `boot.wim` 在 KVM/Proxmox 的 virtio 网卡上没有驱动，装系统要用 FirPE / LefPE for KVM 这类，并把它的 WIM 用 wimboot 起。
-- **PE 不能占 SAN 盘**：走菜单进 PE 会让 PE 自己占一块 SAN 盘，和要装的盘冲突（`0x032320` 盘号冲突 / `0x1d8520` 读盘 I/O 错），所以 PE 走 wimboot（或光驱）起。
+- **PE 要带客户机的网卡驱动**：官方 `boot.wim` 在 KVM/Proxmox 的 virtio 网卡上没有驱动，装系统要用 FirPE / LefPE for KVM 这类（ISO 挂虚拟机光驱即可）。
+- **PE 不能占 SAN 盘**：走菜单进 PE 会让 PE 自己占一块 SAN 盘，和要装的盘冲突（`0x032320` 盘号冲突 / `0x1d8520` 读盘 I/O 错），所以 PE 从光驱起（iPXE 里 `sanhook` 后直接 `exit`）。
 - **启动网卡上别装网络过滤驱动**（VPN / 防火墙 / 带网络过滤的杀软）。
 - **页面文件不能放 iSCSI 盘**：Win10（1703 起）第一次启动会 `PAGE_FAULT_IN_NONPAGED_AREA` 蓝屏，装完在 PE 里就把 `PagingFiles` 清空（有本地盘就放到本地盘）。
 - **iSCSI 启动不能休眠/睡眠**，装完就 `powercfg /h off`。
