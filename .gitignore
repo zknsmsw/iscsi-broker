@@ -29,3 +29,6 @@ users.conf
 #联网控制运行时数据（服务器端产生，不入库）
 netctrl.conf
 netctrl_backup/
+
+#测试文件
+test*
