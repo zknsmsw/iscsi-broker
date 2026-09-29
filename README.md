@@ -168,10 +168,13 @@ sudo python3 iscsi_broker.py
 
 ```cmd
 wpeinit
-iscsicli QAddTargetPortal 10.1.1.1
+iscsicli QAddTargetPortal 10.1.1.1        :: 先把门户加进去（发现动作在服务启动/刷新时做）
+iscsicli ListTargets                      :: 先搜到 IQN 再登录；列不出来就 iscsicli RefreshTargetPortal 10.1.1.1 3260
 iscsicli QLoginTarget iqn.2026-07.storage:web-win11
-diskpart                       :: list disk → 应能看到这块 iSCSI 盘
+diskpart                                  :: list disk → 应能看到这块 iSCSI 盘
 ```
+
+图形界面同理：iSCSI 发起程序 →「发现」页添加门户 →「目标」页里选中 IQN → 连接。
 
 装法二选一：
 
