@@ -191,10 +191,17 @@ net start msiscsi            :: 服务起来后，磁盘管理里应能看到那
 
 ```cmd
 reg load HKLM\OFF C:\Windows\System32\config\SYSTEM
+reg query "HKLM\OFF\Select"      :: 看 Current/Default 是哪个控制集，逐个改（001/002 都要）
 
-:: ① 关掉页面文件：iSCSI 盘上放 pagefile，Win10 第一次启动会 PAGE_FAULT_IN_NONPAGED_AREA 蓝屏
-reg delete "HKLM\OFF\ControlSet001\Control\Session Manager\Memory Management" /v PagingFiles /f
-reg delete "HKLM\OFF\ControlSet001\Control\Session Manager\Memory Management" /v ExistingPageFiles /f
+:: ① 关掉页面文件（必做）：iSCSI 盘上放 pagefile，Win10 首启会 PAGE_FAULT_IN_NONPAGED_AREA / msiscsi.sys 蓝屏
+::    注意是"清空"值，不是删除值——删掉后 Windows 会按"自动管理"又建一个到系统盘（还是 iSCSI 盘）
+::    PE 里 regedit：双击 PagingFiles 把内容删空 → 确定；ExistingPageFiles 直接删
+::    或者导入下面这段（空 REG_MULTI_SZ = hex(7):00,00,00,00），ControlSet002 存在就再加一段：
+::      Windows Registry Editor Version 5.00
+::      [HKEY_LOCAL_MACHINE\OFF\ControlSet001\Control\Session Manager\Memory Management]
+::      "PagingFiles"=hex(7):00,00,00,00
+::      "ExistingPageFiles"=hex(7):00,00,00,00
+::    改完回查：PagingFiles 应该是空的，不再是 ?:\pagefile.sys
 
 :: ② iSCSI 发起端随内核启动（默认 3=按需；官方安装程序一般已登记好，起不来再改）
 reg add "HKLM\OFF\ControlSet001\Services\msiscsi" /v Start /t REG_DWORD /d 0 /f
@@ -202,7 +209,7 @@ reg add "HKLM\OFF\ControlSet001\Services\msiscsi" /v Start /t REG_DWORD /d 0 /f
 reg unload HKLM\OFF
 ```
 
-- 页面文件那条是**必做**（等价于 PE 里 regedit 把 `PagingFiles` 清空并删掉 `ExistingPageFiles`）；客户机有本地盘的话，更好的做法是把页面文件放本地盘：`PagingFiles` 写成 `D:\pagefile.sys 4096 8192`。
+- 客户机有本地盘的话，更好的做法是把页面文件放本地盘：`PagingFiles` 写成 `D:\pagefile.sys 1024 4096`（iSCSI 启动想保留页面文件只能放本地盘）。
 - 还起不来，再把 iBFT 里那块网卡的驱动也设成 `Start=0`。服务名查法：PE 里 `wmic nic where "NetEnabled=true" get Name,ServiceName`；或离线 `reg query "HKLM\OFF\ControlSet001\Enum\PCI" /s /v Driver | findstr /i 4d36e972`，再看该设备实例的 `Service`（本机实测网卡 `rtwlane6` 就是这么查出来的）。
 
 **6）回后台「iSCSI 挂载」页点卸载**，把这块盘从 iSCSI 上摘下来。
@@ -273,7 +280,7 @@ fdisk -l /home/prts/server/images/win11.raw        # 确认分区表、活动分
 - **PE 要带客户机的网卡驱动**：官方 `boot.wim` 在 KVM/Proxmox 的 virtio 网卡上没有驱动，装系统要用 FirPE / LefPE for KVM 这类（ISO 挂虚拟机光驱即可）。
 - **PE 不能占 SAN 盘**：走菜单进 PE 会让 PE 自己占一块 SAN 盘，和要装的盘冲突（`0x032320` 盘号冲突 / `0x1d8520` 读盘 I/O 错），所以 PE 从光驱起（iPXE 里 `sanhook` 后直接 `exit`）。
 - **启动网卡上别装网络过滤驱动**（VPN / 防火墙 / 带网络过滤的杀软）。
-- **页面文件不能放 iSCSI 盘**：Win10（1703 起）第一次启动会 `PAGE_FAULT_IN_NONPAGED_AREA` 蓝屏，装完在 PE 里就把 `PagingFiles` 清空（有本地盘就放到本地盘）。
+- **页面文件不能放 iSCSI 盘**：Win10（1703 起）第一次启动会 `PAGE_FAULT_IN_NONPAGED_AREA`（msiscsi.sys）蓝屏。装完在 PE 里把 `PagingFiles` 的**值清空**（是清空不是删掉，删了会被"自动管理"再建一个；`ControlSet001`/`002` 都要改），有本地盘就放本地盘。
 - **iSCSI 启动不能休眠/睡眠**，装完就 `powercfg /h off`。
 
 ### 4. dnsmasq 部署（DHCP + TFTP + iPXE 推送）
