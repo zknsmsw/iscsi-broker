@@ -86,7 +86,7 @@
 ### 系统依赖（Linux，需 root）
 | 依赖 | 用途 |
 |------|------|
-| Python 3.10+ | 运行脚本（代码使用 `str \| None` 等 3.10 语法；3.12 验证通过） |
+| Python 3.10+ | 运行脚本（代码使用 `str \| None` 等 3.10 语法） |
 | tgt（`tgtadm`） | iSCSI target 管理（创建/删除 target、LUN） |
 | qemu-utils（`qemu-img`、`qemu-nbd`） | 路线 B qcow2 叠加盘（路线 A 不需要） |
 | Linux `nbd` 内核模块 | 路线 B 的 `/dev/nbdX` 块设备（`modprobe nbd max_part=8 nbds_max=16`） |
