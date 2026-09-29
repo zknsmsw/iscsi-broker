@@ -160,44 +160,47 @@ sudo python3 iscsi_broker.py
 
 #### Windows 母盘：PE 里装到 iSCSI 盘
 
-**1）准备 PE**：用现成的网络版 PE（**FirPE**、**LefPE for KVM** 这类，自带网卡驱动），文件丢进 `images/`，菜单里就会多出这一项。
+**1）准备 PE（必须是带网卡驱动的 PE）**：官方 `boot.wim` 在 KVM/Proxmox 的 virtio 网卡上没有驱动，PE 里连不到 iSCSI 盘，所以用 **FirPE** / **LefPE for KVM** 这类。服务器上取出它的 WIM，和 `wimboot` 一起放到一个静态 HTTP 目录：
 
-**2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是下面 iPXE 里要挂的目标。
+```bash
+mkdir -p /home/prts/server/pe && cd /home/prts/server/pe
+# 从 PE 的 ISO 里取 WIM（文件名可能是 boot.wim / FirPE.wim，看 sources/ 或根目录）
+mkdir -p /mnt/peiso && mount -o loop /path/FirPE.iso /mnt/peiso
+find /mnt/peiso -name '*.wim' -size +100M -exec cp {} ./boot.wim \;
+umount /mnt/peiso
+# wimboot（iPXE 用来起 WIM 的小程序）
+curl -L -o wimboot https://github.com/ipxe/wimboot/releases/latest/download/wimboot
+# 用服务器上现成的 python 起静态目录
+nohup python3 -m http.server 8000 >/tmp/pe_http.log 2>&1 &
+```
 
-**3）iPXE 里先 `dhcp`、把要装的盘挂到 0x81，再走菜单进 PE**：
+**2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是下面要挂的目标。
+
+**3）iPXE 里 `dhcp` → 把要装的盘挂成 0x80 → wimboot 起 PE**：
 
 ```
 dhcp
-# 要装系统的盘挂 0x81：0x80 得留给菜单里的 PE，
-# 否则菜单的 sanboot 也用 0x80，iPXE 会直接报 0x032320（盘号被占用）
-sanhook --drive 0x81 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
-# 进菜单，选 PE 那一项进 PE
-chain http://10.1.1.1:5000/boot.ipxe
+sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
+kernel http://10.1.1.1:8000/wimboot
+initrd http://10.1.1.1:8000/boot.wim boot.wim
+boot
 ```
 
-（在 iPXE 提示符里敲，或做成脚本。）
-
-> 如果 Setup 只认 0x80 那块盘（报"硬件可能不支持启动到此磁盘"），就别走菜单，用 wimboot 直接起 PE，把 0x80 留给要装的盘：
->
-> ```
-> dhcp
-> sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn.2026-07.storage:web-win11
-> kernel wimboot
-> initrd boot.wim boot.wim
-> boot
-> ```
-
-进 PE 后这块盘应该已经出现在"安装到哪里"里（iBFT 带给 Setup 的），选中它安装（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）：
-
-```cmd
-\\server\installers\win11\setup.exe
-```
-
-- **只能用官方安装程序装**：别用 Dism++/dism 释放 `install.wim` 来造这块盘——不经 Setup 就不会登记 iSCSI 启动信息，装出来启动不了。母盘做完要批量分发，再 `sysprep` + 捕获镜像，且只能发给同型号网卡的机器。
-- PE 里看不到盘，先 `net start msiscsi`；用 `iscsicli`（QAddTargetPortal → ListTargets → QLoginTarget）挂上来的盘能看见，但 Setup 会拒装（报"硬件可能不支持启动到此磁盘"），所以要走上面的 sanhook。
+- PE 必须**跑在内存里、不占 SAN 盘**：走菜单进 PE 会让 PE 自己占一块 SAN 盘，和要装的盘冲突（抢盘号报 `0x032320`，错开又读盘 I/O 错 `0x1d8520`）。
 - 不用在注册表里配 IP / 网关 / DNS：iPXE 已经 DHCP 好，并通过 iBFT 一起交给 Windows。
 
-**4）装完先别重启**；官方安装程序正常会登记好 iSCSI 启动，起不来时再补注册表：
+**4）进 PE 后确认盘、跑官方安装程序**：
+
+```cmd
+net start msiscsi            :: 服务起来后，磁盘管理里应能看到那块 iSCSI 盘（iBFT 给的）
+```
+
+然后挂上 Windows 安装 ISO，跑它的 `sources\setup.exe`，选那块盘安装（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）。
+
+- **只能用官方安装程序装**：别用 Dism++/dism 释放 `install.wim` 造这块盘——不经 Setup 就不会登记 iSCSI 启动信息，装出来起不来。母盘做完要批量发，再 `sysprep` + 捕获镜像，且只能发给同型号网卡的机器。
+- 用 `iscsicli`（QAddTargetPortal → ListTargets → QLoginTarget）手动连上来的盘能看见，但 Setup 会拒装（报"硬件可能不支持启动到此磁盘"）——所以盘必须由 iPXE sanhook 挂、带 iBFT。
+
+**5）装完先别重启**；官方安装程序正常会登记好 iSCSI 启动，起不来时再补注册表：
 
 ```cmd
 reg load HKLM\OFF C:\Windows\System32\config\SYSTEM
@@ -208,9 +211,9 @@ reg unload HKLM\OFF
 
 - 还起不来，再把 iBFT 里那块网卡的驱动也设成 `Start=0`。服务名查法：PE 里 `wmic nic where "NetEnabled=true" get Name,ServiceName`；或离线 `reg query "HKLM\OFF\ControlSet001\Enum\PCI" /s /v Driver | findstr /i 4d36e972`，再看该设备实例的 `Service`（本机实测网卡 `rtwlane6` 就是这么查出来的）。
 
-**5）回后台「iSCSI 挂载」页点卸载**，把这块盘从 iSCSI 上摘下来。
+**6）回后台「iSCSI 挂载」页点卸载**，把这块盘从 iSCSI 上摘下来。
 
-**6）第一次启动用 Admin Mode（回写模式）**：普通菜单启动会给客户机生成叠加盘，第一次是要写母盘本身，所以 iPXE 菜单里选 **Admin Mode**（输 admin 密码）→ 选 `win11` 启动，把系统配置做完（装软件、驱动、系统设置），然后关机：
+**7）第一次启动用 Admin Mode（回写模式）**：普通菜单启动会给客户机生成叠加盘，第一次是要写母盘本身，所以 iPXE 菜单里选 **Admin Mode**（输 admin 密码）→ 选 `win11` 启动，把系统配置做完（装软件、驱动、系统设置），然后关机：
 
 ```cmd
 powercfg /h off                          :: iSCSI 启动不能休眠/睡眠，关掉快速启动
@@ -273,6 +276,8 @@ fdisk -l /home/prts/server/images/win11.raw        # 确认分区表、活动分
 - **一种固件一张盘**：BIOS 母盘只能给 BIOS 客户机，UEFI 母盘只能给 UEFI 客户机。
 - **装机时机器上别接本地盘**：有本地盘时引导文件可能落到本地盘，做出来就是一块起不来的盘。
 - **网卡要匹配**：iSCSI 启动绑定安装时那块网卡，换网卡就得重装；机型杂就把常用网卡驱动都注入进去。
+- **PE 要带客户机的网卡驱动**：官方 `boot.wim` 在 KVM/Proxmox 的 virtio 网卡上没有驱动，装系统要用 FirPE / LefPE for KVM 这类，并把它的 WIM 用 wimboot 起。
+- **PE 不能占 SAN 盘**：走菜单进 PE 会让 PE 自己占一块 SAN 盘，和要装的盘冲突（`0x032320` 盘号冲突 / `0x1d8520` 读盘 I/O 错），所以 PE 走 wimboot（或光驱）起。
 - **启动网卡上别装网络过滤驱动**（VPN / 防火墙 / 带网络过滤的杀软）。
 - **iSCSI 启动不能休眠/睡眠**，装完就 `powercfg /h off`。
 
