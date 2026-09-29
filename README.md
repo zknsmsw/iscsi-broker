@@ -152,18 +152,19 @@ sudo python3 iscsi_broker.py
 
 ### 3. 母盘（镜像）制作：Linux / Windows
 
-“制作母盘”= 把一套系统**装进一块整盘镜像**，并让它在 **iSCSI 上能自己启动**。先把原理说清楚，否则装出来的盘一定起不来：
+“制作母盘”= 把一套系统**装进一块整盘镜像**，并让它在 **iSCSI 上能自己启动**：
 
-- iPXE 的 `sanboot iscsi:...` 会把 SAN 盘挂成 0x80、给系统留一份 **iBFT**（iSCSI Boot Firmware Table，iPXE 文档明确说 SAN 盘会通过 iBFT 描述），随后**撤掉自己的 hook**；内核起来后，这块盘要靠**系统自己的 iSCSI 发起端**重新连上。
-- 所以系统里**必须**有能在“内核启动阶段”就跑起来的 iSCSI 发起端和网卡驱动，并且注册表/内核参数要让它们随内核启动。否则 iPXE 一交棒盘就“消失”：Windows 卡在 `INACCESSIBLE_BOOT_DEVICE` / 0x7B，Linux 是 initramfs 找不到 root。
-- 因此 Windows 母盘**不能**在普通虚拟机里对着本地盘装完再转过来——必须让安装程序**直接装在 iSCSI 盘上**，安装阶段才会把网卡和 iSCSI 发起端登记成启动设备。
-- 另外的前提：成品是**整盘 raw**；固件要匹配（BIOS→**MBR+活动分区**，UEFI→**GPT+ESP**）；**客户机网卡驱动必须进系统**（Windows 要手动注入，Linux 一般在 initramfs 里带上）。
+- iPXE 的 `sanboot iscsi:...` 把盘挂成 0x80、给系统留一份 **iBFT**，随后撤掉自己的 hook；内核起来后这块盘要靠**系统自己的 iSCSI 发起端**重新连上。
+- 所以系统里必须有能在**内核启动阶段**跑起来的 iSCSI 发起端和网卡驱动，并让它们随内核启动；否则交棒后盘就“消失”（Windows 卡 0x7B / `INACCESSIBLE_BOOT_DEVICE`，Linux initramfs 找不到 root）。
+- 前提：成品是**整盘 raw**；固件要匹配（BIOS→**MBR+活动分区**，UEFI→**GPT+ESP**）；客户机那块**网卡驱动必须在系统里**（跑安装程序装时会从 PE 带过去，Dism++ 离线释放就要自己加）。
 
-#### Windows 母盘：在 iPXE 引导的 WinPE 里装到 iSCSI 盘
+#### Windows 母盘：PE 里装到 iSCSI 盘
 
-**1）准备 PE**：直接用现成的**带网卡驱动的 PE**（网络版 PE 遍地都是，微PE / 优启通这类就行），**不用**自己拿 ADK + imagex/dism 去做，也不用往 `boot.wim` 里塞驱动。把 PE 文件按你平时的做法放到服务器（丢进 `images/` 就行），iPXE 菜单里选它启动进 PE。
+**1）准备 PE**：用现成的网络版 PE（**FirPE**、**LefPE for KVM** 这类，自带网卡驱动），文件丢进 `images/`，iPXE 菜单里选它进 PE。
 
-**2）PE 里连上服务器的 iSCSI 目标**：
+**2）后台创建并挂载母盘**：Web 后台「创建空白盘」填名字和大小（如 `win11` / `64G`）→ 到「iSCSI 挂载」页把它挂载，页面给出的 IQN 就是 PE 里要连的目标。
+
+**3）PE 里连上这个目标，把 Windows 装进去**：
 
 ```cmd
 wpeinit
@@ -172,14 +173,12 @@ iscsicli QLoginTarget iqn.2026-07.storage:web-win11
 diskpart                       :: list disk → 应能看到这块 iSCSI 盘
 ```
 
-（PE 里有图形版 iSCSI 发起程序的话，点两下也一样；也可以在 iPXE 侧先 `sanhook --drive 0x80 iscsi:10.1.1.1:::1:iqn...` 把盘挂上再进 PE。）
+装法二选一：
 
-**3）把 Windows 装到这块盘上**：
+- **跑安装程序**：`\\server\installers\win11\setup.exe`，"安装到哪里"选那块 iSCSI 盘（BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）。这么装，PE 里已加载的网卡驱动会自动带进新系统。
+- **Dism++ 离线展开**：释放映像到那块盘 → 引导修复写引导；离线方式要自己给目标系统加网卡驱动（Dism++ 驱动管理 → 添加驱动）。
 
-- **推荐：直接跑安装程序**。在 PE 里执行 `\\server\installers\win11\setup.exe`，"安装到哪里"选那块 iSCSI 盘（分区按固件来：BIOS 建 MBR+活动分区，UEFI 建 GPT+ESP）。这么装，**PE 里已经加载的网卡驱动会自动带进新系统**，不用另外注入。
-- **或者离线展开**：用 **Dism++**"文件 → 释放映像"把 `install.wim` 释放到那块盘，再用 Dism++ 的"引导修复"写引导（命令行等价物是 `dism /Apply-Image` + `bcdboot`）。离线展开时网卡驱动不会自动带进去，需要在 Dism++ 里打开刚释放的系统 → 驱动管理 → 添加驱动（等价命令：`dism /Image:C:\ /Add-Driver /Driver:D:\drivers\nic /Recurse`），否则内核启动阶段没网卡驱动，照样连不上 iSCSI。
-
-**4）装完先别重启**，在 PE 里把 iSCSI 发起端设成随内核启动（PE 里用 regedit 挂载目标系统的 `C:\Windows\System32\config\SYSTEM`，或直接敲下面命令）：
+**4）装完先别重启**，在 PE 里把 iSCSI 发起端设成随内核启动：
 
 ```cmd
 reg load HKLM\OFF C:\Windows\System32\config\SYSTEM
@@ -193,18 +192,21 @@ reg unload HKLM\OFF
 - 网卡驱动服务名（如 `e1i63x64`、`rt640x64`、`mlx5`）可以在 PE 里 `reg query "HKLM\OFF\ControlSet001\Services" /s /v ImagePath` 找，或看已装系统的“设备管理器 → 网卡 → 属性 → 驱动程序 → 服务名”。
 - 不用在注册表里配 IP / 网关 / DNS：iPXE 已经 DHCP 好，并把这些和目标信息一起通过 iBFT 交给 Windows。
 
-**5）第一次启动**：用客户机的 iPXE `sanboot` 起（不是本地盘），能进系统就说明母盘成立。进系统后再做模板化收尾：
+**5）回后台「iSCSI 挂载」页点卸载**，把这块盘从 iSCSI 上摘下来。
+
+**6）第一次启动用 Admin Mode（回写模式）**：普通菜单启动会给客户机生成叠加盘，第一次是要写母盘本身，所以 iPXE 菜单里选 **Admin Mode**（输 admin 密码）→ 选 `win11` 启动，把系统配置做完（装软件、驱动、系统设置），然后关机：
 
 ```cmd
-powercfg /h off                          :: 关快速启动/休眠，避免克隆机被当成异常关机
-sysprep /oobe /generalize /shutdown      :: 泛化：每台克隆机重新识别硬件、生成自己的 SID/机器名
+powercfg /h off                          :: iSCSI 启动不能休眠/睡眠，关掉快速启动
 ```
 
-关机后母盘就绪，放进 `images/` 即可。
+母盘就绪。之后客户机照常用普通模式启动，就是从这块母盘克隆的叠加盘，改动不落母盘。
 
 #### Linux 母盘：装到 iSCSI 盘 + initramfs 里带 iSCSI
 
-**1）装到 iSCSI 盘上**：iPXE 引导安装 ISO（或先 `sanhook` 挂好盘），安装器里先登录目标再选盘：
+**1）后台创建并挂载母盘**：Web 后台「创建空白盘」（如 `debian` / `32G`）→「iSCSI 挂载」页挂载拿到 IQN。
+
+**2）装到这块盘上**：iPXE 引导安装 ISO 进安装器，先登录目标再选盘：
 
 ```bash
 iscsiadm -m discovery -t sendtargets -p 10.1.1.1
@@ -213,7 +215,7 @@ iscsiadm -m node -T iqn.2026-07.storage:web-debian -p 10.1.1.1 --login
 
 分区按固件来（BIOS→MBR+活动分区，UEFI→GPT+ESP），把系统装到这块盘。
 
-**2）让 initramfs 支持从 iSCSI 启动**（关键，否则内核换成自己的驱动栈后找不到 root）：
+**3）让 initramfs 支持从 iSCSI 启动**（关键，否则内核换成自己的驱动栈后找不到 root）：
 
 - dracut（RHEL / Fedora / openSUSE）：内核参数加
   ```
@@ -228,14 +230,16 @@ iscsiadm -m node -T iqn.2026-07.storage:web-debian -p 10.1.1.1 --login
   然后 `update-initramfs -u`（dracut 用 `dracut -f`）。
 - 客户机网卡驱动要在 initramfs 里：一般发行版自带；特殊网卡用 `dracut --add-drivers <模块>` 或写进 `/etc/initramfs-tools/modules`。
 
-**3）系统里的收尾**：`fstab` 和内核 `root=` 用 **UUID**（`blkid` 查）；网络走 DHCP、别写死网卡名和静态 IP；清掉机器专属信息：
+**4）系统里的收尾**：`fstab` 和内核 `root=` 用 **UUID**（`blkid` 查）；网络走 DHCP、别写死网卡名和静态 IP；清掉机器专属信息：
 
 ```bash
 truncate -s 0 /etc/machine-id && rm -f /var/lib/dbus/machine-id
 rm -f /etc/ssh/ssh_host_*
 ```
 
-**4）第一次启动**同样用客户机 iPXE `sanboot` 验证能进系统，再关机定稿。
+**5）回后台「iSCSI 挂载」页点卸载。**
+
+**6）第一次启动用 Admin Mode（回写模式）**：iPXE 菜单选 Admin Mode（输 admin 密码）→ 选 `debian` 启动，把要装的东西配好，再关机。之后客户机用普通模式启动就是从这块母盘克隆的叠加盘。
 
 #### 母盘自检
 
