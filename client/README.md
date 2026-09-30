@@ -157,5 +157,25 @@ letter=Z                    ; 网盘映射到哪个盘符
   管理员要在后台「通用文件」页先传点东西；登录后才能看到自己的网盘。
 - **Z 盘登录后还是只读**：检查是否真的登录成功（托盘状态显示"已登录：xxx"），以及
   WebClient 服务是否在跑（`sc query WebClient`）。
+- **`net use 失败(rc=2)：系统错误 67 找不到网络名`**（WebDAV 挂载最常见的一个报错）：
+  Windows 的 WebDAV 重定向器（WebClient / DavClnt）连 `http://<服务器>:8080/dav/` 之前，
+  会先发一条 `OPTIONS *` 做 WebDAV 能力探测，**只认这条里有 `DAV: 1, 2` 应答头的服务器**。
+  服务器把它当普通路径回 404/501，重定向器就认为对端不是 WebDAV 服务器，`net use` 直接
+  报“系统错误 67”（而服务器日志里连一条 PROPFIND 都看不到）。服务端 `do_OPTIONS`
+  已对 `OPTIONS *` 回 DAV 头，**排查顺序**：
+  1. **服务器**：是不是包含该修复的版本（老版本必现）；
+  2. **客户机 WebClient**：`sc query WebClient` 要是 RUNNING（否则管理员 `net start WebClient`）；
+  3. **客户机注册表**：`HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters` 里
+     `BasicAuthLevel=2`、`AuthForwardServerList` 含本服务器（以 SYSTEM 身份运行时 agent
+     会自动配好，所以要装成计划任务而不是手动双击）；
+  4. **看 `agent.log` 里的「WebDAV 探测」那一行**：agent 启动时会自己发一次
+     `PROPFIND /dav/`（Depth: 0），把“服务器/网络的问题”和“客户机重定向器的问题”分开：
+
+     | 探测日志 | 含义 |
+     |---|---|
+     | `应答 HTTP 207（地址通，服务端 WebDAV 正常）` | 服务器与令牌都正常，问题在客户机重定向器 → 查 2、3 |
+     | `应答 HTTP 401 —— 接入令牌不对` | 把后台「客户机控制」页的令牌抄进 `agent.ini` |
+     | `连不上服务器 /dav/（…）` | 地址/端口/防火墙问题，此时 Z 盘必然挂不上 |
+
 - 后台「客户机控制」页看不到机器：确认 `agent.ini` 里的 url 通（浏览器打开
   `http://<服务器>:8080/` 试）、令牌没抄错、任务在跑（`schtasks /Query /TN iSCSI-Broker-Agent`）。

@@ -542,6 +542,10 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
   令牌等于控制权（能关机/重启/开 VNC），只在内网用；怀疑泄漏可在后台一键重置。
 - 每机差异（是否挂 Z 盘、默认用户名、在线/VNC/Z 盘状态、指令）全部按 MAC 存在服务器，
   `agent.ini` 里只有全机共用的配置。
+- **Z 盘挂不上、日志报 `net use 失败(rc=2)：系统错误 67 找不到网络名`**：这不是服务器宕机，
+  而是 Windows 的 WebDAV 重定向器（WebClient）没把服务器认成 WebDAV——它连 `/dav/` 之前会先发
+  一条 `OPTIONS *` 做能力探测，服务器必须在这条上回 `DAV: 1, 2`（`WebAdminHandler.do_OPTIONS`
+  已支持）。排查顺序、以及 agent 启动时那次「WebDAV 探测」怎么读，见 `client/README.md` 第 5 节。
 - 详细部署、`agent.ini` 字段、托盘用法、排错命令见 `client/README.md`。
 
 ---

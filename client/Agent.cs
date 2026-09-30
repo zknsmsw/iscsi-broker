@@ -167,6 +167,7 @@ namespace IscsiBrokerAgent
                 Log("=== 启动 v" + VERSION + " mac=" + _mac + " server=" + _url
                     + (_dryRun ? " (dry-run)" : "") + " ===");
                 PrepareWebClient();     // SYSTEM 身份：配好 WebDAV 重定向器（托盘是普通用户改不了 HKLM）
+                DavProbe();             // 顺手探一下服务器的 /dav/：把“服务器问题”和“客户机问题”分开
                 EnsureTray();
                 while (true)
                 {
@@ -664,6 +665,66 @@ namespace IscsiBrokerAgent
             return rc == 0 && outp.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
+        /// <summary>
+        /// 用 MAC + 接入令牌探一次服务器的 WebDAV 根目录（PROPFIND /dav/，Depth:0），把
+        /// “服务器/网络的问题”和“客户机 WebDAV 重定向器的问题”分开。
+        ///
+        /// 为什么要有这一步：Windows 的 WebDAV 重定向器（WebClient / DavClnt）连
+        /// http://&lt;服务器&gt;:8080/dav/ 之前会先发一条 `OPTIONS *` 做 WebDAV 能力探测
+        /// （这条请求不带凭据，服务器认证前就得回 DAV 应答头）；服务器要是把它当普通
+        /// 路径回 404/501，重定向器就断定对端不是 WebDAV 服务器，net use 直接报
+        /// “系统错误 67 找不到网络名”——而服务器日志里连一条 PROPFIND 都看不到。
+        /// （服务端 iscsi_broker.py 的 WebAdminHandler.do_OPTIONS 已对 `*` 回 DAV 头。）
+        /// 这里用 .NET 直接发请求、不走 WebClient 服务，所以无论重定向器正不正常都能
+        /// 单独判断服务端：能拿到 HTTP 状态码就说明“地址通 + 服务端 WebDAV 应答正常”。
+        /// </summary>
+        private static void DavProbe()
+        {
+            if (_dryRun || _url.Length == 0 || _token.Length == 0 || _mac.Length != 12)
+                return;
+            try
+            {
+                HttpWebRequest req = (HttpWebRequest)WebRequest.Create(_url + "/dav/");
+                req.Method = "PROPFIND";
+                req.Timeout = 15000;
+                req.ReadWriteTimeout = 15000;
+                req.Headers["Depth"] = "0";
+                req.Credentials = new NetworkCredential(_mac, _token);
+                req.PreAuthenticate = true;
+                req.UserAgent = "iscsi-broker-agent/" + VERSION;
+                try
+                {
+                    using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                        Log("WebDAV 探测：服务器 /dav/ 应答 HTTP " + (int)resp.StatusCode
+                            + "（地址通，服务端 WebDAV 正常）");
+                }
+                catch (WebException we)
+                {
+                    HttpWebResponse r = we.Response as HttpWebResponse;
+                    if (r != null)
+                    {
+                        int code = (int)r.StatusCode;
+                        r.Close();
+                        if (code == 401)
+                            Log("WebDAV 探测：服务器 /dav/ 应答 HTTP 401 —— 接入令牌不对（把后台"
+                                + "「客户机控制」页的令牌抄进 agent.ini 的 [server] token）");
+                        else
+                            Log("WebDAV 探测：服务器 /dav/ 应答 HTTP " + code
+                                + " —— 服务端 WebDAV 没按预期应答，先把服务器升级到包含 OPTIONS * 修复的版本");
+                    }
+                    else
+                    {
+                        Log("WebDAV 探测：连不上服务器 /dav/（" + we.Status + " " + we.Message
+                            + "）—— 先查服务器地址/端口/防火墙，此时 Z 盘必然挂不上");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Log("WebDAV 探测失败（不影响其它功能）：" + e.Message);
+            }
+        }
+
         // ---------------- VNC ----------------
         private static bool VncRunning()
         {
@@ -862,10 +923,23 @@ namespace IscsiBrokerAgent
                               + " /persistent:no", 30000, out outp);
             _mountOk = (rc == 0);
             if (rc == 0) { msg = "已挂载 " + _letter + ": → " + url; return true; }
-            msg = "net use 失败(rc=" + rc + ")：" + outp;
+            msg = "net use 失败(rc=" + rc + ")：" + outp.Replace("\r\n", " ").Trim();
+            bool notFound = outp.IndexOf("67") >= 0;
             string wc;
             bool wcRun = WebClientRunning(out wc);
-            if (!wcRun && wc.Trim().Length > 0)
+            if (notFound)
+            {
+                // “找不到网络名”不等于服务器不在：WebDAV 重定向器任何一步失败都报这个码
+                msg += "  [提示] 系统错误 67 是 WebDAV 重定向器（WebClient）连不上时统一报的，"
+                     + "按下面顺序查："
+                     + "① 服务器有没有升级到「OPTIONS * 返回 DAV 应答头」的版本（老版本重定向器"
+                     + "的能力探测会拿到 404，客户机日志里看不到任何 PROPFIND）；"
+                     + "② 本机 WebClient 是不是 RUNNING（sc query WebClient，不是就 net start WebClient）；"
+                     + "③ 注册表 HKLM\\SYSTEM\\CurrentControlSet\\Services\\WebClient\\Parameters 里 "
+                     + "BasicAuthLevel=2 且 AuthForwardServerList 含本服务器（本进程以 SYSTEM 启动时会自动配）；"
+                     + "④ 看上面那条「WebDAV 探测」日志：连不上就是网络/端口/防火墙问题。";
+            }
+            else if (!wcRun && wc.Trim().Length > 0)
                 msg += "  [提示] Windows 的 WebDAV 重定向器（WebClient 服务）没在运行，"
                      + "报“找不到网络名”就是这个原因；请以管理员执行：net start WebClient";
             else if (!wcRun)

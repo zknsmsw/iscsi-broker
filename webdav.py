@@ -32,6 +32,8 @@ import users_auth
 
 DAV_NS = "DAV:"
 MOUNT_PREFIX = "/dav/"
+# OPTIONS 应答与 405 的 Allow 头共用（两处写串会让重定向器以为方法不支持）
+ALLOW = "OPTIONS, GET, HEAD, POST, PUT, DELETE, PROPFIND, MKCOL, MOVE, LOCK, UNLOCK"
 MAX_PUT_BYTES = 1 << 40          # 单次 PUT 上限（1 TiB，兜底防止恶意 Content-Length）
 _XML_HEADER = '<?xml version="1.0" encoding="utf-8"?>\n'
 
@@ -201,7 +203,7 @@ def _list_children(user, rel, readonly=False):
 # ---------- 各方法 ----------
 def _do_options(handler):
     _resp(handler, 200, b"", None, {
-        "Allow": "OPTIONS, GET, HEAD, POST, PUT, DELETE, PROPFIND, MKCOL, MOVE, LOCK, UNLOCK",
+        "Allow": ALLOW,
         "DAV": "1, 2",
         "MS-Author-Via": "DAV",
     })
@@ -527,8 +529,7 @@ def handle(handler, user, rel, readonly=False):
         elif method == "UNLOCK":
             _do_unlock(handler, user, rel, readonly)
         else:
-            _resp(handler, 405, b"", None, {"Allow": "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, "
-                                                     "MKCOL, MOVE, LOCK, UNLOCK"})
+            _resp(handler, 405, b"", None, {"Allow": ALLOW})
     except _Abort as e:
         try:
             _send_dav_error(handler, e.code, e.msg)
