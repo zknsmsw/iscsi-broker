@@ -191,17 +191,16 @@ net start msiscsi            :: 服务起来后，磁盘管理里应能看到那
 
 ```cmd
 reg load HKLM\OFF C:\Windows\System32\config\SYSTEM
-reg query "HKLM\OFF\Select"      :: 看 Current/Default 是哪个控制集，逐个改（001/002 都要）
 
 :: ① 关掉页面文件（必做）：iSCSI 盘上放 pagefile，Win10 首启会 PAGE_FAULT_IN_NONPAGED_AREA / msiscsi.sys 蓝屏
-::    注意是"清空"值，不是删除值——删掉后 Windows 会按"自动管理"又建一个到系统盘（还是 iSCSI 盘）
-::    PE 里 regedit：双击 PagingFiles 把内容删空 → 确定；ExistingPageFiles 直接删
-::    或者导入下面这段（空 REG_MULTI_SZ = hex(7):00,00,00,00），ControlSet002 存在就再加一段：
-::      Windows Registry Editor Version 5.00
-::      [HKEY_LOCAL_MACHINE\OFF\ControlSet001\Control\Session Manager\Memory Management]
-::      "PagingFiles"=hex(7):00,00,00,00
-::      "ExistingPageFiles"=hex(7):00,00,00,00
-::    改完回查：PagingFiles 应该是空的，不再是 ?:\pagefile.sys
+::    位置：ControlSet001\Control\Session Manager\Memory Management，值名 PagingFiles（默认 ?:\pagefile.sys）
+::    regedit 做法：双击 PagingFiles 把内容删空 → 确定（值留着、内容为空）；ExistingPageFiles 右键删除
+::    命令行做法（直接删值，一般也行）：
+reg delete "HKLM\OFF\ControlSet001\Control\Session Manager\Memory Management" /v PagingFiles /f
+reg delete "HKLM\OFF\ControlSet001\Control\Session Manager\Memory Management" /v ExistingPageFiles /f
+::    ControlSet002 存在的话，把上面两条的 001 换成 002 再来一遍（reg query "HKLM\OFF\Select" 看 Current 是几）
+::    改完回查：reg query "HKLM\OFF\ControlSet001\Control\Session Manager\Memory Management" /v PagingFiles
+::              应为空，或提示找不到该值
 
 :: ② iSCSI 发起端随内核启动（默认 3=按需；官方安装程序一般已登记好，起不来再改）
 reg add "HKLM\OFF\ControlSet001\Services\msiscsi" /v Start /t REG_DWORD /d 0 /f
