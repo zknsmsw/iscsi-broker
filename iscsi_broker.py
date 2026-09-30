@@ -2811,10 +2811,9 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 + '<input type="submit" value="全部升级到 v' + html.escape(av) + '"></form>')
 
     def _release_card(self):
-        """「客户端发布」卡片：当前发布版、历史版本、上传/编译入口。"""
+        """「客户端发布」卡片：当前发布版、历史版本、上传入口。"""
         info = client_release.info()
         cur = info["current"]
-        cc = client_release.compiler_available()
         def short_sha(s):
             return (s or "")[:12] + "…" if s else "—"
         rows = []
@@ -2839,14 +2838,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                  + '</table>')
         cur_txt = ('当前发布：<b>v' + html.escape(cur) + '</b>' if cur else
                    '<span class="err">还没有发布任何客户端版本</span>')
-        compile_txt = ('服务器有 C# 编译器，可以直接从仓库源码编译：' if cc else
-                       '服务器上没有 mono-mcs/csc，<b>只能上传</b>在 Windows 上用 client\\build.bat '
-                       '编出来的 exe（装 mono-mcs 后可改由服务器编译）：')
-        build_form = ('<form method="post" action="/web/clients/cmd" class="inline-form">'
-                      + self._csrf_hidden()
-                      + '<input type="hidden" name="action" value="build_release">'
-                      + '<input type="text" name="ver" size="8" placeholder="版本(可空)">'
-                      + '<input type="submit" value="编译当前源码并发布"></form>') if cc else ''
         upload_form = ('<form method="post" action="/web/clients/upload" '
                        'enctype="multipart/form-data" class="inline-form">'
                        + self._csrf_hidden()
@@ -2857,11 +2848,12 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 + '<p class="small">发布库：<code>' + html.escape(info["dir"] or "") + '</code>，'
                 + '只保留最近 %d 个版本。</p>' % client_release.KEEP_RELEASES
                 + '<p>' + cur_txt + '</p>' + table
-                + '<p class="small">' + compile_txt + '</p>'
-                + '<p>' + build_form + '</p>'
                 + '<p>上传 exe：' + upload_form + '</p>'
-                + '<p class="small">客户机端怎么更新见 client/README.md；'
-                + '无盘客户机重启会回到母盘里的版本，想让升级“永久生效”要重做母盘。</p>'
+                + '<p class="small">客户端是 .NET Framework + WinForms 的 Windows 程序，'
+                + '<b>只在 Windows 上编译</b>：在装有 Windows 的机器上跑 <code>client\\build.bat</code>，'
+                + '把 <code>client\\dist\\iscsi-broker-agent.exe</code> 传上来（版本号留空取源码里的 VERSION）。'
+                + '客户机端怎么更新见 client/README.md；无盘客户机重启会回到母盘里的版本，'
+                + '想让升级“永久生效”要重做母盘。</p>'
                 + '</div>')
 
     def _do_clients_cmd(self, form):
@@ -2882,19 +2874,12 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 else ("%s 当前没有回写占用" % img)
             self._redirect("/?msg=" + urllib.parse.quote(msg, safe=""))
             return
-        if action in ("build_release", "drop_release"):
-            if action == "build_release":
-                # 传程序所在目录：源码与程序同目录（install.sh 会把 client/ 一起装上）时能找到；
-                # 找不到时 client_release 还会去 <数据目录>/client_src/，并给出可操作的提示
-                ok, msg, _ver = client_release.build(
-                    os.path.dirname(os.path.abspath(__file__)),
-                    ver=(form.get("ver", [""])[0] or "").strip() or None)
-            else:
-                try:
-                    client_release.remove((form.get("ver", [""])[0] or "").strip())
-                    ok, msg = True, "已删除该发布版本"
-                except client_release.ReleaseError as e:
-                    ok, msg = False, str(e)
+        if action == "drop_release":
+            try:
+                client_release.remove((form.get("ver", [""])[0] or "").strip())
+                ok, msg = True, "已删除该发布版本"
+            except client_release.ReleaseError as e:
+                ok, msg = False, str(e)
             self._redirect("/web/clients?msg=" + urllib.parse.quote(("" if ok else "失败：") + msg, safe=""))
             return
         mac = form.get("mac", [""])[0]
@@ -2918,8 +2903,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         rec = client_release.release_of(ver) if ver else None
         if not rec:
             self._redirect("/web/clients?msg=" + urllib.parse.quote(
-                "服务器上还没有发布客户端：请在下面「客户端发布」里上传 build.bat 编好的 exe"
-                "（服务器装了 mono-mcs/csc 时也可以直接点编译）", safe=""))
+                "服务器上还没有发布客户端：请在下面「客户端发布」里上传 Windows 上 "
+                "client\\build.bat 编好的 iscsi-broker-agent.exe", safe=""))
             return
         args = {"ver": rec["ver"], "url": self._agent_exe_rel(rec["ver"]),
                 "sha256": rec.get("sha256", ""), "size": rec.get("size", 0)}
@@ -2974,8 +2959,11 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         ver = (fields.get("ver", [""])[0] or "").strip()
         try:
             if not ver:
-                ver = client_release.read_source_version(
-                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "Agent.cs"))
+                # 版本号留空时取装的源码里的 VERSION（install.sh 会把 client/Agent.cs 装到程序目录）
+                ver = client_release.source_version(os.path.dirname(os.path.abspath(__file__)))
+            if not ver:
+                back("上传失败：没填版本号，也读不到 client/Agent.cs 里的 VERSION，请手填版本号（如 1.1）")
+                return
             rec = client_release.import_bytes(blob, ver, notes="uploaded from web")
             back("已发布客户端 v%s（%d 字节，sha256=%s…）" % (rec["ver"], rec["size"], rec["sha256"][:12]))
         except client_release.ReleaseError as e:
@@ -3175,15 +3163,14 @@ if __name__ == "__main__":
     print(f"[{datetime.datetime.now()}] [START] Client agent channel ready (token file: "
           f"{os.path.join(OVERLAY_DIR, agent_hub.TOKEN_FILE_NAME)})")
 
-    # 客户机客户端发布库（托盘「检查更新」从这里拉新版 exe）
+    # 客户机客户端发布库（托盘「检查更新」从这里拉新版 exe）。
+    # 注意：客户端只在 Windows 上用 client\build.bat 编译，服务器不编译，只负责存放与分发。
     print(f"[{datetime.datetime.now()}] [START] Client release store: "
-          f"{client_release.setup(BASE_DIR)}"
-          f"{'' if client_release.compiler_available() else ' (无 C# 编译器：只能后台上传 exe)'}")
+          f"{client_release.setup(BASE_DIR)}")
 
     # 命令行维护入口（不启动服务）：
-    #   python3 iscsi_broker.py --publish-client <exe路径> [--client-ver 1.1]
-    #   python3 iscsi_broker.py --build-client [--client-ver 1.1]
-    if "--publish-client" in sys.argv or "--build-client" in sys.argv:
+    #   python3 iscsi_broker.py --publish-client <exe路径> --client-ver 1.1
+    if "--publish-client" in sys.argv:
         def _arg_val(name):
             if name in sys.argv:
                 i = sys.argv.index(name)
@@ -3191,22 +3178,17 @@ if __name__ == "__main__":
                     return sys.argv[i + 1]
             return ""
 
-        ver = (_arg_val("--client-ver") or "").strip() or None
-        if "--build-client" in sys.argv:
-            ok, msg, _v = client_release.build(os.path.dirname(os.path.abspath(__file__)), ver=ver)
-        else:
-            src = _arg_val("--publish-client")
-            if not src:
-                print("用法：iscsi_broker.py --publish-client <exe路径> [--client-ver 1.1]")
-                raise SystemExit(2)
-            try:
-                if not ver:
-                    ver = client_release.read_source_version(
-                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "Agent.cs"))
-                rec = client_release.import_file(src, ver, notes="published from cli")
-                ok, msg = True, "已发布 v%s（%d 字节）" % (rec["ver"], rec["size"])
-            except (client_release.ReleaseError, OSError) as e:
-                ok, msg = False, str(e)
+        ver = (_arg_val("--client-ver") or "").strip()
+        src = _arg_val("--publish-client")
+        if not src or not ver:
+            print("用法：iscsi_broker.py --publish-client <Windows 上 build.bat 编出的 exe> "
+                  "--client-ver <版本号，如 1.1>")
+            raise SystemExit(2)
+        try:
+            rec = client_release.import_file(src, ver, notes="published from cli")
+            ok, msg = True, "已发布 v%s（%d 字节）" % (rec["ver"], rec["size"])
+        except (client_release.ReleaseError, OSError) as e:
+            ok, msg = False, str(e)
         print(("[OK] " if ok else "[ERROR] ") + msg)
         raise SystemExit(0 if ok else 1)
 

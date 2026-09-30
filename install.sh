@@ -383,9 +383,6 @@ backup_prev() {
 }
 
 # ---------------- 安装/卸载 ----------------
-# 可选：后台「客户端发布 → 编译当前源码并发布」需要服务器上有 C# 编译器。
-# 没装也能用（改成在 Windows 上 build.bat 编好后在后台上传 exe），装了就能直接编译出客户端。
-# Debian/Ubuntu: apt install mono-mcs      Fedora/RHEL: dnf install mono-devel
 install_files() {
   local f
   for f in "${PROG_FILES[@]}"; do
@@ -407,16 +404,15 @@ install_files() {
   else
     warn "源码里没有 web/ 目录，VNC 控制页（noVNC）会不可用"
   fi
-  # 客户机客户端源码：后台「客户端发布 → 编译当前源码并发布」要用它
-  # （只拷编译需要的文件：Agent.cs + 图标；dist/ 里的产物与 agent.ini 不进程序目录）
+  # 客户机客户端源码：**不在服务器上编译**（客户端是 Windows 程序，只在 Windows 上用
+  # build.bat 编），装过去只是为了后台上传时能自动读出版本号（Agent.cs 里的 VERSION）。
   if [[ -f "$SRC_DIR/client/Agent.cs" ]]; then
     mkdir -p "$INSTALL_DIR/client"
     install -m 0644 "$SRC_DIR/client/Agent.cs" "$INSTALL_DIR/client/Agent.cs"
     [[ -f "$SRC_DIR/client/agent.ico" ]] && \
       install -m 0644 "$SRC_DIR/client/agent.ico" "$INSTALL_DIR/client/agent.ico"
-    ok "客户端源码已装到 $INSTALL_DIR/client/（后台可直接编译发布新版客户端）"
   else
-    warn "源码里没有 client/Agent.cs：后台只能“上传 exe”，不能服务器编译"
+    warn "源码里没有 client/Agent.cs：后台上传客户端时需要手填版本号"
   fi
   if [[ -f "$SRC_DIR/README.md" ]]; then
     install -m 0644 "$SRC_DIR/README.md" "$INSTALL_DIR/README.md"

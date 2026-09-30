@@ -10,9 +10,9 @@ client_release.py —— 客户机客户端（iscsi-broker-agent.exe）的“发
        index.json                          当前版本 + 每个版本的元数据（sha256/大小/时间/来源）
        iscsi-broker-agent-<ver>.exe        实际文件，只保留最近 KEEP_RELEASES 个
 2. 版本号只允许 A.B 或 A.B.C（纯数字段），比较按数字逐段比，绝不能用字符串比大小。
-3. 服务器自己编译是**可选**能力：主机上装了 mono 的 mcs/csc 才能真正编译（Linux → .NET
-   Framework exe 的交叉编译）；没装就只能由管理员上传 build.bat 编出来的 exe。
-   build() 永远返回 (ok, msg, ver)，绝不让“编译失败”把 Web 线程打挂。
+3. **不在服务器上编译客户端**：客户端是 .NET Framework + WinForms + Win32 P/Invoke 的
+   Windows 程序，必须在 Windows 上（client\\build.bat）编译，产物由管理员上传到这里，
+   服务器只负责版本化存放与分发（曾经的 mono 交叉编译已删除，见 README）。
 4. 只被主程序调用，不反向 import iscsi_broker（避免循环依赖）。
 """
 
@@ -20,8 +20,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -245,7 +243,22 @@ def available_for(cur):
         return (best is not None), (dict(best) if best else None)
 
 
-# ---------- 写入：上传 / 编译 ----------
+# ---------- 写入：上传 ----------
+def source_version(prog_dir):
+    """读客户端源码里的 VERSION（供后台上传时“版本号留空”用）；读不到返回 ""。
+
+    注：这里只**读一个版本号**用于校验/展示，服务器不编译客户端（见模块说明）。
+    """
+    try:
+        with open(os.path.join(prog_dir, "client", "Agent.cs"), "r",
+                  encoding="utf-8", errors="replace") as f:
+            m = re.search(r'VERSION\s*=\s*"([^"]+)"', f.read())
+        v = (m.group(1) if m else "").strip()
+        return v if ver_ok(v) else ""
+    except OSError:
+        return ""
+
+
 def import_bytes(blob, ver, notes="", source="upload"):
     """管理员上传：校验后收录为 ver 版本。"""
     _require_setup()
@@ -271,126 +284,6 @@ def import_file(src_path, ver, notes="", source="upload"):
     """从服务器本地文件收录（命令行用：--publish-client）。"""
     with open(src_path, "rb") as f:
         return import_bytes(f.read(), ver, notes, source)
-
-
-def _find_compiler():
-    """找一个可用的 C# 编译器（Linux 上是 mono 的 mcs/csc；Windows 上是 .NET 的 csc）。"""
-    for name in ("mcs", "csc", "mono-csc"):
-        p = shutil.which(name)
-        if p:
-            return p
-    # PATH 里没有时再试常见安装位置（有些发行版的 mono 不在服务进程的 PATH 里）
-    for p in ("/usr/bin/mcs", "/usr/local/bin/mcs", "/usr/bin/csc", "/usr/local/bin/csc",
-              r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
-              r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"):
-        if os.path.isfile(p):
-            return p
-    return ""
-
-
-def compiler_available():
-    return bool(_find_compiler())
-
-
-def source_dir_candidates(base_dir=None):
-    """可能的客户端源码目录（按优先级）：显式传入 > 数据目录 client_src/ > client/。
-
-    为什么需要多个：程序通常装在 /opt/iscsi-broker（只有 .py + web/），而 git clone 出来的
-    源码在另一个目录；install.sh 会把 client/ 一起拷到程序目录，但老部署 / 从压缩包解压的
-    部署不一定有。管理员也可以把 Agent.cs 放到 <BASE_DIR>/client_src/ 让服务器编译。
-    """
-    out = []
-    if base_dir:
-        out.append(base_dir)
-    if _dir:
-        data_root = os.path.dirname(_dir)          # _dir 是 <BASE_DIR>/client_dist
-        out.append(os.path.join(data_root, "client_src"))
-    return out
-
-
-def find_source_dir(base_dir=None):
-    """找一个含 client/Agent.cs 的源码根目录；没有返回 ""。"""
-    cands = list(source_dir_candidates(base_dir))
-    # 程序自身所在目录（源码目录可能就在程序目录下）
-    cands.append(os.path.dirname(os.path.abspath(__file__)))
-    for c in cands:
-        if c and os.path.isfile(os.path.join(c, "client", "Agent.cs")):
-            return c
-    return ""
-
-
-def read_source_version(agent_cs):
-    """从 Agent.cs 里读 `private const string VERSION = "1.1";`。"""
-    try:
-        with open(agent_cs, "r", encoding="utf-8", errors="replace") as f:
-            txt = f.read()
-    except OSError as e:
-        raise ReleaseError("读不到客户端源码：%s" % e)
-    m = re.search(r'VERSION\s*=\s*"([^"]+)"', txt)
-    if not m or not ver_ok(m.group(1)):
-        raise ReleaseError("客户端源码里没找到合法的 VERSION 常量")
-    return m.group(1).strip()
-
-
-def build(source_dir, ver=None, notes=""):
-    """用服务器上装的 C# 编译器编译 client/Agent.cs，收录成新版本。
-
-    source_dir：源码根目录（其下有 client/Agent.cs）；传 ""/None 时自动在
-    <BASE_DIR>/client_src/ 与程序目录里找。
-    返回 (ok, msg, ver)。编译失败/没编译器时 ok=False，msg 是给人看的说明。
-    """
-    _require_setup()
-    root = source_dir if (source_dir and os.path.isfile(os.path.join(source_dir, "client", "Agent.cs"))) \
-        else find_source_dir(source_dir)
-    if not root:
-        tried = "、".join(source_dir_candidates(source_dir) + [os.path.dirname(os.path.abspath(__file__))])
-        return (False, "服务器上找不到客户端源码 client/Agent.cs（找过：%s）。"
-                       "可以在服务器上跑 install.sh 把 client/ 一起装好、或把 Agent.cs 放到 "
-                       "<数据目录>/client_src/、或直接在 Windows 上跑 client\\build.bat 后在后台上传 exe"
-               % tried, "")
-    agent_cs = os.path.join(root, "client", "Agent.cs")
-    icon = os.path.join(root, "client", "agent.ico")
-    cc = _find_compiler()
-    if not cc:
-        return (False, "服务器上没有 C# 编译器（mono-mcs / csc），无法在这里编译；"
-                       "请在 Windows 上跑 client\\build.bat 然后用后台上传产物", "")
-    try:
-        src_ver = read_source_version(agent_cs)
-    except ReleaseError as e:
-        return False, str(e), ""
-    target_ver = (ver or src_ver).strip()
-    if not ver_ok(target_ver):
-        return False, "版本号非法：%r" % target_ver, ""
-    with _lock:
-        out = os.path.join(_dir, ".build_" + target_ver + EXE_SUFFIX)
-    cmd = [cc, "/nologo", "/target:exe", "/platform:anycpu", "/optimize+", "/warn:4",
-           "/out:" + out,
-           "/reference:System.dll", "/reference:System.Core.dll",
-           "/reference:System.Drawing.dll", "/reference:System.Windows.Forms.dll",
-           "/reference:System.Web.Extensions.dll"]
-    if os.path.isfile(icon):
-        cmd += ['/win32icon:' + icon, '/resource:' + icon + ",agent.ico"]
-    cmd.append(agent_cs)
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-    except Exception as e:
-        return False, "编译失败：%s" % e, ""
-    if r.returncode != 0 or not os.path.isfile(out):
-        try:
-            os.remove(out)
-        except OSError:
-            pass
-        tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
-        return False, "编译失败（%s）：%s" % (cc, " | ".join(tail[-6:]) or "无输出"), ""
-    try:
-        rec = _adopt_locked(target_ver, out, "build", notes or ("src=%s" % src_ver))
-    except ReleaseError as e:
-        try:
-            os.remove(out)
-        except OSError:
-            pass
-        return False, str(e), ""
-    return True, "已编译并发布 v%s（%d 字节）" % (rec["ver"], rec["size"]), rec["ver"]
 
 
 def remove(ver):

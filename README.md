@@ -554,10 +554,9 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
 - **客户端怎么升级**：服务器把 `iscsi-broker-agent.exe` 按版本存在发布库
   （`<BASE_DIR>/client_dist/`，接口 `GET /agent/version`、`GET /agent/exe`）；客户机托盘右键
   「检查更新」自己拉新版并自我替换，后台「客户机控制」页也能对单台/全部客户机下发升级指令。
-  发布新版：后台上传 `client\build.bat` 的产物，或服务器装了 C# 编译器
-  （`apt install mono-mcs` / `dnf install mono-devel`）时直接点编译——编译用的
-  `client/Agent.cs` 由 `install.sh` 一起装到程序目录（也可放在 `<数据目录>/client_src/`）；
-  命令行等价入口：`python3 iscsi_broker.py --build-client` / `--publish-client <exe>`。
+  发布新版：**只能在 Windows 上编译**（`client\build.bat`），把产物通过后台「客户端发布 → 上传并发布」
+  传上去（或命令行 `python3 iscsi_broker.py --publish-client <exe> --client-ver 1.1`）；
+  服务器只负责存放与分发，不做 Linux 交叉编译。
   注意无盘客户机重启会回到母盘里的版本，永久生效仍需更新母盘（详见 `client/README.md`）。
 - 详细部署、`agent.ini` 字段、托盘用法、排错命令见 `client/README.md`。
 
