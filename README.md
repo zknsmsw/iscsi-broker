@@ -80,7 +80,7 @@
 ## 三、目录结构（运行时自动生成）
 
 ```
-/home/prts/server/                  ← BASE_DIR（OVERLAY_DIR = BASE_DIR；用 install.sh 或环境变量指定）
+/opt/iscsi-broker-data/              ← BASE_DIR（OVERLAY_DIR = BASE_DIR；用 install.sh 或环境变量指定）
 ├── images/                          ← 母盘目录，手动放置 xxx.raw（不会自动创建！）
 ├── admin.conf                       ← 管理员密码（加盐 SHA256 哈希）
 ├── users.conf                       ← 注册用户列表（每行 用户名$sha256$salt$digest$配额）
@@ -197,13 +197,18 @@ sudo bash install.sh --in-place   # 原地：直接给当前目录注册 systemd
 常用参数：
 
 ```bash
-sudo bash install.sh --base-dir /data/server     # 数据根目录（母盘/网盘/配置），默认 /home/prts/server
-sudo bash install.sh --in-place                  # 不拷贝，用当前目录注册服务
-sudo bash install.sh --install-dir /opt/broker   # 程序目录（仅默认装法），默认 /opt/iscsi-broker
-sudo bash install.sh --no-deps --no-start        # 只装文件+注册服务，不装依赖、不启动
-sudo bash install.sh -y                          # 所有询问自动答“是”（无人值守）
-sudo bash install.sh --uninstall                 # 停止并卸载服务（数据目录保留）
+sudo bash install.sh --base-dir /srv/iscsi         # 数据目录换到大盘（默认 /opt/iscsi-broker-data）
+sudo bash install.sh --in-place                    # 不拷贝，用当前目录注册服务
+sudo bash install.sh --install-dir /opt/broker     # 程序目录（仅默认装法），默认 /opt/iscsi-broker
+sudo bash install.sh --no-deps --no-start          # 只装文件+注册服务，不装依赖、不启动
+sudo bash install.sh -y                            # 所有询问自动答“是”（无人值守）
+sudo bash install.sh --uninstall                   # 停止并卸载服务（数据目录保留）
 ```
+
+**数据目录**（默认 `/opt/iscsi-broker-data`）放母盘 `images/`、网盘 `cloud/`、账号与各类配置，
+跟程序目录 `/opt/iscsi-broker` 是**两个目录**——不能是同一个，否则升级会覆盖、`--purge` 会把数据
+一起删掉（脚本会检查并告警）。母盘 `.raw` 和网盘数据很占地方，建议用 `--base-dir` 指到单独的大盘
+（脚本也会在可用空间不足 20G 时提醒）。
 
 装完还需要手动做三件事：把母盘 `.raw` 放进 `<数据目录>/images/`、配 dnsmasq 的 DHCP/TFTP
 （见本节第 4 小节）、给客户机母盘装客户端 agent（见第 7 小节和 `client/README.md`）。
@@ -258,12 +263,12 @@ git checkout -- iscsi_broker.py    # 之后 git pull 就不会再冲突
 # 1) 安装依赖（以 Debian/Ubuntu 为例）
 apt install python3 tgt qemu-utils iproute2 iputils-arping util-linux dnsmasq ipxe iptables kmod
 # 2) 准备数据目录并放入母盘
-mkdir -p /home/prts/server/images
+mkdir -p /opt/iscsi-broker-data/images
 #    把 xxx.raw 母盘放进去（如 win11.raw）；母盘怎么做见下一节
 # 3) 指定数据目录（二选一）：
-#    a. 环境变量：export ISCSI_BROKER_BASE_DIR=/home/prts/server
-#    b. 写 /etc/iscsi-broker/iscsi-broker.env 一行 ISCSI_BROKER_BASE_DIR=/home/prts/server
-#    （都不做则用源码默认值 /home/prts/server，不用改源码）
+#    a. 环境变量：export ISCSI_BROKER_BASE_DIR=/opt/iscsi-broker-data
+#    b. 写 /etc/iscsi-broker/iscsi-broker.env 一行 ISCSI_BROKER_BASE_DIR=/opt/iscsi-broker-data
+#    （都不做则用源码默认值 /opt/iscsi-broker-data，不用改源码）
 # 4) 程序目录里要有 web/（VNC 控制页用内置 noVNC），即仓库原样放好即可
 # 5) 给 LAN 口配静态 IP（示例，网卡名按实际改）
 ip addr add 10.1.1.1/24 dev enp3s0
@@ -387,8 +392,8 @@ rm -f /etc/ssh/ssh_host_*
 #### 母盘自检
 
 ```bash
-qemu-img info /home/prts/server/images/win11.raw   # raw 的 virtual size 就是客户机看到的盘大小
-fdisk -l /home/prts/server/images/win11.raw        # 确认分区表、活动分区 / ESP
+qemu-img info /opt/iscsi-broker-data/images/win11.raw   # raw 的 virtual size 就是客户机看到的盘大小
+fdisk -l /opt/iscsi-broker-data/images/win11.raw        # 确认分区表、活动分区 / ESP
 ```
 
 能不能启动，只能用一台客户机走一遍 PXE/iSCSI 启动来验证。
@@ -545,7 +550,7 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
 
 | 配置 | 默认 | 说明 |
 |------|------|------|
-| `BASE_DIR` | `/home/prts/server` | 服务器数据根目录（母盘/网盘/配置/叠加盘都在这）。优先级：环境变量 `ISCSI_BROKER_BASE_DIR` > `/etc/iscsi-broker/iscsi-broker.env` > 上面这个默认值；`install.sh` 会替你写好那个 env 文件，所以不用改源码 |
+| `BASE_DIR` | `/opt/iscsi-broker-data` | 服务器数据根目录（母盘/网盘/配置/叠加盘都在这）。优先级：环境变量 `ISCSI_BROKER_BASE_DIR` > `/etc/iscsi-broker/iscsi-broker.env` > 上面这个默认值；`install.sh` 会替你写好那个 env 文件，所以不用改源码 |
 | `PORT` / `WEB_PORT` | 5000 / 8080 | iPXE 供给端口 / Web 后台端口 |
 | `DEFAULT_IMAGE` | `win11` | 启动菜单默认高亮镜像 |
 | `FORCE_MODE` | `auto` | `auto` / `reflink` / `qcow2` |

@@ -7,7 +7,9 @@ import users_auth, cloud_store, netctrl, agent_hub, webdav, wsbridge  # 本地�
 # 优先级：环境变量 ISCSI_BROKER_BASE_DIR > /etc/iscsi-broker/iscsi-broker.env > 下面的默认值。
 # install.sh 会把实际路径写进那个 env 文件、由 systemd 的 EnvironmentFile 注入，
 # 所以从 git 拉下来的源码不用手改（升级/pull 也不会冲突）。
-_DEFAULT_BASE_DIR = "/home/prts/server"   # 例如 /home/user/server
+# 注意：这里放的是**数据**（母盘 images/、网盘 cloud/、配置）；程序目录是另一个地方
+# （install.sh 默认 /opt/iscsi-broker），两者不能是同一个目录——否则升级/卸载会误伤数据。
+_DEFAULT_BASE_DIR = "/opt/iscsi-broker-data"   # 大盘可换：--base-dir /srv/iscsi 等
 _ENV_FILE = "/etc/iscsi-broker/iscsi-broker.env"
 
 def _resolve_base_dir():

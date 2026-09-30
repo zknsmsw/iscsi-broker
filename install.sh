@@ -26,7 +26,7 @@ set -euo pipefail
 
 APP="iscsi-broker"
 INSTALL_DIR="/opt/iscsi-broker"
-BASE_DIR="/home/prts/server"
+BASE_DIR="/opt/iscsi-broker-data"
 ENV_DIR="/etc/iscsi-broker"
 ENV_FILE="$ENV_DIR/$APP.env"
 UNIT_FILE="/etc/systemd/system/$APP.service"
@@ -69,8 +69,11 @@ usage() {
         一次 git pull + systemctl restart 就生效，没有两份代码；前提是这个目录只有 root 能写
         （脚本会检查并提示 chown/chmod），否则普通用户改一下 iscsi_broker.py 就能拿到 root。
 
-  --base-dir DIR     数据根目录（母盘/网盘/配置放这里）。不写的话：先读 /etc/iscsi-broker/*.env，
-                     再探测旧部署源码/正在运行的实例，最后才用默认 /home/prts/server
+  --base-dir DIR     数据根目录（母盘 images/、网盘 cloud/、各类配置放这里），
+                     默认 /opt/iscsi-broker-data。注意它**不能**是程序目录本身
+                     （升级会覆盖、--purge 会删数据）；母盘/网盘很占地方，建议指到大盘。
+                     不写 --base-dir 时的探测顺序：/etc/iscsi-broker/*.env →
+                     正在运行的实例 → 旧源码里写死的 BASE_DIR → 上面的默认值
   --install-dir DIR  程序安装目录（仅默认装法用），默认 /opt/iscsi-broker
   --in-place         不拷贝程序，直接用当前目录（配合 git pull 升级最方便）
   --no-deps          跳过依赖安装（升级时常用：sudo bash install.sh --no-deps）
@@ -292,10 +295,21 @@ resolve_base_dir() {
     msg "沿用已有数据目录：$BASE_DIR（升级/接管不会动里面的数据）"
   else
     msg "没探测到已有安装，使用默认数据目录：$BASE_DIR"
-    if [[ ! -d "$BASE_DIR" ]]; then
-      warn "该目录不存在，会新建。若你的母盘/网盘在别处，请用 --base-dir 指定，例如："
-      warn "    sudo bash install.sh --base-dir /你的/实际/数据目录"
-    fi
+  fi
+}
+
+# 数据目录不能就是程序目录：升级会覆盖程序文件，--purge 会把母盘/网盘一起删掉
+check_base_dir_sane() {
+  local base_abs prog_abs
+  base_abs="$(readlink -m "$BASE_DIR" 2>/dev/null || echo "$BASE_DIR")"
+  prog_abs="$(readlink -m "$PROG_DIR" 2>/dev/null || echo "$PROG_DIR")"
+  if [[ "$base_abs" == "$prog_abs" ]]; then
+    warn "数据目录和程序目录是同一个：$BASE_DIR"
+    warn "这样升级会覆盖程序文件，--uninstall --purge 会把母盘/网盘一起删掉！"
+    warn "强烈建议把数据目录挪到别处（例如 /opt/iscsi-broker-data 或大盘挂载点），"
+    warn "用 --base-dir 指定后重跑本脚本（数据搬家：mv 过去再改 --base-dir）。"
+  elif [[ "$base_abs" == "$prog_abs"/* ]]; then
+    warn "数据目录在程序目录里面：$BASE_DIR —— 卸载程序时很容易连数据一起删，建议换到外面"
   fi
 }
 
@@ -427,10 +441,18 @@ prepare_data_dir() {
   mkdir -p "$BASE_DIR/images" "$BASE_DIR/cloud"
   # 数据目录里有 admin.conf/users.conf/网盘内容，收紧到只有 root 能进（tgtd 本身也是 root 跑）
   chmod 0700 "$BASE_DIR" 2>/dev/null || true
+  # 母盘 + 网盘很占地方，空间太小提前提醒
+  local avail avail_h
+  avail="$(df -Pk "$BASE_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  avail_h="$(df -h "$BASE_DIR" 2>/dev/null | awk 'NR==2 {print $4}' || true)"
+  if [[ -n "$avail" && "$avail" =~ ^[0-9]+$ && "$avail" -lt $((20 * 1024 * 1024)) ]]; then
+    warn "数据目录所在分区可用空间只有 ${avail_h:-?}（母盘 .raw 和网盘数据都很占地方）"
+    warn "建议用大盘：sudo bash install.sh --base-dir /你的/大盘目录"
+  fi
   if ! ls -1 "$BASE_DIR"/images/*.raw >/dev/null 2>&1; then
     warn "images/ 里还没有母盘：把母盘 .raw 放进去后（文件名如 win11.raw）iPXE 菜单才会出现它"
   fi
-  ok "数据目录就绪（母盘放 $BASE_DIR/images/）"
+  ok "数据目录就绪（母盘放 $BASE_DIR/images/，可用空间 ${avail_h:-?}）"
 }
 
 write_env_file() {
@@ -584,11 +606,12 @@ if [[ $DO_UNINSTALL -eq 1 ]]; then
   do_uninstall
 fi
 echo "${c_info}== iSCSI Broker 安装/升级 ==${c_end}  源码目录：$SRC_DIR"
-PROG_DIR="$INSTALL_DIR"
+if [[ $IN_PLACE -eq 1 ]]; then PROG_DIR="$SRC_DIR"; else PROG_DIR="$INSTALL_DIR"; fi
 install_deps
 check_python
 detect_legacy
 resolve_base_dir
+check_base_dir_sane
 warn_dirty_source
 check_in_place_safety
 stop_old_instances
