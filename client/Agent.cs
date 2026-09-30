@@ -229,6 +229,26 @@ namespace IscsiBrokerAgent
         }
 
         // ---------------- 日志 ----------------
+        private static readonly Dictionary<string, string> _lastLogMsg = new Dictionary<string, string>();
+        private static readonly Dictionary<string, DateTime> _lastLogAt = new Dictionary<string, DateTime>();
+
+        /// <summary>同样的消息不刷屏：内容没变、且距上次不到 seconds 秒就不再写。</summary>
+        private static void LogOnce(string key, string msg, int seconds)
+        {
+            lock (_logLock)
+            {
+                string prev;
+                DateTime at;
+                bool same = _lastLogMsg.TryGetValue(key, out prev) && prev == msg
+                            && _lastLogAt.TryGetValue(key, out at)
+                            && (DateTime.Now - at).TotalSeconds < seconds;
+                if (same) return;
+                _lastLogMsg[key] = msg;
+                _lastLogAt[key] = DateTime.Now;
+            }
+            Log(msg);
+        }
+
         private static void Log(string msg)
         {
             string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + " " + msg;
@@ -364,13 +384,14 @@ namespace IscsiBrokerAgent
             catch (WebException we)
             {
                 HttpWebResponse r = we.Response as HttpWebResponse;
-                Log("心跳失败：" + we.Message + (r != null ? (" HTTP " + (int)r.StatusCode) : ""));
+                string extra = (r != null) ? (" HTTP " + (int)r.StatusCode) : "";
                 if (r != null && (int)r.StatusCode == 403)
-                    Log("→ 接入令牌不对：请把服务器“客户机控制”页上的令牌抄进 agent.ini");
+                    extra += " → 接入令牌不对：请把服务器“客户机控制”页上的令牌抄进 agent.ini";
+                LogOnce("poll-fail", "心跳失败：" + we.Message + extra, 300);
             }
             catch (Exception e)
             {
-                Log("心跳异常：" + e.Message);
+                LogOnce("poll-error", "心跳异常：" + e.Message, 300);
             }
         }
 
@@ -467,9 +488,14 @@ namespace IscsiBrokerAgent
                 _traySession = sid;
                 Log("已在会话 " + sid + " 启动托盘 pid=" + pid);
             }
+            else if (err.IndexOf("1008") >= 0)
+            {
+                // 1008 = 该会话还没有登录用户的令牌，也就是“人还没登录”，等就行
+                LogOnce("wait-logon", "还没有用户登录（会话 " + sid + "），等登录后自动拉起托盘", 900);
+            }
             else
             {
-                Log("启动托盘失败：" + err);
+                LogOnce("tray-launch-fail", "启动托盘失败：" + err, 300);
             }
         }
 
@@ -802,6 +828,23 @@ namespace IscsiBrokerAgent
             catch { }
         }
 
+        /// <summary>带节流的气泡提示：同样的内容在 seconds 秒内只弹/只记一次。</summary>
+        private static void NotifyTipOnce(string key, string msg, int seconds)
+        {
+            string k = "tip:" + key;
+            lock (_logLock)
+            {
+                string prev; DateTime at;
+                if (_lastLogMsg.TryGetValue(k, out prev) && prev == msg
+                    && _lastLogAt.TryGetValue(k, out at)
+                    && (DateTime.Now - at).TotalSeconds < seconds)
+                    return;
+                _lastLogMsg[k] = msg;
+                _lastLogAt[k] = DateTime.Now;
+            }
+            NotifyTip(msg);
+        }
+
         /// <summary>挂 Z 盘：未登录用 MAC+接入令牌（只读公共盘），登录后用账号+会话令牌（个人网盘）。</summary>
         private static bool MapDrive(string user, string pass, out string msg)
         {
@@ -837,11 +880,12 @@ namespace IscsiBrokerAgent
             if (_davUser.Length > 0 && _davSession.Length > 0)
             {
                 if (MapDrive(_davUser, _davSession, out msg)) NotifyTip("Z 盘已挂载：你的网盘（可写）");
-                else NotifyTip("挂载你的网盘失败：" + msg);
+                else NotifyTipOnce("mount-fail", "挂载你的网盘失败：" + msg, 900);
             }
             else
             {
-                if (!MapDrive(_mac, _token, out msg)) NotifyTip("只读公共盘挂载失败：" + msg);
+                if (!MapDrive(_mac, _token, out msg))
+                    NotifyTipOnce("mount-fail", "只读公共盘挂载失败：" + msg, 900);
             }
             UpdateTrayMenu();
         }
