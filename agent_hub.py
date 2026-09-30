@@ -255,13 +255,15 @@ def _drop_expired_locked(rec):
 def enqueue(mac, ctype, **args):
     """给某台机器排一条指令。返回 (True, 说明) 或 (False, 原因)。
 
-    ctype 取值：shutdown / reboot / vnc_start / vnc_stop / mount / unmount
+    ctype 取值：shutdown / reboot / vnc_start / vnc_stop / mount / unmount / update
+    （update 的参数：ver / url / sha256 / size / force，客户机下载新 exe 自我替换）
     """
     global _seq
     mac = _norm_mac(mac)
     if not mac:
         return False, "MAC 不合法"
-    if ctype not in ("shutdown", "reboot", "vnc_start", "vnc_stop", "mount", "unmount"):
+    if ctype not in ("shutdown", "reboot", "vnc_start", "vnc_stop", "mount", "unmount",
+                     "update"):
         return False, "未知指令：%s" % ctype
     with _lock:
         rec = _ensure(mac)
@@ -285,6 +287,8 @@ def poll(mac, ip="", info=None):
     """客户机心跳：更新状态并取走一条待执行指令。
 
     返回 (归一化后的 mac, 指令 dict 或 None)；mac 非法时返回 ("", None)。
+    指令为 {"id":N, "type":"...", ...参数平铺...}（update 指令的 ver/url/sha256/size/force
+    直接放在顶层，客户机不需要解 args；同时保留 "args" 一份，方便以后扩展）。
     """
     mac = touch(mac, ip=ip, info=info)
     if not mac:
@@ -295,7 +299,11 @@ def poll(mac, ip="", info=None):
         if not rec["queue"]:
             return mac, None
         cmd = rec["queue"].pop(0)
-        cmd["args"] = dict(cmd.get("args") or {}, mac=mac)
+        args = dict(cmd.get("args") or {}, mac=mac)
+        cmd["args"] = args
+        for k, v in args.items():          # 平铺参数（id/type/args 不被覆盖）
+            if k not in ("id", "type", "args", "created"):
+                cmd[k] = v
         rec["last_cmd"] = {"id": cmd["id"], "type": cmd["type"], "sent": time.time()}
         return mac, cmd
 

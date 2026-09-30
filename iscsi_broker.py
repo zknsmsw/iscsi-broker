@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-import urllib.parse, subprocess, os, datetime, hashlib, threading, glob, time, re, secrets, html, ssl, json, base64
-import users_auth, cloud_store, netctrl, agent_hub, webdav, wsbridge  # 本地模块：多账号认证（users_auth）+ 个人网盘（cloud_store）+ 联网控制（netctrl）+ 客户机 agent 通道（agent_hub）+ 网盘 WebDAV（webdav）+ VNC WebSocket 桥（wsbridge）
+import urllib.parse, subprocess, os, sys, datetime, hashlib, threading, glob, time, re, secrets, html, ssl, json, base64
+import users_auth, cloud_store, netctrl, agent_hub, webdav, wsbridge, client_release  # 本地模块：多账号认证（users_auth）+ 个人网盘（cloud_store）+ 联网控制（netctrl）+ 客户机 agent 通道（agent_hub）+ 网盘 WebDAV（webdav）+ VNC WebSocket 桥（wsbridge）+ 客户机发布库（client_release）
 
 # ========== 数据根目录 BASE_DIR ==========
 # 优先级：环境变量 ISCSI_BROKER_BASE_DIR > /etc/iscsi-broker/iscsi-broker.env > 下面的默认值。
@@ -1400,9 +1400,52 @@ class Handler(BaseHTTPRequestHandler):
             "shell\n"
         )
 
+def _form_boundary(content_type):
+    """从 multipart/form-data 的 Content-Type 里取 boundary（无引号）；没有返回 None。"""
+    for part in (content_type or "").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k.lower() == "boundary" and v:
+            return v.strip().strip('"').encode("utf-8", "replace")
+    return None
+
+
+def _parse_multipart(body, boundary):
+    """把 multipart/form-data 的完整请求体解析成 {字段名: [str 或 bytes]}。
+
+    只用于后台上传小的客户端 exe（上限见 client_release.MAX_UPLOAD），所以整包读进内存，
+    不引入 cgi 模块（3.13 已移除）。文件字段的值是 bytes，普通字段是 str。
+    """
+    delim = b"--" + boundary
+    fields = {}
+    if not body.startswith(delim):
+        return fields
+    for part in body[len(delim):].split(delim):
+        if part[:2] == b"--":                     # 结束标记
+            break
+        part = part[2:] if part[:2] == b"\r\n" else part.lstrip(b"\r\n")
+        if part.endswith(b"\r\n"):
+            part = part[:-2]
+        head, sep, val = part.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        name, filename = None, None
+        for line in head.decode("utf-8", "replace").split("\r\n"):
+            if line.lower().startswith("content-disposition:"):
+                for item in line.split(";"):
+                    k, _, v = item.strip().partition("=")
+                    if k.lower() == "name":
+                        name = v.strip().strip('"')
+                    elif k.lower() == "filename":
+                        filename = v.strip().strip('"')
+        if not name:
+            continue
+        fields.setdefault(name, []).append(val if filename is not None else
+                                            val.decode("utf-8", "replace"))
+    return fields
+
+
 class WebAdminHandler(BaseHTTPRequestHandler):
     """简易 Web 管理后台：修改密码 / 创建空白盘 / 查看客户机名单 / 多账号与个人网盘。"""
-
     def log_message(self, fmt, *args):
         return  # 静默访问日志
 
@@ -1796,6 +1839,13 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if path == "/web/register":   # 公开注册页（无需会话）
             self._register_page()
             return
+        # 客户机托盘「检查更新」：不走浏览器会话，靠 agent 接入令牌认证（见 _agent_version_info）
+        if path in ("/agent/version", "/agent/exe"):
+            if path == "/agent/version":
+                self._agent_version_info()
+            else:
+                self._agent_exe()
+            return
         if not self._require_session():
             return
         if path == "/web/logout":
@@ -1882,6 +1932,11 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             if not self._role_gate(s, "admin"):
                 return
             self._do_common_upload(s)
+            return
+        if path == "/web/clients/upload":     # 客户端 exe 上传（multipart，自带 csrf 字段）
+            if not self._role_gate(s, "admin"):
+                return
+            self._do_client_upload(s)
             return
         form = self._form()
         if form.get("csrf", [""])[0] != s["csrf"]:   # 简单 CSRF 校验
@@ -2255,7 +2310,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
     #   POST /agent/result  回报执行结果
     # 两者都靠 agent_hub 的接入令牌认证，不走浏览器会话。
     CMD_LABELS = {"shutdown": "关机", "reboot": "重启", "vnc_start": "启用 VNC",
-                  "vnc_stop": "停用 VNC", "mount": "挂载网盘", "unmount": "卸载网盘"}
+                  "vnc_stop": "停用 VNC", "mount": "挂载网盘", "unmount": "卸载网盘",
+                  "update": "更新客户端"}
 
     def _send_json(self, obj, code=200):
         data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -2283,6 +2339,65 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         """本机 WebDAV 根地址（按当前请求的 Host 拼，兼容 HTTPS/自定义端口）。"""
         scheme = "https" if HTTPS_ENABLED else "http"
         return "%s://%s/dav/" % (scheme, self.headers.get("Host", ""))
+
+    # ---------- 客户机客户端「检查更新」（托盘手动触发，不走浏览器会话） ----------
+    #   GET /agent/version?mac=&token=&cur=1.0   查有没有比 cur 新的发布
+    #   GET /agent/exe?ver=1.1&mac=&token=       下载该版本 exe（托盘校验 sha256 后自我替换）
+    # 两个都用 agent 接入令牌认证；exe 不额外加密（内网 + 令牌 + sha256 校验）。
+    def _agent_exe_rel(self, ver):
+        """某个版本的下载地址（相对路径，托盘按自己配的 url 拼）。"""
+        return "/agent/exe?ver=" + urllib.parse.quote(ver, safe="")
+
+    def _client_exe_row(self, ver, rec=None):
+        """托盘要的信息：版本元数据（不含服务器本地路径）。"""
+        return {"url": self._agent_exe_rel(ver),
+                "sha256": (rec or {}).get("sha256", ""),
+                "size": (rec or {}).get("size", 0),
+                "notes": (rec or {}).get("notes", "")}
+
+    def _agent_version_info(self):
+        """托盘「检查更新」：返回当前发布版本与是否有更新。"""
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if not agent_hub.check_token((q.get("token") or [""])[0]):
+            self._send_json({"ok": False, "err": "bad token"}, 403)
+            return
+        cur = (q.get("cur") or [""])[0].strip()
+        avail, rec = client_release.available_for(cur)
+        if not avail:
+            self._send_json({"ok": True, "available": False,
+                             "ver": client_release.current() or cur})
+            return
+        out = {"ok": True, "available": True, "ver": rec["ver"]}
+        out.update(self._client_exe_row(rec["ver"], rec))
+        self._send_json(out)
+
+    def _agent_exe(self):
+        """下载指定版本的客户端 exe。"""
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        if not agent_hub.check_token((q.get("token") or [""])[0]):
+            self._send_json({"ok": False, "err": "bad token"}, 403)
+            return
+        ver = (q.get("ver") or [""])[0].strip() or client_release.current()
+        rec = client_release.release_of(ver)
+        path = client_release.path_of(ver)
+        if not rec or not path:
+            self._send_json({"ok": False, "err": "no such version"}, 404)
+            return
+        try:
+            with open(path, "rb") as f:
+                blob = f.read()
+        except OSError as e:
+            self._send_json({"ok": False, "err": "read failed: %s" % e}, 500)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("X-Client-Version", rec["ver"])
+        self.send_header("X-Client-Sha256", rec.get("sha256", ""))
+        self.send_header("Content-Disposition",
+                         'attachment; filename="iscsi-broker-agent-%s.exe"' % rec["ver"])
+        self.end_headers()
+        self.wfile.write(blob)
 
     def _agent_poll(self):
         """客户机 agent 心跳：更新在线状态并下发一条待执行指令。"""
@@ -2328,7 +2443,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "err": "bad mac"}, 400)
             return
         self._send_json({"ok": True, "mac": mac, "mount": agent_hub.mount_wanted(mac),
-                         "account": agent_hub.account_of(mac), "dav": self._dav_url()})
+                         "account": agent_hub.account_of(mac), "dav": self._dav_url(),
+                         "avail_ver": client_release.current()})
 
     def _agent_login(self):
         """客户机托盘「登录网盘」：校验账号密码，换一个短期网盘会话令牌。
@@ -2407,6 +2523,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                                            "停用后该客户机的 Z 盘会被卸载，确定？"))
             else:
                 acts.append(self._cmd_form(mac, "mount", "启用网盘"))
+            acts.append(self._upgrade_form(mac, rec))
         else:
             acts.append('—')
         # 默认用户名设置表单（只用于预填客户机托盘的登录框，不保存密码；离线也能先设好）
@@ -2445,11 +2562,41 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if ipxe:
             ipxe_txt = '<br><span class="small">' + html.escape(
                 ("iPXE: %s %s" % (ipxe.get("img") or "-", ipxe.get("mode") or "")).strip()) + '</span>'
+        # 客户端版本列：服务器当前发布版 vs 这台机器心跳里报的版本
+        av = client_release.current()
+        cv = (rec.get("agent_ver") or "").strip()
+        if not cv:
+            ver_txt = '<span class="small">未知</span>'
+        elif av and cv != av:
+            ver_txt = ('<span class="err">' + html.escape(cv) + '</span><br><span class="small">可升 '
+                       + html.escape(av) + '</span>')
+        else:
+            ver_txt = '<span class="ok">' + html.escape(cv) + '</span>'
         return ('<tr><td>' + html.escape(mac) + ipxe_txt + '</td><td>'
                 + html.escape(rec.get("hostname") or "—") + '</td><td>'
                 + html.escape(rec.get("ip") or "—") + '</td><td>' + st + '</td><td>'
                 + drive_txt + '</td><td>' + vnc + '</td><td>'
-                + sep.join(acts) + '</td><td>' + acc_form + '</td><td>' + res_html + '</td></tr>')
+                + sep.join(acts) + '</td><td>' + acc_form + '</td><td>' + ver_txt
+                + '</td><td>' + res_html + '</td></tr>')
+
+    def _upgrade_form(self, mac, rec=None):
+        """单个客户机的「升级客户端」按钮（同版本时是强制重装）。"""
+        av = client_release.current()
+        cv = ((rec or {}).get("agent_ver") or "").strip()
+        if not av:
+            return '<span class="small" title="服务器还没有发布客户端">升级客户端</span>'
+        if cv and cv == av:
+            label, force, confirm = "重装 v" + av, "1", "该机已是 v%s，强制重装客户端？" % av
+        else:
+            label, force = "升级到 v" + av, "0"
+            confirm = "把该客户机升级到 v%s？客户机会下载新版本并重启自己。" % av
+        return ('<form method="post" action="/web/clients/cmd" class="inline-form"'
+                + ' onsubmit="return confirm(\'' + confirm.replace("'", "") + '\')">'
+                + self._csrf_hidden()
+                + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
+                + '<input type="hidden" name="action" value="upgrade_one">'
+                + '<input type="hidden" name="force" value="' + force + '">'
+                + '<input type="submit" value="' + html.escape(label) + '"></form>')
 
     def _clients_page(self, msg=None):
         records = agent_hub.snapshot()
@@ -2462,10 +2609,12 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             ipxe_only += 1
             rows.append(self._client_row({"mac": c["mac"], "online": False, "ip": c.get("ip") or "",
                                           "hostname": "", "vnc_running": False, "vnc_port": 0,
-                                          "drive": "", "account": "", "results": []}, ipxe=c))
+                                          "drive": "", "account": "", "results": [],
+                                          "agent_ver": ""}, ipxe=c))
         table = ('<table><tr><th>MAC</th><th>主机名</th><th>IP</th><th>agent</th><th>Z 盘</th>'
-                 '<th>VNC</th><th>操作</th><th>默认用户名</th><th>最近结果</th></tr>'
-                 + ("".join(rows) if rows else '<tr><td colspan="9">暂无客户机记录（客户机 agent 还没心跳过）</td></tr>')
+                 '<th>VNC</th><th>操作</th><th>默认用户名</th><th>客户端版本</th>'
+                 '<th>最近结果</th></tr>'
+                 + ("".join(rows) if rows else '<tr><td colspan="10">暂无客户机记录（客户机 agent 还没心跳过）</td></tr>')
                  + '</table>')
         msg_html = ''
         if msg:
@@ -2483,10 +2632,15 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             + self._csrf_hidden()
             + '<input type="hidden" name="action" value="rotate_token">'
             + '<input type="submit" value="重置令牌"></form></div>'
-            '<div class="card"><h2>客户机控制</h2>' + table
+            + self._release_card()
+            + '<div class="card"><h2>客户机控制</h2>' + table
             + '<p class="small">“在线”= 最近 %d 秒内收到过 agent 心跳。指令随心跳下发，'
             % agent_hub.ONLINE_WINDOW
             + '关机/重启会立即执行；VNC 需要母盘里装好 VNC 服务端并在 agent.ini 里配好路径。</p>'
+            + self._upgrade_all_form()
+            + '<p class="small"><b>升级客户端</b>：客户机托盘「检查更新」可以自己拉新版；'
+            + '这里点「升级」是下发一条指令，客户机下次心跳时下载新 exe 并自我替换重启。'
+            + '无盘客户机重启后会回到母盘里的旧版本，需要重做母盘或再升一次。</p>'
             + '<p class="small"><b>网盘（Z 盘）</b>：默认自动挂载，内容是服务器的“通用文件”（只读）；'
             + '用户在客户机右下角托盘里<b>登录自己的网盘账号</b>后，Z 盘换成他自己的网盘（可写，'
             + '里面仍能看到只读的“通用文件”）。「停用网盘」= 不给这台机器挂 Z 盘；'
@@ -2506,12 +2660,94 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         )
         self._send_html(_page_html("客户机控制", body, NAV_ADMIN))
 
+    def _upgrade_all_form(self):
+        """「全部升级」按钮（下发给所有客户机）。"""
+        av = client_release.current()
+        if not av:
+            return ''
+        return ('<form method="post" action="/web/clients/cmd" class="inline-form"'
+                ' onsubmit="return confirm(\'给所有客户机下发“升级到 v' + html.escape(av)
+                + '”指令？\')">' + self._csrf_hidden()
+                + '<input type="hidden" name="action" value="upgrade_all">'
+                + '<input type="submit" value="全部升级到 v' + html.escape(av) + '"></form>')
+
+    def _release_card(self):
+        """「客户端发布」卡片：当前发布版、历史版本、上传/编译入口。"""
+        info = client_release.info()
+        cur = info["current"]
+        cc = client_release.compiler_available()
+        def short_sha(s):
+            return (s or "")[:12] + "…" if s else "—"
+        rows = []
+        for r in info["releases"]:
+            tag = '<span class="ok">当前</span>' if r["ver"] == cur else ''
+            drop = ''
+            if r["ver"] != cur:
+                drop = ('<form method="post" action="/web/clients/cmd" class="inline-form"'
+                        ' onsubmit="return confirm(\'删除已发布的 v' + html.escape(r["ver"])
+                        + '？\')">' + self._csrf_hidden()
+                        + '<input type="hidden" name="action" value="drop_release">'
+                        + '<input type="hidden" name="ver" value="' + html.escape(r["ver"]) + '">'
+                        + '<input type="submit" value="删除"></form>')
+            rows.append('<tr><td>' + html.escape(r["ver"]) + ' ' + tag + '</td><td class="small">'
+                        + html.escape(str(r.get("source") or "")) + '</td><td class="small">'
+                        + str(int(r.get("size") or 0) // 1024) + ' KB</td><td class="small">'
+                        + html.escape(short_sha(r.get("sha256"))) + '</td><td class="small">'
+                        + html.escape(r.get("built") or "") + '</td><td>' + drop + '</td></tr>')
+        table = ('<table><tr><th>版本</th><th>来源</th><th>大小</th><th>sha256</th><th>发布时间</th>'
+                 '<th></th></tr>'
+                 + ("".join(rows) if rows else '<tr><td colspan="6">还没有发布过客户端</td></tr>')
+                 + '</table>')
+        cur_txt = ('当前发布：<b>v' + html.escape(cur) + '</b>' if cur else
+                   '<span class="err">还没有发布任何客户端版本</span>')
+        compile_txt = ('服务器有 C# 编译器，可以直接从仓库源码编译：' if cc else
+                       '服务器上没有 mono-mcs/csc，<b>只能上传</b>在 Windows 上用 client\\build.bat '
+                       '编出来的 exe（装 mono-mcs 后可改由服务器编译）：')
+        build_form = ('<form method="post" action="/web/clients/cmd" class="inline-form">'
+                      + self._csrf_hidden()
+                      + '<input type="hidden" name="action" value="build_release">'
+                      + '<input type="text" name="ver" size="8" placeholder="版本(可空)">'
+                      + '<input type="submit" value="编译当前源码并发布"></form>') if cc else ''
+        upload_form = ('<form method="post" action="/web/clients/upload" '
+                       'enctype="multipart/form-data" class="inline-form">'
+                       + self._csrf_hidden()
+                       + 'exe：<input type="file" name="exe" accept=".exe"> '
+                       + '版本：<input type="text" name="ver" size="7" placeholder="如 1.1"> '
+                       + '<input type="submit" value="上传并发布"></form>')
+        return ('<div class="card"><h2>客户端发布</h2>'
+                + '<p class="small">发布库：<code>' + html.escape(info["dir"] or "") + '</code>，'
+                + '只保留最近 %d 个版本。</p>' % client_release.KEEP_RELEASES
+                + '<p>' + cur_txt + '</p>' + table
+                + '<p class="small">' + compile_txt + '</p>'
+                + '<p>' + build_form + '</p>'
+                + '<p>上传 exe：' + upload_form + '</p>'
+                + '<p class="small">客户机端怎么更新见 client/README.md；'
+                + '无盘客户机重启会回到母盘里的版本，想让升级“永久生效”要重做母盘。</p>'
+                + '</div>')
+
     def _do_clients_cmd(self, form):
-        """处理客户机控制页的下发按钮（关机/重启/VNC/挂载/账号/令牌）。"""
+        """处理客户机控制页的下发按钮（关机/重启/VNC/挂载/账号/令牌/更新客户端）。"""
         action = form.get("action", [""])[0]
         if action == "rotate_token":
             agent_hub.rotate_token()
             self._redirect("/web/clients?msg=" + urllib.parse.quote("令牌已重置，请更新各客户机的 agent.ini", safe=""))
+            return
+        if action in ("upgrade_one", "upgrade_all"):
+            self._do_upgrade(action == "upgrade_all",
+                             form.get("mac", [""])[0], form.get("force", [""])[0] == "1")
+            return
+        if action in ("build_release", "drop_release"):
+            if action == "build_release":
+                ok, msg, _ver = client_release.build(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    ver=(form.get("ver", [""])[0] or "").strip() or None)
+            else:
+                try:
+                    client_release.remove((form.get("ver", [""])[0] or "").strip())
+                    ok, msg = True, "已删除该发布版本"
+                except client_release.ReleaseError as e:
+                    ok, msg = False, str(e)
+            self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
             return
         mac = form.get("mac", [""])[0]
         if action == "set_account":
@@ -2527,6 +2763,77 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             msg = "已记下“%s”，客户机上线后会自动同步（现在：%s）" % (
                 "启用网盘" if action == "mount" else "停用网盘", msg)
         self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
+
+    def _do_upgrade(self, all_machines, mac, force):
+        """后台「升级客户端」：把发布版作为 update 指令下发给客户机（客户机下次心跳执行）。"""
+        ver = client_release.current()
+        rec = client_release.release_of(ver) if ver else None
+        if not rec:
+            self._redirect("/web/clients?msg=" + urllib.parse.quote(
+                "服务器上还没有发布客户端：请在下面「客户端发布」里上传 build.bat 编好的 exe"
+                "（服务器装了 mono-mcs/csc 时也可以直接点编译）", safe=""))
+            return
+        args = {"ver": rec["ver"], "url": self._agent_exe_rel(rec["ver"]),
+                "sha256": rec.get("sha256", ""), "size": rec.get("size", 0)}
+        if force:
+            args["force"] = 1
+        targets = [r["mac"] for r in agent_hub.snapshot()] if all_machines else [mac]
+        targets = [m for m in targets if m]
+        if not targets:
+            self._redirect("/web/clients?msg=" + urllib.parse.quote("没有可下发的客户机", safe=""))
+            return
+        ok_n, fail = 0, []
+        for m in targets:
+            ok, msg = agent_hub.enqueue(m, "update", **args)
+            if ok:
+                ok_n += 1
+            else:
+                fail.append("%s: %s" % (m, msg))
+        if ok_n and not fail:
+            msg = "已下发“更新客户端到 v%s”：%d 台（客户机下次心跳时执行）" % (rec["ver"], ok_n)
+        elif ok_n:
+            msg = "已下发 %d 台更新到 v%s；%d 台失败：%s" % (ok_n, rec["ver"], len(fail), "；".join(fail[:3]))
+        else:
+            msg = "下发失败：" + "；".join(fail[:3])
+        self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
+
+    def _do_client_upload(self, s):
+        """后台上传客户端 exe：POST /web/clients/upload（multipart/form-data）。"""
+        def back(msg):
+            self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
+
+        ctype = self.headers.get("Content-Type", "") or ""
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        limit = client_release.MAX_UPLOAD + 1024
+        if "multipart/form-data" not in ctype.lower():
+            back("上传失败：不是表单上传")
+            return
+        if length <= 0 or length > limit:
+            back("上传失败：文件为空或超过 %d MB" % (client_release.MAX_UPLOAD // 1024 // 1024))
+            return
+        bound = _form_boundary(ctype)
+        if not bound:
+            back("上传失败：缺少 boundary")
+            return
+        # 直接读进内存（上限 32MB，够放 200KB 的 exe）
+        fields = _parse_multipart(self.rfile.read(length), bound)
+        if fields.get("csrf", [""])[0] != s.get("csrf"):
+            back("上传失败：会话已过期，请重新登录后再传")
+            return
+        blob = fields.get("exe", [b""])[0]
+        if isinstance(blob, str):
+            blob = blob.encode("utf-8", "replace")
+        ver = (fields.get("ver", [""])[0] or "").strip()
+        try:
+            if not ver:
+                ver = client_release.read_source_version(
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "Agent.cs"))
+            rec = client_release.import_bytes(blob, ver, notes="uploaded from web")
+            back("已发布客户端 v%s（%d 字节，sha256=%s…）" % (rec["ver"], rec["size"], rec["sha256"][:12]))
+        except client_release.ReleaseError as e:
+            back("上传失败：" + str(e))
+        except Exception as e:
+            back("上传失败：" + str(e))
 
     # ---------- 管理员：默认配额 ----------
     def _settings_page(self, msg=None):
@@ -2719,6 +3026,41 @@ if __name__ == "__main__":
     agent_hub.setup(OVERLAY_DIR)
     print(f"[{datetime.datetime.now()}] [START] Client agent channel ready (token file: "
           f"{os.path.join(OVERLAY_DIR, agent_hub.TOKEN_FILE_NAME)})")
+
+    # 客户机客户端发布库（托盘「检查更新」从这里拉新版 exe）
+    print(f"[{datetime.datetime.now()}] [START] Client release store: "
+          f"{client_release.setup(BASE_DIR)}"
+          f"{'' if client_release.compiler_available() else ' (无 C# 编译器：只能后台上传 exe)'}")
+
+    # 命令行维护入口（不启动服务）：
+    #   python3 iscsi_broker.py --publish-client <exe路径> [--client-ver 1.1]
+    #   python3 iscsi_broker.py --build-client [--client-ver 1.1]
+    if "--publish-client" in sys.argv or "--build-client" in sys.argv:
+        def _arg_val(name):
+            if name in sys.argv:
+                i = sys.argv.index(name)
+                if i + 1 < len(sys.argv):
+                    return sys.argv[i + 1]
+            return ""
+
+        ver = (_arg_val("--client-ver") or "").strip() or None
+        if "--build-client" in sys.argv:
+            ok, msg, _v = client_release.build(os.path.dirname(os.path.abspath(__file__)), ver=ver)
+        else:
+            src = _arg_val("--publish-client")
+            if not src:
+                print("用法：iscsi_broker.py --publish-client <exe路径> [--client-ver 1.1]")
+                raise SystemExit(2)
+            try:
+                if not ver:
+                    ver = client_release.read_source_version(
+                        os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "Agent.cs"))
+                rec = client_release.import_file(src, ver, notes="published from cli")
+                ok, msg = True, "已发布 v%s（%d 字节）" % (rec["ver"], rec["size"])
+            except (client_release.ReleaseError, OSError) as e:
+                ok, msg = False, str(e)
+        print(("[OK] " if ok else "[ERROR] ") + msg)
+        raise SystemExit(0 if ok else 1)
 
     # 联网控制：接管转发/NAT（按客户机 MAC 控制上网），并启动规则巡检线程
     if NETCTRL_ENABLED:

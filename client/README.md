@@ -157,6 +157,22 @@ letter=Z                    ; 网盘映射到哪个盘符
   管理员要在后台「通用文件」页先传点东西；登录后才能看到自己的网盘。
 - **Z 盘登录后还是只读**：检查是否真的登录成功（托盘状态显示"已登录：xxx"），以及
   WebClient 服务是否在跑（`sc query WebClient`）。
+- **客户端怎么更新（手动）**：托盘右键菜单里有「检查更新」——agent 向服务器
+  `GET /agent/version` 问最新发布版本，有新版就下载到 `%TEMP%`、校验 sha256、然后
+  改名旧 exe（`.old`）→ 写入新 exe → `schtasks /Run` 把自己拉起来，全过程写在
+  `<exe目录>\agent-update.log`。同版本也可以「强制重装」（修坏掉的 exe）。
+  服务端发布新版的两条路（后台「客户机控制」页 →「客户端发布」卡片）：
+  1. **上传**：在 Windows 上跑 `client\build.bat`，把 `dist\iscsi-broker-agent.exe` 传上去；
+  2. **服务器自己编译**：服务器装了 mono 的 `mcs`/`csc` 时，可以直接点「编译当前源码并发布」
+     （拉到最新代码后一键出新版），也可以用命令行：
+     `python3 iscsi_broker.py --build-client [--client-ver 1.1]`、
+     `python3 iscsi_broker.py --publish-client <exe> [--client-ver 1.1]`。
+
+  > **无盘客户机的注意点**：普通 PXE 客户机每次开机都是母盘 + 全新叠加盘，客户机里
+  > 替换掉的 exe **不会保留到下次开机**（回写模式的客户机才会落盘）。所以对无盘机来说，
+  > 托盘更新适合“临时把某台机器升上去用”，**要永久生效还是得把新 exe 放进母盘**
+  > （母盘里覆盖 `C:\iscsi-broker-agent\iscsi-broker-agent.exe` 后封装）。后台也支持
+  > 对单台/全部客户机下发「升级客户端」指令（客户机下次心跳时执行同一套更新流程）。
 - **`net use 失败(rc=2)：系统错误 67 找不到网络名`**（WebDAV 挂载最常见的一个报错）：
   Windows 的 WebDAV 重定向器（WebClient / DavClnt）连 `http://<服务器>:8080/dav/` 之前，
   会先发一条 `OPTIONS *` 做 WebDAV 能力探测，**只认这条里有 `DAV: 1, 2` 应答头的服务器**。

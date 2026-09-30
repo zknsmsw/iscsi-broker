@@ -1,11 +1,11 @@
-# ---- Python ----
+﻿# ---- Python ----
 __pycache__/
 *.py[cod]
 *.egg-info/
 build/
 dist/
 
-# ---- 开发期测试残留空目录（Windows ACL 锁定的 mkdtemp 遗留，服务器端不存在）----
+# ---- 寮€鍙戞湡娴嬭瘯娈嬬暀绌虹洰褰曪紙Windows ACL 閿佸畾鐨?mkdtemp 閬楃暀锛屾湇鍔″櫒绔笉瀛樺湪锛?---
 probe_*/
 cloud_store_test_*/
 t4_selftest_*/
@@ -13,22 +13,25 @@ p_mkdir_700/
 .test_tmp/
 tmp*/
 
-# ---- AgentTeams 插件内部状态（不入库）----
+# ---- AgentTeams 鎻掍欢鍐呴儴鐘舵€侊紙涓嶅叆搴擄級----
 .agent-teams/
 
-# ---- 运行时生成数据（服务器端产生，不入库）----
+# ---- 杩愯鏃剁敓鎴愭暟鎹紙鏈嶅姟鍣ㄧ浜х敓锛屼笉鍏ュ簱锛?---
 *.tmp
 overlay_*.raw
 overlay_*.qcow2
 *.raw
 
-#个人配置文件
+#涓汉閰嶇疆鏂囦欢
 admin.conf
 users.conf
 
-#联网控制运行时数据（服务器端产生，不入库）
+#鑱旂綉鎺у埗杩愯鏃舵暟鎹紙鏈嶅姟鍣ㄧ浜х敓锛屼笉鍏ュ簱锛?
 netctrl.conf
 netctrl_backup/
 
-#测试文件
+#娴嬭瘯鏂囦欢
 test*
+# 本地验证用临时数据目录（不入库）
+.srvtest/
+

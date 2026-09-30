@@ -68,7 +68,8 @@
 | `users_auth.py` | **账号认证模块**：注册 / 登录校验 / 配额管理 / 默认配额，用户数据持久化到 `users.conf`、`cloud.conf`。 |
 | `cloud_store.py` | **网盘存储模块**：目录列表、上传（流式 multipart 解析）、下载、建文件夹、配额统计、通用文件管理，含路径穿越与符号链接防护。 |
 | `netctrl.py` | **联网控制模块**：`netctrl.conf` 状态读写、FORWARD/NAT 规则托管（iptables 按 MAC 过滤 + MASQUERADE）、开机/巡检规则对齐、改动前自动备份。 |
-| `agent_hub.py` | **客户机 agent 通道**：接入令牌、心跳与在线状态、指令队列（关机/重启/VNC/挂载）、MAC→网盘账号与挂载意图（`agent_token.conf`、`agents.conf`）。 |
+| `agent_hub.py` | **客户机 agent 通道**：接入令牌、心跳与在线状态、指令队列（关机/重启/VNC/挂载/客户端升级）、MAC→网盘账号与挂载意图（`agent_token.conf`、`agents.conf`）。 |
+| `client_release.py` | **客户端发布库**：`iscsi-broker-agent.exe` 的版本化保存（`client_dist/` + `index.json`，含 sha256/大小），可选调用 mono `mcs`/`csc` 从源码编译，供客户机托盘「检查更新」拉取。 |
 | `webdav.py` | **网盘 WebDAV 端点**：把 `cloud_store` 的个人网盘暴露成 WebDAV，供 Windows 客户机映射盘符（PROPFIND/GET/PUT/MKCOL/DELETE/MOVE/LOCK 等，复用云盘的路径安全与配额）。 |
 | `wsbridge.py` | **VNC 的 WebSocket 桥**：浏览器 --ws--> 服务器 --tcp 5900--> 客户机（纯标准库实现 RFC6455）。 |
 | `client/` | **客户机客户端**：`Agent.cs`（源码）+ `build.bat`（用系统自带 csc 编译）+ `agent.ini.example` + `README.md`（部署说明）。 |
@@ -546,6 +547,12 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
   而是 Windows 的 WebDAV 重定向器（WebClient）没把服务器认成 WebDAV——它连 `/dav/` 之前会先发
   一条 `OPTIONS *` 做能力探测，服务器必须在这条上回 `DAV: 1, 2`（`WebAdminHandler.do_OPTIONS`
   已支持）。排查顺序、以及 agent 启动时那次「WebDAV 探测」怎么读，见 `client/README.md` 第 5 节。
+- **客户端怎么升级**：服务器把 `iscsi-broker-agent.exe` 按版本存在发布库
+  （`<BASE_DIR>/client_dist/`，接口 `GET /agent/version`、`GET /agent/exe`）；客户机托盘右键
+  「检查更新」自己拉新版并自我替换，后台「客户机控制」页也能对单台/全部客户机下发升级指令。
+  发布新版：后台上传 `client\build.bat` 的产物，或服务器装了 mono `mcs`/`csc` 时直接点编译
+  （也可用 `python3 iscsi_broker.py --build-client` / `--publish-client <exe>`）。
+  注意无盘客户机重启会回到母盘里的版本，永久生效仍需更新母盘（详见 `client/README.md`）。
 - 详细部署、`agent.ini` 字段、托盘用法、排错命令见 `client/README.md`。
 
 ---

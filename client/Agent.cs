@@ -6,7 +6,13 @@
 //   2) 网盘挂载：把服务器个人网盘通过 WebDAV 映射成盘符（自动配好 Windows
 //      WebDAV 重定向器需要的注册表与 WebClient 服务，并把 net use 跑在交互用户
 //      会话里，这样“我的电脑”里能看到盘）；登录会话变化后自动重新挂载；
-//   3) VNC：按 agent.ini 拉起 / 停止 VNC 服务端（推荐装成服务，可看登录界面）。
+//   3) VNC：按 agent.ini 拉起 / 停止 VNC 服务端（推荐装成服务，可看登录界面）；
+//   4) 客户端自更新：托盘右键「检查更新」（同版本可「强制重装客户端」）向服务器
+//      GET /agent/version 问最新版本，版本号按数字段比较；有新版本就下载到
+//      %TEMP%\iscsi-broker-agent-<ver>.new，校验 sha256 与大小后写一个
+//      %TEMP%\agent-swap-<pid>.cmd，由它等本进程退出→改名替换 exe→重开任务
+//      （失败自动回滚），全过程记到 <exe 目录>\agent-update.log；
+//      服务器 /agent/poll 下发 {"type":"update",...} 时走同一条流程。
 //
 // 编译：client\build.bat（用系统自带 csc.exe，不需要装 SDK；产物是单个小 exe，
 //       目标机不需要装 .NET 运行时——Win10/11 自带 .NET Framework 4.x）。
@@ -28,6 +34,7 @@ using System.Net;
 using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -77,7 +84,7 @@ namespace IscsiBrokerAgent
 
     internal static class Program
     {
-        private const string VERSION = "1.0";
+        private const string VERSION = "1.1";
         private const string TASK_NAME = "iSCSI-Broker-Agent";
         private const uint INVALID_SESSION = 0xFFFFFFFF;
         private const int MAXIMUM_ALLOWED = 0x02000000;
@@ -138,6 +145,7 @@ namespace IscsiBrokerAgent
             if (action == "selftest") return SelfTest(args);
 
             LoadConfig();
+            CleanupStaleFiles();          // 上次更新成功留下的 .old / 残留的 .new 清掉
             if (action == "tray") return TrayMain();
             if (action == "test")
             {
@@ -427,6 +435,47 @@ namespace IscsiBrokerAgent
                 if (_dryRun) { Log("[dry-run] 不执行 " + type); return; }
                 msg = RunShutdown(reboot);
                 Log(msg);
+                return;
+            }
+            if (type == "update")
+            {
+                // 服务器下发「更新客户端到 vX」：下载 → 校验 sha256 → 起替换脚本 → 本体退出。
+                // 必须在退出前把结果回报掉，否则关机/退出后就没机会回报了。
+                string uver = CmdArg(cmd, "ver");
+                string uurl = CmdArg(cmd, "url");
+                string usha = CmdArg(cmd, "sha256");
+                long usize = ParseInt(CmdArg(cmd, "size"), 0);
+                bool uforce = CmdArg(cmd, "force").Length > 0 && CmdArg(cmd, "force") != "0";
+                if (_dryRun)
+                {
+                    Log("[dry-run] 不执行客户端更新（目标 v" + uver + " " + uurl + "）");
+                    Report(id, true, "[dry-run] 不执行客户端更新到 v" + uver);
+                    return;
+                }
+                if (uver.Length > 0 && CompareVer(uver, VERSION) == 0 && !uforce)
+                {
+                    Report(id, true, "已是最新版本 v" + VERSION + "，未要求强制重装，跳过");
+                    return;
+                }
+                string umsg;
+                UpdatePlan plan = DownloadUpdate(uver, uurl, usha, usize, out umsg);
+                if (plan == null)
+                {
+                    Log("指令 #" + id + " 结果：失败 " + umsg);
+                    Report(id, false, umsg);
+                    return;
+                }
+                string smsg;
+                if (!LaunchSwap(plan, out smsg))
+                {
+                    Log("指令 #" + id + " 结果：失败 " + smsg);
+                    Report(id, false, smsg);
+                    return;
+                }
+                Log("指令 #" + id + " 结果：成功 已下载校验 v" + plan.Ver + "，本进程退出等替换");
+                Report(id, true, "更新到 v" + plan.Ver + "：已下载并校验 sha256，正在退出替换");
+                Thread.Sleep(500);
+                Environment.Exit(0);
                 return;
             }
             switch (type)
@@ -834,6 +883,8 @@ namespace IscsiBrokerAgent
                 menu.Items.Add(new ToolStripMenuItem("打开 Z 盘", null, delegate { OpenDrive(); }));
                 menu.Items.Add(new ToolStripMenuItem("重新挂载", null, delegate { Remount(); }));
                 menu.Items.Add(new ToolStripMenuItem("查看日志", null, delegate { OpenLog(); }));
+                menu.Items.Add(new ToolStripMenuItem("检查更新", null, delegate { CheckUpdate(false); }));
+                menu.Items.Add(new ToolStripMenuItem("强制重装客户端", null, delegate { CheckUpdate(true); }));
                 menu.Items.Add(new ToolStripSeparator());
                 menu.Items.Add(new ToolStripMenuItem("退出托盘", null, delegate { ExitTray(); }));
                 menu.Opening += delegate { UpdateTrayMenu(); };
@@ -870,11 +921,12 @@ namespace IscsiBrokerAgent
         {
             if (_trayIcon == null || _trayStatus == null) return;
             bool logged = _davUser.Length > 0;
-            _trayStatus.Text = logged ? ("已登录：" + _davUser + "（Z 盘可写）")
-                                      : "未登录（Z 盘只读通用文件）";
+            _trayStatus.Text = "当前 v" + VERSION + "｜"
+                + (logged ? ("已登录：" + _davUser + "（Z 盘可写）")
+                          : "未登录（Z 盘只读通用文件）");
             _trayLogin.Enabled = !logged;
             _trayLogout.Enabled = logged;
-            string tip = "iSCSI Broker 网盘\r\n"
+            string tip = "iSCSI Broker 网盘 v" + VERSION + "\r\n"
                 + (logged ? ("已登录 " + _davUser + "，Z 盘可写") : "未登录，Z 盘为只读通用文件");
             try { _trayIcon.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip; } catch { }
         }
@@ -1064,6 +1116,12 @@ namespace IscsiBrokerAgent
                     return;
                 }
                 _lastAccount = GetString(resp, "account");    // 默认用户名：登录框预填
+                // 服务器可能顺手告诉托盘“有比本机新的发布版本”（avail_ver）：提示一下，
+                // 真正的下载替换仍由用户点「检查更新」触发
+                string avail = GetString(resp, "avail_ver");
+                if (avail.Length > 0 && CompareVer(avail, VERSION) > 0)
+                    NotifyTipOnce("avail-ver", "服务器已有新版本 v" + avail + "（当前 v" + VERSION
+                                  + "），右键图标「检查更新」可升级", 3600);
             }
             catch (Exception e)
             {
@@ -1119,6 +1177,628 @@ namespace IscsiBrokerAgent
                     + (ReferenceEquals(ic, SystemIcons.Application) ? " (fallback)" : " (embedded)");
             }
             catch (Exception e) { return "error: " + e.Message; }
+        }
+
+        // ---------------- 客户端自更新（托盘手动 / 服务器下发都走这里） ----------------
+        // 协议：
+        //   GET {url}/agent/version?mac=&token=&cur=<当前版本>
+        //        200 {"ok":true,"available":true,"ver":"1.1","url":"/agent/exe?ver=1.1",
+        //             "sha256":"<64hex>","size":68096,"notes":""}
+        //        200 {"ok":true,"available":false,"ver":"1.0"}     已是最新/无发布
+        //        403 {"ok":false,"err":"bad token"}
+        //   GET {url}/agent/exe?ver=1.1&mac=&token=   -> exe 二进制（出错回 JSON+4xx）
+        // 替换自身不能直接覆盖运行中的 exe：写一个 %TEMP%\agent-swap-<pid>.cmd、用独立进程
+        // 启动它，然后本体退出；脚本负责等进程退出 → 改名 → 放新文件 → 重开任务（失败回滚）。
+
+        /// <summary>一次“已下载且校验通过”的更新（还没替换）。</summary>
+        private class UpdatePlan
+        {
+            public string Ver = "";
+            public string Sha = "";
+            public string NewFile = "";    // %TEMP%\iscsi-broker-agent-<ver>.new
+            public string Url = "";
+            public long Size;
+        }
+
+        /// <summary>版本号比较：按数字段逐段比（"1.10" &gt; "1.9"），不能用字符串比。返回 -1/0/1。</summary>
+        private static int CompareVer(string a, string b)
+        {
+            int[] pa = VersionParts(a);
+            int[] pb = VersionParts(b);
+            int n = Math.Max(pa.Length, pb.Length);
+            for (int i = 0; i < n; i++)
+            {
+                int va = i < pa.Length ? pa[i] : 0;
+                int vb = i < pb.Length ? pb[i] : 0;
+                if (va != vb) return va > vb ? 1 : -1;
+            }
+            return 0;
+        }
+
+        /// <summary>把 "v1.10.2" 拆成数字段（[1,10,2]）；缺的段当 0。</summary>
+        private static int[] VersionParts(string v)
+        {
+            if (v == null) return new int[0];
+            string s = v.Trim();
+            if (s.Length > 0 && (s[0] == 'v' || s[0] == 'V')) s = s.Substring(1);
+            StringBuilder digits = new StringBuilder();
+            for (int i = 0; i < s.Length; i++)
+            {
+                char c = s[i];
+                if ((c >= '0' && c <= '9') || c == '.') digits.Append(c);
+                else if (digits.Length > 0) break;    // 遇到 "-beta" 这类后缀就停
+            }
+            string[] parts = digits.ToString().Split('.');
+            int[] nums = new int[parts.Length];
+            for (int i = 0; i < parts.Length; i++) nums[i] = ParseInt(parts[i], 0);
+            return nums;
+        }
+
+        /// <summary>文件 sha256（小写十六进制）。</summary>
+        private static string Sha256File(string path)
+        {
+            using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (SHA256 sha = SHA256.Create())
+            {
+                byte[] h = sha.ComputeHash(fs);
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < h.Length; i++) sb.Append(h[i].ToString("x2"));
+                return sb.ToString();
+            }
+        }
+
+        private static string ExePath()
+        {
+            return Process.GetCurrentProcess().MainModule.FileName;
+        }
+
+        /// <summary>下载落点：%TEMP%\iscsi-broker-agent-&lt;ver&gt;.new。</summary>
+        private static string NewFilePath(string ver)
+        {
+            StringBuilder safe = new StringBuilder();
+            for (int i = 0; i < ver.Length; i++)
+            {
+                char c = ver[i];
+                if ((c >= '0' && c <= '9') || c == '.') safe.Append(c);
+            }
+            string name = safe.Length > 0 ? safe.ToString() : "unknown";
+            return Path.Combine(Path.GetTempPath(), "iscsi-broker-agent-" + name + ".new");
+        }
+
+        private static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch { }
+        }
+
+        /// <summary>启动清理：上次更新成功留下的 &lt;exe&gt;.old 与残留的 &lt;exe&gt;.new 删掉。</summary>
+        private static void CleanupStaleFiles()
+        {
+            try
+            {
+                string exe = ExePath();
+                string oldFile = exe + ".old";
+                string newFile = exe + ".new";
+                if (File.Exists(oldFile))
+                {
+                    if (_dryRun) Log("[dry-run] 删除上次更新留下的旧版文件 " + oldFile);
+                    else
+                    {
+                        File.Delete(oldFile);
+                        Log("上次客户端更新成功：已删除旧版文件 " + oldFile);
+                    }
+                }
+                if (File.Exists(newFile))
+                {
+                    if (_dryRun) Log("[dry-run] 删除残留的更新文件 " + newFile);
+                    else
+                    {
+                        File.Delete(newFile);
+                        Log("删除上次没替换成功的残留文件 " + newFile);
+                    }
+                }
+            }
+            catch (Exception e) { Log("清理旧客户端文件失败：" + e.Message); }
+        }
+
+        // ---------- HTTP（GET / 下载） ----------
+        private static string AbsUrl(string path)
+        {
+            if (path.Length > 7 && (path.StartsWith("http://") || path.StartsWith("https://"))) return path;
+            if (path.Length > 0 && path[0] == '/') return _url + path;
+            return _url + "/" + path;
+        }
+
+        private static bool HasQuery(string u, string key)
+        {
+            return u.IndexOf("?" + key + "=") >= 0 || u.IndexOf("&" + key + "=") >= 0;
+        }
+
+        private static string AddQuery(string u, string key, string val)
+        {
+            if (HasQuery(u, key) || val.Length == 0) return u;
+            char sep = u.IndexOf('?') >= 0 ? '&' : '?';
+            return u + sep + key + "=" + Uri.EscapeDataString(val);
+        }
+
+        private static string ReadAll(HttpWebResponse resp)
+        {
+            using (Stream rs = resp.GetResponseStream())
+            using (StreamReader sr = new StreamReader(rs, Encoding.UTF8))
+                return sr.ReadToEnd();
+        }
+
+        private static Dictionary<string, object> ParseJson(string text)
+        {
+            try { return new JavaScriptSerializer().DeserializeObject(text) as Dictionary<string, object>; }
+            catch { return null; }
+        }
+
+        /// <summary>GET 一个 JSON 接口；HTTP 4xx/5xx 也把 JSON 响应体解析出来（服务器用 JSON 报错）。</summary>
+        private static Dictionary<string, object> GetJsonUrl(string url, out int status)
+        {
+            status = 0;
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = 15000;
+            req.ReadWriteTimeout = 30000;
+            req.Proxy = null;
+            req.KeepAlive = false;
+            req.UserAgent = "iscsi-broker-agent/" + VERSION;
+            try
+            {
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                {
+                    status = (int)resp.StatusCode;
+                    return ParseJson(ReadAll(resp));
+                }
+            }
+            catch (WebException we)
+            {
+                HttpWebResponse r = we.Response as HttpWebResponse;
+                if (r == null) throw;
+                status = (int)r.StatusCode;
+                string body = ReadAll(r);
+                r.Close();
+                Dictionary<string, object> d = ParseJson(body);
+                if (d != null) return d;
+                throw;
+            }
+        }
+
+        /// <summary>下载到指定文件（覆盖）。失败返回 false，err 是给人看的原因。</summary>
+        private static bool DownloadTo(string url, string destPath, out string err, out string serverSha)
+        {
+            err = "";
+            serverSha = "";
+            HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = 20000;
+            req.ReadWriteTimeout = 60000;
+            req.Proxy = null;
+            req.KeepAlive = false;
+            req.UserAgent = "iscsi-broker-agent/" + VERSION;
+            try
+            {
+                using (HttpWebResponse resp = (HttpWebResponse)req.GetResponse())
+                {
+                    if ((int)resp.StatusCode != 200)
+                    {
+                        err = "HTTP " + (int)resp.StatusCode;
+                        return false;
+                    }
+                    string h = resp.Headers["X-Client-Sha256"];
+                    serverSha = h == null ? "" : h.Trim().ToLowerInvariant();
+                    using (Stream rs = resp.GetResponseStream())
+                    using (FileStream fs = new FileStream(destPath, FileMode.Create, FileAccess.Write))
+                    {
+                        byte[] buf = new byte[65536];
+                        int n;
+                        while ((n = rs.Read(buf, 0, buf.Length)) > 0) fs.Write(buf, 0, n);
+                    }
+                }
+                return true;
+            }
+            catch (WebException we)
+            {
+                HttpWebResponse r = we.Response as HttpWebResponse;
+                if (r != null)
+                {
+                    string body = ReadAll(r);
+                    r.Close();
+                    Dictionary<string, object> d = ParseJson(body);
+                    string m = d == null ? "" : GetString(d, "err");
+                    err = "HTTP " + (int)we.Status + (m.Length > 0 ? ("：" + m) : "");
+                    return false;
+                }
+                err = we.Message;
+                return false;
+            }
+            catch (Exception e)
+            {
+                err = e.Message;
+                return false;
+            }
+        }
+
+        /// <summary>粗校验下载物是 Windows PE（MZ + PE\0\0）。</summary>
+        private static bool LooksLikeExe(string path)
+        {
+            try
+            {
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    byte[] head = new byte[0x40];
+                    if (fs.Read(head, 0, head.Length) < 0x40) return false;
+                    if (head[0] != 'M' || head[1] != 'Z') return false;
+                    int peOff = head[0x3C] | (head[0x3D] << 8) | (head[0x3E] << 16) | (head[0x3F] << 24);
+                    if (peOff <= 0 || peOff > fs.Length - 4) return false;
+                    fs.Seek(peOff, SeekOrigin.Begin);
+                    byte[] sig = new byte[4];
+                    if (fs.Read(sig, 0, 4) != 4) return false;
+                    return sig[0] == 'P' && sig[1] == 'E' && sig[2] == 0 && sig[3] == 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        private static string FileVersionOf(string path)
+        {
+            try
+            {
+                string v = FileVersionInfo.GetVersionInfo(path).FileVersion;
+                return v == null ? "" : v.Trim();
+            }
+            catch { return ""; }
+        }
+
+        // ---------- 问服务器 / 下载 / 替换 ----------
+        /// <summary>问一次 /agent/version（cur 为上报的“当前版本”）。</summary>
+        private static bool QueryVersionOnce(string cur, out bool available, out string ver, out string url,
+                                             out string sha, out long size, out string notes, out string err)
+        {
+            available = false; ver = ""; url = ""; sha = ""; size = 0; notes = ""; err = "";
+            string q = AbsUrl("/agent/version");
+            q = AddQuery(q, "mac", _mac);
+            q = AddQuery(q, "token", _token);
+            q = AddQuery(q, "cur", cur);
+            int status;
+            Dictionary<string, object> resp;
+            try { resp = GetJsonUrl(q, out status); }
+            catch (Exception e) { err = "检查更新失败：" + e.Message; return false; }
+            if (status == 403)
+            {
+                err = "检查更新失败：接入令牌不对（" + GetString(resp, "err") + "）";
+                return false;
+            }
+            if (resp == null)
+            {
+                err = "检查更新失败：服务器应答不是 JSON（HTTP " + status + "）";
+                return false;
+            }
+            if (GetString(resp, "ok") != "True")
+            {
+                err = "检查更新失败：" + GetString(resp, "err") + "（HTTP " + status + "）";
+                return false;
+            }
+            object av;
+            available = resp.TryGetValue("available", out av) && av is bool && (bool)av;
+            ver = GetString(resp, "ver").Trim();
+            url = GetString(resp, "url").Trim();
+            sha = GetString(resp, "sha256").Trim().ToLowerInvariant();
+            notes = GetString(resp, "notes");
+            size = ParseInt(GetString(resp, "size"), 0);
+            return true;
+        }
+
+        /// <summary>
+        /// 查最新发布。force=true（强制重装）时如果按本地版本问不到可用更新，
+        /// 再用 cur=0 问一次 —— 服务器对非法/空的 cur 会把当前发布整个给回来，
+        /// 这样“服务器版本与本机相同”也能拿到 sha256/url 重装同一版本。
+        /// </summary>
+        private static bool QueryVersion(bool force, out bool available, out string ver, out string url,
+                                         out string sha, out long size, out string notes, out string err)
+        {
+            if (!QueryVersionOnce(VERSION, out available, out ver, out url, out sha, out size, out notes, out err))
+                return false;
+            if (available || !force) return true;
+            return QueryVersionOnce("0", out available, out ver, out url, out sha, out size, out notes, out err);
+        }
+
+        /// <summary>下载 + 校验（sha256 必须一致）+ 落盘，返回待替换的 UpdatePlan；失败返回 null。</summary>
+        private static UpdatePlan DownloadUpdate(string ver, string url, string sha, long size, out string msg)
+        {
+            msg = "";
+            if (ver.Length == 0)
+            {
+                msg = "服务器没给版本号，无法更新";
+                return null;
+            }
+            string full = AbsUrl(url.Length > 0 ? url : "/agent/exe");
+            full = AddQuery(full, "ver", ver);
+            full = AddQuery(full, "mac", _mac);
+            full = AddQuery(full, "token", _token);
+            string newFile = NewFilePath(ver);
+            TryDelete(newFile);
+            Log("开始下载客户端 v" + ver + "：" + full);
+            string err, srvSha;
+            if (!DownloadTo(full, newFile, out err, out srvSha))
+            {
+                TryDelete(newFile);
+                msg = "下载客户端 v" + ver + " 失败：" + err;
+                return null;
+            }
+            long got = 0;
+            try { got = new FileInfo(newFile).Length; }
+            catch { }
+            // ① sha256：服务器 JSON 给的、响应头给的、本地算出来的必须一致（必须校验！）
+            string local;
+            try { local = Sha256File(newFile); }
+            catch (Exception e)
+            {
+                TryDelete(newFile);
+                msg = "计算下载文件 sha256 失败：" + e.Message;
+                return null;
+            }
+            if (sha.Length == 0 && srvSha.Length == 0)
+            {
+                TryDelete(newFile);
+                msg = "服务器没提供 sha256，按安全要求拒绝替换";
+                return null;
+            }
+            if (sha.Length > 0 && local != sha)
+            {
+                TryDelete(newFile);
+                msg = "sha256 不匹配（服务器 " + sha + "，实际 " + local + "），已删除下载文件";
+                return null;
+            }
+            if (srvSha.Length > 0 && local != srvSha)
+            {
+                TryDelete(newFile);
+                msg = "sha256 与响应头 X-Client-Sha256 不符（" + srvSha + " ≠ " + local + "），已删除下载文件";
+                return null;
+            }
+            // ② 大小合理
+            if (size > 0 && got != size)
+            {
+                TryDelete(newFile);
+                msg = "文件大小不符（服务器 " + size + "，实际 " + got + "），已删除下载文件";
+                return null;
+            }
+            if (got < 4096)
+            {
+                TryDelete(newFile);
+                msg = "文件只有 " + got + " 字节，不像客户端 exe，已删除";
+                return null;
+            }
+            // ③ 能读出 MZ/PE 头与文件版本信息（csc 默认不带 AssemblyFileVersion，
+            //    所以文件版本对不上只记日志、不当失败，免得正常更新被挡住）
+            if (!LooksLikeExe(newFile))
+            {
+                TryDelete(newFile);
+                msg = "下载到的文件没有 MZ/PE 头，不是 Windows 可执行文件，已删除";
+                return null;
+            }
+            string fver = FileVersionOf(newFile);
+            if (fver.Length == 0)
+                Log("提示：下载文件没带文件版本信息（csc 不带 AssemblyFileVersion 时正常）");
+            else if (CompareVer(fver, ver) != 0)
+                Log("提示：下载文件的文件版本 v" + fver + " 与目标 v" + ver + " 不同（继续替换）");
+            Log("客户端 v" + ver + " 下载完成：" + got + " 字节，sha256=" + local);
+            UpdatePlan plan = new UpdatePlan();
+            plan.Ver = ver;
+            plan.Sha = local;
+            plan.NewFile = newFile;
+            plan.Url = full;
+            plan.Size = got;
+            return plan;
+        }
+
+        /// <summary>托盘「检查更新」/「强制重装客户端」。</summary>
+        private static void CheckUpdate(bool force)
+        {
+            if (_url.Length == 0 || _token.Length == 0 || _mac.Length != 12)
+            {
+                NotifyTip("配置不完整（agent.ini 的 url/token 与 MAC），无法检查更新");
+                return;
+            }
+            bool available;
+            string ver, url, sha, notes, err;
+            long size;
+            if (!QueryVersion(force, out available, out ver, out url, out sha, out size, out notes, out err))
+            {
+                NotifyTip(err);
+                return;
+            }
+            if (!force && !available)
+            {
+                NotifyTip("已是最新版本 v" + VERSION
+                          + (ver.Length > 0 && CompareVer(ver, VERSION) != 0 ? "（服务器当前发布 v" + ver + "）" : "")
+                          + "；如需重装可用「强制重装客户端」");
+                return;
+            }
+            if (ver.Length == 0)
+            {
+                NotifyTip("服务器上没有客户端发布版本，无法更新");
+                return;
+            }
+            if (!force && CompareVer(ver, VERSION) <= 0)
+            {
+                NotifyTip("已是最新版本 v" + VERSION + "（服务器发布 v" + ver + "）");
+                return;
+            }
+            int cmp = CompareVer(ver, VERSION);
+            StringBuilder body = new StringBuilder();
+            body.Append(force ? "强制重装客户端\r\n\r\n" : "发现客户端新版本\r\n\r\n");
+            body.Append("当前版本：v" + VERSION + "\r\n");
+            body.Append("目标版本：v" + ver + (cmp < 0 ? "（比当前版本旧，属于降级重装）" : "") + "\r\n");
+            if (size > 0) body.Append("文件大小：" + size + " 字节\r\n");
+            if (sha.Length > 0) body.Append("SHA256：" + sha + "\r\n");
+            if (notes.Length > 0) body.Append("发布说明：" + notes + "\r\n");
+            body.Append("\r\n是否立即下载并替换？替换时客户端会短暂退出并自动重启。");
+            DialogResult dr = MessageBox.Show(body.ToString(), "iSCSI Broker 客户端更新",
+                                              MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+            Log("[托盘] 检查更新：本机 v" + VERSION + " 服务器 v" + ver
+                + " 用户选择=" + (dr == DialogResult.Yes ? "更新" : "取消"));
+            if (dr != DialogResult.Yes) return;
+            if (_dryRun)
+            {
+                Log("[dry-run] 本应下载 " + AbsUrl(url) + " 到 " + NewFilePath(ver) + " 并替换 " + ExePath());
+                NotifyTip("[dry-run] 只打印不落盘：本应更新到 v" + ver);
+                return;
+            }
+            string msg;
+            UpdatePlan plan = DownloadUpdate(ver, url, sha, size, out msg);
+            if (plan == null)
+            {
+                NotifyTip("更新失败：" + msg);
+                return;
+            }
+            string smsg;
+            if (!LaunchSwap(plan, out smsg))
+            {
+                NotifyTip("替换客户端失败：" + smsg);
+                return;
+            }
+            NotifyTip("已下载并校验 v" + plan.Ver + "，正在替换并重启客户端…");
+            Thread.Sleep(500);
+            ExitTray();                      // 本体退出，剩下交给 agent-swap-<pid>.cmd
+        }
+
+        /// <summary>写 %TEMP%\agent-swap-&lt;pid&gt;.cmd（ASC 内容）并以独立进程启动它。</summary>
+        private static bool LaunchSwap(UpdatePlan plan, out string msg)
+        {
+            msg = "";
+            string exe = ExePath();
+            int pid = Process.GetCurrentProcess().Id;
+            string cmdFile = Path.Combine(Path.GetTempPath(), "agent-swap-" + pid + ".cmd");
+            string logFile = Path.Combine(Path.GetDirectoryName(exe), "agent-update.log");
+            try
+            {
+                File.WriteAllText(cmdFile,
+                                  SwapScript(exe, plan.NewFile, plan.Ver, VERSION, plan.Sha, pid, logFile),
+                                  Encoding.Default);
+            }
+            catch (Exception e)
+            {
+                msg = "写替换脚本失败：" + e.Message;
+                return false;
+            }
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("cmd.exe", "/c \"" + cmdFile + "\"");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.WorkingDirectory = Path.GetTempPath();
+                using (Process p = Process.Start(psi)) { }   // 不等它：本进程马上要退出
+            }
+            catch (Exception e)
+            {
+                msg = "启动替换脚本失败：" + e.Message;
+                return false;
+            }
+            Log("已启动替换脚本 " + cmdFile + "（本进程退出后由它改名替换并重启任务）");
+            return true;
+        }
+
+        /// <summary>替换脚本内容（纯 ASCII，避免 cmd 代码页问题）。</summary>
+        private static string SwapScript(string exe, string newFile, string newVer, string oldVer,
+                                         string sha, int pid, string logPath)
+        {
+            string image = Path.GetFileName(exe);
+            StringBuilder sb = new StringBuilder();
+            sb.Append("@echo off\r\n");
+            sb.Append("rem iscsi-broker-agent self-update swap script (auto-generated, self-deleting)\r\n");
+            sb.Append("setlocal enableextensions\r\n");
+            sb.Append("set \"EXE=" + exe + "\"\r\n");
+            sb.Append("set \"OLD=%EXE%.old\"\r\n");
+            sb.Append("set \"NEW=" + newFile + "\"\r\n");
+            sb.Append("set \"MYPID=" + pid + "\"\r\n");
+            sb.Append("set \"OLD_VER=" + oldVer + "\"\r\n");
+            sb.Append("set \"NEW_VER=" + newVer + "\"\r\n");
+            sb.Append("set \"EXPECT_SHA=" + sha + "\"\r\n");
+            sb.Append("set \"LOG=" + logPath + "\"\r\n");
+            sb.Append("echo.>>\"%LOG%\" 2>nul\r\n");
+            sb.Append("if not exist \"%LOG%\" set \"LOG=%TEMP%\\iscsi-broker-agent-update.log\"\r\n");
+            sb.Append("call :log \"=== update start old=v%OLD_VER% new=v%NEW_VER% pid=%MYPID% sha256=%EXPECT_SHA% ===\"\r\n");
+            // 1) 等本体退出（最多 60 秒）
+            sb.Append("set /a N=0\r\n");
+            sb.Append(":waitbody\r\n");
+            sb.Append("tasklist /FI \"PID eq %MYPID%\" 2>nul | find /I \"%MYPID%\" >nul\r\n");
+            sb.Append("if errorlevel 1 goto waited\r\n");
+            sb.Append("set /a N+=1\r\n");
+            sb.Append("if %N% GEQ 60 goto waited\r\n");
+            sb.Append("ping -n 2 127.0.0.1 >nul\r\n");
+            sb.Append("goto waitbody\r\n");
+            sb.Append(":waited\r\n");
+            sb.Append("call :log \"waited %N%s for pid %MYPID% to exit\"\r\n");
+            // 2) 杀掉同 exe 的其它实例（旧托盘会抢 mutex / 锁住 exe 文件）——脚本自己是 cmd.exe，安全
+            sb.Append("taskkill /IM iscsi-broker-agent.exe /F >>\"%LOG%\" 2>&1\r\n");
+            if (image.Length > 0 && !image.Equals("iscsi-broker-agent.exe", StringComparison.OrdinalIgnoreCase))
+                sb.Append("taskkill /IM \"" + image + "\" /F >>\"%LOG%\" 2>&1\r\n");
+            sb.Append("ping -n 2 127.0.0.1 >nul\r\n");
+            // 3) 旧 exe 改名（失败重试 10 次）
+            sb.Append("set /a R=0\r\n");
+            sb.Append(":renbody\r\n");
+            sb.Append("move /Y \"%EXE%\" \"%OLD%\" >>\"%LOG%\" 2>&1\r\n");
+            sb.Append("if not exist \"%EXE%\" goto renamed\r\n");
+            sb.Append("set /a R+=1\r\n");
+            sb.Append("if %R% GEQ 10 goto renfail\r\n");
+            sb.Append("ping -n 2 127.0.0.1 >nul\r\n");
+            sb.Append("goto renbody\r\n");
+            sb.Append(":renfail\r\n");
+            sb.Append("call :log \"ERROR: cannot rename old exe after %R% tries, abort (exe still in use?)\"\r\n");
+            sb.Append("del \"%~f0\"\r\n");
+            sb.Append("exit /b 1\r\n");
+            sb.Append(":renamed\r\n");
+            sb.Append("call :log \"renamed old exe to .old (tries=%R%)\"\r\n");
+            // 4) 新 exe 就位（失败重试 10 次）
+            sb.Append("set /a R2=0\r\n");
+            sb.Append(":mvbody\r\n");
+            sb.Append("move /Y \"%NEW%\" \"%EXE%\" >>\"%LOG%\" 2>&1\r\n");
+            sb.Append("if exist \"%EXE%\" goto moved\r\n");
+            sb.Append("set /a R2+=1\r\n");
+            sb.Append("if %R2% GEQ 10 goto mvfail\r\n");
+            sb.Append("ping -n 2 127.0.0.1 >nul\r\n");
+            sb.Append("goto mvbody\r\n");
+            sb.Append(":mvfail\r\n");
+            sb.Append("call :log \"ERROR: cannot put new exe in place after %R2% tries, rolling back\"\r\n");
+            sb.Append("move /Y \"%OLD%\" \"%EXE%\" >>\"%LOG%\" 2>&1\r\n");
+            sb.Append("if exist \"%EXE%\" goto rollok\r\n");
+            sb.Append("call :log \"ROLLBACK FAILED: no exe at %EXE% (old file kept as %OLD%)\"\r\n");
+            sb.Append("goto rollend\r\n");
+            sb.Append(":rollok\r\n");
+            sb.Append("call :log \"rollback ok: old exe restored\"\r\n");
+            sb.Append(":rollend\r\n");
+            sb.Append("schtasks /Run /TN \"iSCSI-Broker-Agent\" >>\"%LOG%\" 2>&1\r\n");
+            sb.Append("del \"%~f0\"\r\n");
+            sb.Append("exit /b 1\r\n");
+            sb.Append(":moved\r\n");
+            sb.Append("call :log \"installed v%NEW_VER% at %EXE% (tries=%R2%)\"\r\n");
+            sb.Append("del \"%EXE%.new\" >nul 2>&1\r\n");
+            // 5) 重新拉起（计划任务优先，失败兜底直接起进程）
+            sb.Append("schtasks /Run /TN \"iSCSI-Broker-Agent\" >>\"%LOG%\" 2>&1\r\n");
+            sb.Append("if not errorlevel 1 goto started\r\n");
+            sb.Append("call :log \"schtasks /Run failed, fallback: start exe run\"\r\n");
+            sb.Append("start \"\" \"%EXE%\" run\r\n");
+            sb.Append(":started\r\n");
+            sb.Append("call :log \"=== update ok: v%OLD_VER% -> v%NEW_VER% ===\"\r\n");
+            sb.Append("del \"%~f0\"\r\n");
+            sb.Append("exit /b 0\r\n");
+            sb.Append(":log\r\n");
+            sb.Append("echo [%DATE% %TIME%] %~1 >>\"%LOG%\"\r\n");
+            sb.Append("exit /b 0\r\n");
+            return sb.ToString();
+        }
+
+        /// <summary>从心跳指令里取字段：update 的参数在 "args" 里也兼容平铺写法。</summary>
+        private static string CmdArg(Dictionary<string, object> cmd, string key)
+        {
+            string v = GetString(cmd, key);
+            if (v.Length > 0) return v;
+            Dictionary<string, object> args = GetDict(cmd, "args");
+            if (args != null) return GetString(args, key);
+            return "";
         }
 
         // ---------------- 自检（命令行，不弹界面、不挂盘） ----------------

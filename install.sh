@@ -46,7 +46,7 @@ LEGACY_BASE=""       # 从旧部署里探测到的数据目录
 LEGACY_SRC=""        # 旧部署的程序目录/源码位置
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROG_FILES=(iscsi_broker.py users_auth.py cloud_store.py netctrl.py agent_hub.py webdav.py wsbridge.py)
+PROG_FILES=(iscsi_broker.py users_auth.py cloud_store.py netctrl.py agent_hub.py webdav.py wsbridge.py client_release.py)
 
 c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_err=$'\033[31m'; c_info=$'\033[36m'; c_end=$'\033[0m'
 [[ -t 1 ]] || { c_ok=""; c_warn=""; c_err=""; c_info=""; c_end=""; }
