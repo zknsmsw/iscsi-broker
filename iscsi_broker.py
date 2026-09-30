@@ -1703,26 +1703,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             return user, False
         return (user, False) if users_auth.check_login(user, pwd) else (None, False)
 
-    # WebDAV 允许的方法（OPTIONS 应答与 405 的 Allow 头共用，避免两处写串）
-    DAV_ALLOW = webdav.ALLOW
-
-    def _dav_target(self):
-        """请求目标是否该按 WebDAV 处理。
-
-        除 /dav/ 外还必须认下 `OPTIONS *`：Windows 自带的 WebDAV 重定向器
-        （WebClient / DavClnt）在连 http://<服务器>:8080/dav/ 之前会先发一条
-        `OPTIONS * HTTP/1.1` 做能力探测，*只认* 这一条里有 DAV 应答头的结果。
-        老代码把 `*` 当普通路径、回 404，重定向器就认为服务器不是 WebDAV，
-        net use 直接报“系统错误 67 找不到网络名”（服务器日志里连一条 PROPFIND
-        都看不到）。这里对 `*` 应答 DAV 头，兼容绝对 URI（http://host/dav/）。
-        """
-        target = (self.path or "").strip()
-        if target == "*":
-            return True
-        parsed = urllib.parse.urlparse(target)
-        path = parsed.path or ""
-        return path.startswith(webdav.MOUNT_PREFIX) or path == webdav.MOUNT_PREFIX.rstrip("/")
-
     def _dav_dispatch(self):
         """把 /dav/ 下的请求交给 webdav 模块。"""
         parsed = urllib.parse.urlparse(self.path)
@@ -1752,14 +1732,18 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         webdav.handle(self, user, rel, readonly)
 
     def do_OPTIONS(self):
-        # 认证前就要把 WebDAV 能力说清楚（Windows 的探测请求不带凭据）
-        if self._dav_target():
-            webdav._do_options(self)
-            return
-        self.send_response(200)
-        self.send_header("Allow", "GET, HEAD, POST, OPTIONS")
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        """任何 OPTIONS 都按 WebDAV 做能力应答。
+
+        Windows 自带的 WebDAV 重定向器（WebClient / DavClnt）在连
+        http://<服务器>:8080/dav/ 之前要先做能力探测，而且**只认响应里带
+        `DAV:` 应答头的结果**；探测的请求目标随版本/URL 写法不同，实测见过
+        `*`、`/`、`/dav/` 几种。老代码只对 /dav/ 应答、其余回 404，重定向器
+        就把服务器当成“不是 WebDAV”，`net use` 直接报“系统错误 67 找不到
+        网络名”（服务器日志里连一条 PROPFIND 都不会出现）。
+        所以这里不挑路径，任何 OPTIONS 一律回 DAV 头——能力应答不带凭据，
+        也必须在认证之前给出。浏览器/其它工具拿到这组头也无副作用。
+        """
+        webdav._do_options(self)
 
     def do_PROPFIND(self):
         self._dav_dispatch()
