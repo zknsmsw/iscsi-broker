@@ -22,13 +22,16 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Net;
 using System.Net.NetworkInformation;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Web.Script.Serialization;
+using System.Windows.Forms;
 
 namespace IscsiBrokerAgent
 {
@@ -98,12 +101,22 @@ namespace IscsiBrokerAgent
         private static int _vncPort = 5900;
         private static int _interval = 3;
         private static bool _dryRun;
-        private static bool _mountRequested;
+        private static bool _mountRequested = true;   // 默认就给客户机挂 Z 盘（只读通用文件）
         private static bool _mountOk;
-        private static uint _appliedSession = INVALID_SESSION;
+        private static int _trayPid;                  // SYSTEM 进程拉起的托盘进程（用户会话里）
+        private static uint _traySession = INVALID_SESSION;
+        // ---- 以下只在托盘进程里用 ----
+        private static string _davSession = "";       // 登录换来的网盘会话令牌（只在内存里）
+        private static string _davUser = "";          // 当前登录的网盘账号
+        private static string _lastAccount = "";      // 服务器给的“默认用户名”，用于预填登录框
+        private static NotifyIcon _trayIcon;
+        private static ToolStripMenuItem _trayStatus;
+        private static ToolStripMenuItem _trayLogin;
+        private static ToolStripMenuItem _trayLogout;
         private static readonly object _logLock = new object();
 
         // ---------------- 入口 ----------------
+        [STAThread]
         private static int Main(string[] args)
         {
             _exeDir = Path.GetDirectoryName(Process.GetCurrentProcess().MainModule.FileName);
@@ -116,14 +129,16 @@ namespace IscsiBrokerAgent
             {
                 string low = a.Trim().ToLowerInvariant();
                 if (low == "--dry-run" || low == "dry-run" || low == "dryrun") _dryRun = true;
-                else if (low == "install" || low == "uninstall" || low == "run"
-                         || low == "once" || low == "test") action = low;
+                else if (low == "install" || low == "uninstall" || low == "run" || low == "tray"
+                         || low == "once" || low == "test" || low == "selftest") action = low;
             }
 
             if (action == "install") return Install();
             if (action == "uninstall") return Uninstall();
+            if (action == "selftest") return SelfTest(args);
 
             LoadConfig();
+            if (action == "tray") return TrayMain();
             if (action == "test")
             {
                 Console.WriteLine("ini      : " + _iniPath);
@@ -135,6 +150,7 @@ namespace IscsiBrokerAgent
                                   + " running=" + VncRunning());
                 Console.WriteLine("drive    : " + _letter + ": mounted=" + _mountOk
                                   + " requested=" + _mountRequested);
+                Console.WriteLine("icon     : " + DescribeIcon());
                 return 0;
             }
 
@@ -150,6 +166,8 @@ namespace IscsiBrokerAgent
                 if (action == "once") { PollOnce(); return 0; }
                 Log("=== 启动 v" + VERSION + " mac=" + _mac + " server=" + _url
                     + (_dryRun ? " (dry-run)" : "") + " ===");
+                PrepareWebClient();     // SYSTEM 身份：配好 WebDAV 重定向器（托盘是普通用户改不了 HKLM）
+                EnsureTray();
                 while (true)
                 {
                     PollOnce();
@@ -318,13 +336,14 @@ namespace IscsiBrokerAgent
             }
             try
             {
-                EnsureDriveOnNewSession();     // 登录会话变化后自动补挂网盘
+                // 托盘（用户会话里）负责挂 Z 盘和显示图标；这里只保证它该在的时候在
+                if (_mountRequested) EnsureTray();
                 Dictionary<string, object> info = new Dictionary<string, object>();
                 info["hostname"] = Environment.MachineName;
                 info["agent_ver"] = VERSION;
                 info["vnc_running"] = VncRunning();
                 info["vnc_port"] = _vncPort;
-                info["drive"] = (_mountRequested && _mountOk) ? (_letter + ":") : "";
+                // 注意：不报 drive/dav_user —— 那两个由托盘上报，不然会互相覆盖
                 Dictionary<string, object> body = new Dictionary<string, object>();
                 body["mac"] = _mac;
                 body["token"] = _token;
@@ -392,8 +411,12 @@ namespace IscsiBrokerAgent
             {
                 case "vnc_start": ok = VncStart(out msg); break;
                 case "vnc_stop": ok = VncStop(out msg); break;
-                case "mount": ok = SetMount(true, out msg); break;
-                case "unmount": ok = SetMount(false, out msg); break;
+                case "mount":
+                    ReconcileMount(true);
+                    ok = true; msg = "已要求客户机挂载 Z 盘（托盘负责，稍后生效）"; break;
+                case "unmount":
+                    ReconcileMount(false);
+                    ok = true; msg = "已停用 Z 盘并卸载"; break;
                 default: ok = false; msg = "未知指令：" + type; break;
             }
             Log("指令 #" + id + " 结果：" + (ok ? "成功" : "失败") + " " + msg);
@@ -409,112 +432,143 @@ namespace IscsiBrokerAgent
             return (reboot ? "重启" : "关机") + "命令已执行 " + outText;
         }
 
-        // ---------------- 网盘挂载 ----------------
-        private static bool SetMount(bool mount, out string msg)
-        {
-            if (mount)
-            {
-                _mountRequested = true;
-                _appliedSession = INVALID_SESSION;         // 强制下一次重挂
-                bool ok = MapDrive(out msg);
-                _mountOk = ok;
-                SaveState();
-                return ok;
-            }
-            _mountRequested = false;
-            _mountOk = false;
-            SaveState();
-            bool ok2 = UnmapDrive(out msg);
-            return ok2;
-        }
-
-        /// <summary>按服务器的意图把网盘状态对齐（开机后自动补挂 / 自动卸载）。</summary>
+        // ---------------- 网盘挂载（Z 盘） ----------------
+        // 实际映射由“用户会话里的托盘进程”负责（盘符映射是每个登录会话一份，SYSTEM 会话里做没用）；
+        // 这里只负责按服务器意图把托盘拉起 / 关掉。
         private static void ReconcileMount(bool want)
         {
-            string msg;
             _mountRequested = want;
             if (want)
             {
-                _appliedSession = INVALID_SESSION;
-                _mountOk = MapDrive(out msg);
-                Log("按服务器要求挂载网盘" + (_mountOk ? "成功：" : "失败：") + msg);
+                EnsureTray();
             }
             else
             {
-                bool ok = UnmapDrive(out msg);
-                _mountOk = false;
-                Log("按服务器要求卸载网盘" + (ok ? "成功" : "失败：" + msg));
+                DisableTrayAndDrive();
             }
             SaveState();
         }
 
-        /// <summary>会话变化（用户登录/切换）后自动补挂网盘。</summary>
-        private static void EnsureDriveOnNewSession()
+        /// <summary>用户登录会话里没有托盘进程就拉起来（登录切换后重新拉起）。</summary>
+        private static void EnsureTray()
         {
-            if (!_mountRequested) return;
             uint sid = WTSGetActiveConsoleSessionId();
-            if (sid == INVALID_SESSION || sid == _appliedSession) return;
-            string msg;
-            if (MapDrive(out msg))
+            if (sid == INVALID_SESSION)
+                return;                              // 没人登录：等用户登录后下一轮再说
+            if (_trayPid != 0 && _traySession == sid && ProcessAlive(_trayPid))
+                return;                              // 已经在跑
+            if (_trayPid != 0)
+                TryKill(_trayPid);                   // 会话切换：干掉旧会话里的托盘
+            string err;
+            int pid = LaunchInSession(sid, Process.GetCurrentProcess().MainModule.FileName, "tray", out err);
+            if (pid > 0)
             {
-                _mountOk = true;
-                _appliedSession = sid;
-                SaveState();
-                Log("会话 " + sid + " 已挂载网盘 " + _letter + ": " + msg);
+                _trayPid = pid;
+                _traySession = sid;
+                Log("已在会话 " + sid + " 启动托盘 pid=" + pid);
             }
             else
             {
-                Log("会话 " + sid + " 挂载网盘失败：" + msg);
+                Log("启动托盘失败：" + err);
             }
         }
 
-        private static bool MapDrive(out string msg)
+        /// <summary>停用网盘：关掉托盘并卸掉该会话里的盘符。</summary>
+        private static void DisableTrayAndDrive()
         {
-            string url = _url + "/dav/";
-            msg = "";
-            if (_dryRun)
+            if (_trayPid != 0)
             {
-                msg = "[dry-run] net use " + _letter + ": " + url + " /user:" + _mac;
-                return true;
+                TryKill(_trayPid);
+                _trayPid = 0;
+                _traySession = INVALID_SESSION;
             }
-            PrepareWebClient();
             uint sid = WTSGetActiveConsoleSessionId();
             if (sid == INVALID_SESSION)
+                return;
+            if (_dryRun)
             {
-                msg = "当前没有已登录的交互用户，等用户登录后自动挂载";
-                return false;
+                Log("[dry-run] net use " + _letter + ": /delete /y");
+                return;
             }
             int rc;
             string outp;
-            RunInSession(sid, "net.exe use " + _letter + ": \"" + url + "\" /user:" + _mac
-                              + " " + _token + " /persistent:no", 30000, out rc, out outp);
-            if (rc == 0)
-            {
-                msg = "已挂载 " + _letter + ": → " + url;
-                return true;
-            }
-            msg = "net use 失败(rc=" + rc + ")：" + outp;
-            return false;
+            RunInSession(sid, "net.exe use " + _letter + ": /delete /y", 20000, out rc, out outp);
+            Log("停用网盘：net use /delete rc=" + rc + " " + outp);
         }
 
-        private static bool UnmapDrive(out string msg)
+        private static bool ProcessAlive(int pid)
         {
-            string outp;
-            msg = "";
-            if (_dryRun) { msg = "[dry-run] net use " + _letter + ": /delete /y"; return true; }
-            uint sid = WTSGetActiveConsoleSessionId();
-            if (sid == INVALID_SESSION) { msg = "当前没有已登录的交互用户"; return false; }
-            int rc;
-            RunInSession(sid, "net.exe use " + _letter + ": /delete /y", 20000, out rc, out outp);
-            _appliedSession = INVALID_SESSION;
-            if (rc == 0) { msg = "已卸载 " + _letter + ":"; return true; }
-            msg = "net use /delete 失败(rc=" + rc + ")：" + outp;
-            return false;
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                    return !p.HasExited;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void TryKill(int pid)
+        {
+            try
+            {
+                using (Process p = Process.GetProcessById(pid))
+                    p.Kill();
+            }
+            catch { /* 已经不在了 */ }
+        }
+
+        /// <summary>在指定会话的登录用户身份下启动一个进程（不等待），返回 pid。</summary>
+        private static int LaunchInSession(uint sessionId, string exe, string arguments, out string err)
+        {
+            err = "";
+            IntPtr hToken = IntPtr.Zero, hDup = IntPtr.Zero;
+            try
+            {
+                if (!WTSQueryUserToken(sessionId, out hToken))
+                {
+                    err = "WTSQueryUserToken 失败（错误码 " + Marshal.GetLastWin32Error() + "）";
+                    return 0;
+                }
+                if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, IntPtr.Zero, SecurityImpersonation,
+                                      TokenPrimary, out hDup))
+                {
+                    err = "DuplicateTokenEx 失败（错误码 " + Marshal.GetLastWin32Error() + "）";
+                    return 0;
+                }
+                STARTUPINFO si = new STARTUPINFO();
+                si.cb = Marshal.SizeOf(si);
+                si.lpDesktop = "winsta0\\default";
+                PROCESS_INFORMATION pi;
+                string cmd = "\"" + exe + "\"" + (arguments.Length > 0 ? " " + arguments : "");
+                if (!CreateProcessAsUser(hDup, null, cmd, IntPtr.Zero, IntPtr.Zero, false,
+                                         CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                                         IntPtr.Zero, null, ref si, out pi))
+                {
+                    err = "CreateProcessAsUser 失败（错误码 " + Marshal.GetLastWin32Error() + "）";
+                    return 0;
+                }
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                return pi.dwProcessId;
+            }
+            catch (Exception e)
+            {
+                err = e.Message;
+                return 0;
+            }
+            finally
+            {
+                if (hDup != IntPtr.Zero) CloseHandle(hDup);
+                if (hToken != IntPtr.Zero) CloseHandle(hToken);
+            }
         }
 
         /// <summary>
         /// Windows 自带的 WebDAV 重定向器默认不允许明文 http 上用 Basic 认证、
-        /// 还有 50MB 文件大小上限；这里把注册表改好并重启 WebClient 服务。
+        /// 还有 50MB 文件大小上限；SYSTEM 身份的进程启动时改好注册表并拉起 WebClient 服务
+        /// （托盘是普通用户身份，改不了 HKLM）。
         /// </summary>
         private static void PrepareWebClient()
         {
@@ -628,6 +682,333 @@ namespace IscsiBrokerAgent
                 msg = "停止 VNC 失败：" + e.Message;
                 return false;
             }
+        }
+
+        // ---------------- 托盘进程（跑在用户会话里：右下角图标 + 右键菜单 + 登录 + 挂 Z 盘） ----------------
+        // 为什么必须是独立进程：盘符映射是“每个登录会话一份”，SYSTEM 会话里映射用户看不到；
+        // 而且 SYSTEM 服务的桌面不是用户桌面，画不出托盘图标。SYSTEM 进程负责把它拉起来。
+        private static int TrayMain()
+        {
+            bool created;
+            using (var mutex = new Mutex(true, "iscsi-broker-agent-tray", out created))
+            {
+                if (!created) return 0;                  // 本会话已有托盘在跑
+                try { FreeConsole(); } catch { }         // 从控制台/命令行启动时收掉黑窗口
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+
+                ContextMenuStrip menu = new ContextMenuStrip();
+                _trayStatus = new ToolStripMenuItem("未登录（Z 盘只读通用文件）");
+                _trayStatus.Enabled = false;
+                menu.Items.Add(_trayStatus);
+                menu.Items.Add(new ToolStripSeparator());
+                _trayLogin = new ToolStripMenuItem("登录网盘…", null, delegate { ShowLoginDialog(); });
+                _trayLogout = new ToolStripMenuItem("注销网盘", null, delegate { DoLogout(); });
+                menu.Items.Add(_trayLogin);
+                menu.Items.Add(_trayLogout);
+                menu.Items.Add(new ToolStripMenuItem("打开 Z 盘", null, delegate { OpenDrive(); }));
+                menu.Items.Add(new ToolStripMenuItem("重新挂载", null, delegate { Remount(); }));
+                menu.Items.Add(new ToolStripMenuItem("查看日志", null, delegate { OpenLog(); }));
+                menu.Items.Add(new ToolStripSeparator());
+                menu.Items.Add(new ToolStripMenuItem("退出托盘", null, delegate { ExitTray(); }));
+                menu.Opening += delegate { UpdateTrayMenu(); };
+
+                _trayIcon = new NotifyIcon();
+                _trayIcon.Icon = LoadTrayIcon();
+                _trayIcon.Text = "iSCSI Broker 网盘";
+                _trayIcon.ContextMenuStrip = menu;
+                _trayIcon.Visible = true;
+                _trayIcon.DoubleClick += delegate { OpenDrive(); };
+
+                Log("托盘启动：mac=" + _mac + " letter=" + _letter + " icon=" + DescribeIcon());
+                UpdateTrayMenu();
+                Remount();                                // 开机先挂只读公共盘
+                PostStatus();
+                System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
+                timer.Interval = 20000;
+                timer.Tick += delegate { PostStatus(); };
+                timer.Start();
+                Application.Run();                        // 跑消息循环，直到“退出托盘”
+                _trayIcon.Visible = false;
+            }
+            return 0;
+        }
+
+        private static void UpdateTrayMenu()
+        {
+            if (_trayIcon == null || _trayStatus == null) return;
+            bool logged = _davUser.Length > 0;
+            _trayStatus.Text = logged ? ("已登录：" + _davUser + "（Z 盘可写）")
+                                      : "未登录（Z 盘只读通用文件）";
+            _trayLogin.Enabled = !logged;
+            _trayLogout.Enabled = logged;
+            string tip = "iSCSI Broker 网盘\r\n"
+                + (logged ? ("已登录 " + _davUser + "，Z 盘可写") : "未登录，Z 盘为只读通用文件");
+            try { _trayIcon.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip; } catch { }
+        }
+
+        private static void NotifyTip(string msg)
+        {
+            Log("[托盘] " + msg);
+            try
+            {
+                if (_trayIcon != null) _trayIcon.ShowBalloonTip(4000, "iSCSI Broker 网盘", msg, ToolTipIcon.Info);
+            }
+            catch { }
+        }
+
+        /// <summary>挂 Z 盘：未登录用 MAC+接入令牌（只读公共盘），登录后用账号+会话令牌（个人网盘）。</summary>
+        private static bool MapDrive(string user, string pass, out string msg)
+        {
+            string url = _url + "/dav/";
+            msg = "";
+            if (_dryRun)
+            {
+                msg = "[dry-run] net use " + _letter + ": " + url + " /user:" + user;
+                _mountOk = true;
+                return true;
+            }
+            string outp;
+            RunShell("net use " + _letter + ": /delete /y", 20000, out outp);   // 先卸掉旧的
+            int rc = RunShell("net use " + _letter + ": \"" + url + "\" /user:" + user + " " + pass
+                              + " /persistent:no", 30000, out outp);
+            _mountOk = (rc == 0);
+            if (rc == 0) { msg = "已挂载 " + _letter + ": → " + url; return true; }
+            msg = "net use 失败(rc=" + rc + ")：" + outp;
+            return false;
+        }
+
+        private static void Remount()
+        {
+            string msg;
+            if (_davUser.Length > 0 && _davSession.Length > 0)
+            {
+                if (MapDrive(_davUser, _davSession, out msg)) NotifyTip("Z 盘已挂载：你的网盘（可写）");
+                else NotifyTip("挂载你的网盘失败：" + msg);
+            }
+            else
+            {
+                if (!MapDrive(_mac, _token, out msg)) NotifyTip("只读公共盘挂载失败：" + msg);
+            }
+            UpdateTrayMenu();
+        }
+
+        private static void ShowLoginDialog()
+        {
+            Form f = new Form();
+            f.Text = "登录网盘";
+            f.FormBorderStyle = FormBorderStyle.FixedDialog;
+            f.StartPosition = FormStartPosition.CenterScreen;
+            f.ClientSize = new Size(330, 150);
+            f.MaximizeBox = false;
+            f.MinimizeBox = false;
+            Label lu = new Label(); lu.Text = "用户名："; lu.SetBounds(16, 18, 70, 22);
+            TextBox tu = new TextBox(); tu.SetBounds(92, 16, 220, 24); tu.Text = _lastAccount;
+            Label lp = new Label(); lp.Text = "密码："; lp.SetBounds(16, 54, 70, 22);
+            TextBox tp = new TextBox(); tp.SetBounds(92, 52, 220, 24); tp.UseSystemPasswordChar = true;
+            Button ok = new Button(); ok.Text = "登录"; ok.SetBounds(140, 96, 80, 28); ok.DialogResult = DialogResult.OK;
+            Button cancel = new Button(); cancel.Text = "取消"; cancel.SetBounds(232, 96, 80, 28); cancel.DialogResult = DialogResult.Cancel;
+            f.Controls.Add(lu); f.Controls.Add(tu); f.Controls.Add(lp); f.Controls.Add(tp);
+            f.Controls.Add(ok); f.Controls.Add(cancel);
+            f.AcceptButton = ok;
+            f.CancelButton = cancel;
+            if (f.ShowDialog() != DialogResult.OK) return;
+            if (tu.Text.Trim().Length == 0) { NotifyTip("用户名不能为空"); return; }
+            DoLogin(tu.Text.Trim(), tp.Text);
+        }
+
+        private static void DoLogin(string user, string pwd)
+        {
+            try
+            {
+                Dictionary<string, object> body = new Dictionary<string, object>();
+                body["mac"] = _mac;
+                body["token"] = _token;
+                body["user"] = user;
+                body["pwd"] = pwd;
+                body["letter"] = _letter;
+                Dictionary<string, object> resp = PostJson("/agent/login", body);
+                if (GetString(resp, "ok") != "True")
+                {
+                    NotifyTip("登录失败：" + GetString(resp, "err"));
+                    return;
+                }
+                _davSession = GetString(resp, "token");
+                _davUser = GetString(resp, "user");
+                string msg;
+                if (MapDrive(_davUser, _davSession, out msg))
+                    NotifyTip("已登录 " + _davUser + "，Z 盘现在是你的网盘（通用文件仍只读）");
+                else
+                    NotifyTip("登录成功，但挂载失败：" + msg);
+            }
+            catch (Exception e)
+            {
+                NotifyTip("登录失败：" + e.Message);
+            }
+            UpdateTrayMenu();
+            PostStatus();
+        }
+
+        private static void DoLogout()
+        {
+            try
+            {
+                Dictionary<string, object> body = new Dictionary<string, object>();
+                body["mac"] = _mac;
+                body["token"] = _token;
+                body["session"] = _davSession;
+                PostJson("/agent/logout", body);
+            }
+            catch (Exception e) { Log("注销请求失败：" + e.Message); }
+            _davSession = "";
+            _davUser = "";
+            string msg;
+            if (!MapDrive(_mac, _token, out msg)) NotifyTip("已注销，但只读公共盘没挂上：" + msg);
+            else NotifyTip("已注销，Z 盘恢复为只读通用文件");
+            UpdateTrayMenu();
+            PostStatus();
+        }
+
+        /// <summary>把托盘状态报给服务器（Z 盘挂没挂、登录了谁），顺手取服务器当前的意图。</summary>
+        private static void PostStatus()
+        {
+            try
+            {
+                Dictionary<string, object> info = new Dictionary<string, object>();
+                info["drive"] = _mountOk ? (_letter + ":") : "";
+                info["dav_user"] = _davUser;
+                Dictionary<string, object> body = new Dictionary<string, object>();
+                body["mac"] = _mac;
+                body["token"] = _token;
+                body["info"] = info;
+                Dictionary<string, object> resp = PostJson("/agent/status", body);
+                if (resp == null) return;
+                object mo;
+                if (resp.TryGetValue("mount", out mo) && mo is bool && !(bool)mo)
+                {
+                    NotifyTip("管理员已停用本机网盘，托盘退出");
+                    string outp;
+                    RunShell("net use " + _letter + ": /delete /y", 15000, out outp);
+                    ExitTray();
+                    return;
+                }
+                _lastAccount = GetString(resp, "account");    // 默认用户名：登录框预填
+            }
+            catch (Exception e)
+            {
+                Log("托盘状态上报失败：" + e.Message);
+            }
+        }
+
+        private static void OpenDrive()
+        {
+            try { Process.Start("explorer.exe", _letter + ":\\"); }
+            catch (Exception e) { NotifyTip("打不开 " + _letter + " 盘：" + e.Message); }
+        }
+
+        private static void OpenLog()
+        {
+            try { Process.Start("notepad.exe", _logPath); }
+            catch { }
+        }
+
+        private static void ExitTray()
+        {
+            try { if (_trayIcon != null) _trayIcon.Visible = false; } catch { }
+            Application.Exit();
+        }
+
+        /// <summary>托盘图标：优先用 exe 里内置的 ico，取不到就退回系统图标。</summary>
+        private static Icon LoadTrayIcon()
+        {
+            try
+            {
+                Assembly asm = Assembly.GetExecutingAssembly();
+                foreach (string n in asm.GetManifestResourceNames())
+                {
+                    if (n.EndsWith("agent.ico", StringComparison.OrdinalIgnoreCase))
+                    {
+                        using (Stream s = asm.GetManifestResourceStream(n))
+                        {
+                            if (s != null) return new Icon(s);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return SystemIcons.Application;
+        }
+
+        private static string DescribeIcon()
+        {
+            try
+            {
+                Icon ic = LoadTrayIcon();
+                return ic.Width + "x" + ic.Height
+                    + (ReferenceEquals(ic, SystemIcons.Application) ? " (fallback)" : " (embedded)");
+            }
+            catch (Exception e) { return "error: " + e.Message; }
+        }
+
+        // ---------------- 自检（命令行，不弹界面、不挂盘） ----------------
+        private static string ArgValue(string[] args, string name)
+        {
+            for (int i = 0; i < args.Length - 1; i++)
+                if (args[i].Equals(name, StringComparison.OrdinalIgnoreCase)) return args[i + 1];
+            return "";
+        }
+
+        private static int SelfTest(string[] args)
+        {
+            LoadConfig();
+            string user = ArgValue(args, "--user");
+            string pwd = ArgValue(args, "--pwd");
+            Console.WriteLine("mac      : " + _mac);
+            Console.WriteLine("url      : " + _url);
+            Console.WriteLine("letter   : " + _letter);
+            Console.WriteLine("icon     : " + DescribeIcon());
+            try
+            {
+                Dictionary<string, object> info = new Dictionary<string, object>();
+                info["hostname"] = Environment.MachineName;
+                info["agent_ver"] = VERSION;
+                info["vnc_running"] = VncRunning();
+                info["vnc_port"] = _vncPort;
+                Dictionary<string, object> body = new Dictionary<string, object>();
+                body["mac"] = _mac; body["token"] = _token; body["ver"] = VERSION; body["info"] = info;
+                Dictionary<string, object> resp = PostJson("/agent/poll", body);
+                Console.WriteLine("poll     : " + (GetString(resp, "ok") == "True" ? "ok"
+                                  : ("fail: " + GetString(resp, "err"))) + " mount=" + GetString(resp, "mount"));
+
+                Dictionary<string, object> si = new Dictionary<string, object>();
+                si["drive"] = _letter + ":"; si["dav_user"] = "selftest";
+                Dictionary<string, object> st = new Dictionary<string, object>();
+                st["mac"] = _mac; st["token"] = _token; st["info"] = si;
+                Dictionary<string, object> sresp = PostJson("/agent/status", st);
+                Console.WriteLine("status   : " + (GetString(sresp, "ok") == "True" ? "ok"
+                                  : ("fail: " + GetString(sresp, "err"))) + " account=" + GetString(sresp, "account"));
+
+                if (user.Length > 0)
+                {
+                    Dictionary<string, object> lb = new Dictionary<string, object>();
+                    lb["mac"] = _mac; lb["token"] = _token; lb["user"] = user; lb["pwd"] = pwd;
+                    Dictionary<string, object> lresp = PostJson("/agent/login", lb);
+                    string tok = GetString(lresp, "token");
+                    Console.WriteLine("login    : " + (GetString(lresp, "ok") == "True"
+                                      ? ("ok user=" + GetString(lresp, "user") + " token_len=" + tok.Length)
+                                      : ("fail: " + GetString(lresp, "err"))));
+                    Dictionary<string, object> ob = new Dictionary<string, object>();
+                    ob["mac"] = _mac; ob["token"] = _token; ob["session"] = tok;
+                    Dictionary<string, object> oresp = PostJson("/agent/logout", ob);
+                    Console.WriteLine("logout   : " + (GetString(oresp, "ok") == "True" ? "ok" : "fail"));
+                }
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine("error    : " + e.Message);
+                return 1;
+            }
+            return 0;
         }
 
         // ---------------- 执行外部命令（不用管道，避免受限环境拿不到子进程输出） ----------------
@@ -828,5 +1209,8 @@ namespace IscsiBrokerAgent
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FreeConsole();
     }
 }

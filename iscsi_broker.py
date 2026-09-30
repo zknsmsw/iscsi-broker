@@ -729,6 +729,28 @@ def admin_ratelimited(ip):
         admin_attempts[ip] = ts
         return False
 
+# ---------- 网盘登录限速（客户机托盘登录用，只统计失败次数） ----------
+DAV_LOGIN_ATTEMPT_MAX = 10        # 每 IP 在窗口期内最多失败次数
+DAV_LOGIN_ATTEMPT_WINDOW = 300    # 窗口（秒）
+dav_login_fails = {}              # ip -> [失败时间戳]
+dav_login_lock = threading.Lock()
+
+def dav_login_ratelimited(ip):
+    """该来源 IP 是否因为失败次数过多被限速。"""
+    now = time.time()
+    with dav_login_lock:
+        ts = [t for t in dav_login_fails.get(ip, []) if now - t <= DAV_LOGIN_ATTEMPT_WINDOW]
+        dav_login_fails[ip] = ts
+        return len(ts) >= DAV_LOGIN_ATTEMPT_MAX
+
+def dav_login_failed(ip):
+    with dav_login_lock:
+        dav_login_fails.setdefault(ip, []).append(time.time())
+
+def dav_login_reset(ip):
+    with dav_login_lock:
+        dav_login_fails.pop(ip, None)
+
 PAGE_CSS = """body{font-family:"Microsoft YaHei",Arial,sans-serif;background:#f4f6f8;margin:0;padding:24px;color:#222}
 .wrap{max-width:880px;margin:0 auto}
 h1{font-size:20px;margin-top:0}
@@ -1650,33 +1672,34 @@ class WebAdminHandler(BaseHTTPRequestHandler):
 
     # ---------- WebDAV：个人网盘挂载（客户机映射盘符用） ----------
     def _dav_auth(self):
-        """WebDAV 的 HTTP Basic 认证，成功返回网盘用户名，失败返回 None。
+        """WebDAV 的 HTTP Basic 认证。返回 (网盘用户名, 是否只读)；失败返回 (None, False)。
 
-        两种身份都支持：
-          1) 客户机 agent：用户名 = 自己的 MAC，密码 = agent 接入令牌
-             → 用管理员在“客户机控制”页指定的 网盘账号（客户机上不存网盘密码）
-          2) 网盘账号：用户名 + 密码（浏览器、发起端手工连时用）
+        三种身份：
+          1) MAC + agent 接入令牌 → 未登录的客户机：挂的是**只读“通用文件”公共盘**
+          2) 账号 + 密码 → 浏览器 / iSCSI 发起端手工连：完整个人网盘（可写，根目录里
+             还能看到只读的“通用文件”子目录）
+          3) 账号 + 登录会话令牌 → 客户机托盘「登录网盘」后换来的（客户机上不存密码）
         """
         hdr = self.headers.get("Authorization", "")
         if not hdr.lower().startswith("basic "):
-            return None
+            return None, False
         try:
             raw = base64.b64decode(hdr.split(None, 1)[1].strip()).decode("utf-8", "replace")
         except Exception:
-            return None
+            return None, False
         user, sep, pwd = raw.partition(":")
         if not sep:
-            return None
+            return None, False
         user = user.strip()
         if not user:
-            return None
+            return None, False
         if agent_hub.check_token(pwd):
             mac = "".join(c for c in user.lower() if c in "0123456789abcdef")
-            account = agent_hub.account_of(mac)
-            if account:
-                return account
-            return None
-        return user if users_auth.check_login(user, pwd) else None
+            return (mac, True) if len(mac) == 12 else (None, False)
+        sess_user = agent_hub.dav_session_user(pwd)
+        if sess_user and sess_user == user:
+            return user, False
+        return (user, False) if users_auth.check_login(user, pwd) else (None, False)
 
     def _dav_dispatch(self):
         """把 /dav/ 下的请求交给 webdav 模块。"""
@@ -1690,20 +1713,21 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if not parsed.path.startswith(webdav.MOUNT_PREFIX):
             self.send_error(404)
             return
-        user = self._dav_auth()
+        user, readonly = self._dav_auth()
         if not user:
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="iSCSI Broker cloud"')
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        # 首次使用自动建网盘根目录（与网盘页面一致），否则客户机挂载会拿到 404
-        try:
-            os.makedirs(cloud_store.user_home(user), exist_ok=True)
-        except Exception:
-            pass
+        if not readonly:
+            # 首次使用自动建网盘根目录（与网盘页面一致），否则客户机挂载会拿到 404
+            try:
+                os.makedirs(cloud_store.user_home(user), exist_ok=True)
+            except Exception:
+                pass
         rel = urllib.parse.unquote(parsed.path[len(webdav.MOUNT_PREFIX):]).strip("/")
-        webdav.handle(self, user, rel)
+        webdav.handle(self, user, rel, readonly)
 
     def do_OPTIONS(self):
         if urllib.parse.urlparse(self.path).path.startswith(webdav.MOUNT_PREFIX):
@@ -1818,6 +1842,17 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             return
         if path == "/agent/result":
             self._agent_result()
+            return
+        # 客户机托盘的状态上报（挂了没挂 Z 盘、登录了谁），不影响指令队列
+        if path == "/agent/status":
+            self._agent_status()
+            return
+        # 客户机托盘「登录网盘」：账号密码换成短期会话令牌（客户机上不存密码）
+        if path == "/agent/login":
+            self._agent_login()
+            return
+        if path == "/agent/logout":
+            self._agent_logout()
             return
         if path == "/web/login":
             self._do_login(self._form())
@@ -2267,6 +2302,64 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                                    data.get("ok", False), data.get("msg", ""))
         self._send_json({"ok": ok, "err": err}, 200 if ok else 400)
 
+    def _agent_status(self):
+        """客户机托盘上报自己的状态（Z 盘挂没挂、登录了谁）。
+
+        与 /agent/poll 分开：托盘上报不该拿走指令（指令由 SYSTEM 进程取），
+        顺带把服务器当前的“是否允许挂盘 / 默认用户名”带回去，托盘用来对状态。
+        """
+        data = self._json_body()
+        if data is None or not agent_hub.check_token(data.get("token")):
+            self._send_json({"ok": False, "err": "bad token"}, 403)
+            return
+        info = data.get("info") if isinstance(data.get("info"), dict) else {}
+        mac = agent_hub.touch(data.get("mac"), ip=self.client_address[0], info=info)
+        if not mac:
+            self._send_json({"ok": False, "err": "bad mac"}, 400)
+            return
+        self._send_json({"ok": True, "mac": mac, "mount": agent_hub.mount_wanted(mac),
+                         "account": agent_hub.account_of(mac), "dav": self._dav_url()})
+
+    def _agent_login(self):
+        """客户机托盘「登录网盘」：校验账号密码，换一个短期网盘会话令牌。
+
+        这样客户机上不保存网盘密码，WebDAV 只用令牌认证；令牌过期/注销即失效。
+        """
+        data = self._json_body()
+        if data is None or not agent_hub.check_token(data.get("token")):
+            self._send_json({"ok": False, "err": "bad token"}, 403)
+            return
+        ip = self.client_address[0]
+        if dav_login_ratelimited(ip):
+            self._send_json({"ok": False, "err": "密码错误次数太多，请稍后再试"}, 429)
+            return
+        user = (data.get("user") or "").strip()
+        pwd = data.get("pwd") or ""
+        role = users_auth.check_login(user, pwd)
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if not role:
+            dav_login_failed(ip)
+            time.sleep(1)                       # 限速防暴力猜密码
+            print(f"[{now}] [ERROR] DAV login failed for {user!r} from {ip}")
+            self._send_json({"ok": False, "err": "用户名或密码错误"}, 403)
+            return
+        dav_login_reset(ip)
+        tok = agent_hub.dav_session_issue(user)
+        agent_hub.set_dav_user(data.get("mac"), user)
+        print(f"[{now}] [SUCCESS] DAV login: {user} ({role}) from {ip}")
+        self._send_json({"ok": True, "user": user, "role": role, "token": tok,
+                         "dav": self._dav_url(), "letter": data.get("letter") or ""})
+
+    def _agent_logout(self):
+        """客户机托盘「注销网盘」：让会话令牌立刻失效。"""
+        data = self._json_body()
+        if data is None or not agent_hub.check_token(data.get("token")):
+            self._send_json({"ok": False, "err": "bad token"}, 403)
+            return
+        agent_hub.dav_session_revoke(data.get("session"))
+        agent_hub.set_dav_user(data.get("mac"), "")
+        self._send_json({"ok": True})
+
     def _cmd_form(self, mac, action, label, confirm=None):
         """生成“下发指令”的内联表单。"""
         onsubmit = ''
@@ -2300,14 +2393,13 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             else:
                 acts.append(self._cmd_form(mac, "vnc_start", "启用 VNC"))
             if rec.get("want_mount"):
-                acts.append(self._cmd_form(mac, "unmount", "卸载网盘"))
-            elif rec.get("account"):
-                acts.append(self._cmd_form(mac, "mount", "挂载网盘"))
+                acts.append(self._cmd_form(mac, "unmount", "停用网盘",
+                                           "停用后该客户机的 Z 盘会被卸载，确定？"))
             else:
-                acts.append('<span class="small">先设网盘账号</span>')
+                acts.append(self._cmd_form(mac, "mount", "启用网盘"))
         else:
             acts.append('—')
-        # 网盘账号设置表单（离线也能先设好）
+        # 默认用户名设置表单（只用于预填客户机托盘的登录框，不保存密码；离线也能先设好）
         acc_form = ('<form method="post" action="/web/clients/cmd" class="inline-form">'
                     + self._csrf_hidden()
                     + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
@@ -2331,10 +2423,14 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             if rec.get("vnc_running") else '<span class="small">未运行</span>'
         if rec.get("drive"):
             drive_txt = html.escape(rec["drive"])
+            if rec.get("dav_user"):
+                drive_txt += '<br><span class="ok">已登录 ' + html.escape(rec["dav_user"]) + '</span>'
+            else:
+                drive_txt += '<br><span class="small">未登录（只读通用文件）</span>'
         elif rec.get("want_mount"):
             drive_txt = '<span class="small">待挂载</span>'
         else:
-            drive_txt = '—'
+            drive_txt = '<span class="small">已停用</span>'
         ipxe_txt = ""
         if ipxe:
             ipxe_txt = '<br><span class="small">' + html.escape(
@@ -2357,8 +2453,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             rows.append(self._client_row({"mac": c["mac"], "online": False, "ip": c.get("ip") or "",
                                           "hostname": "", "vnc_running": False, "vnc_port": 0,
                                           "drive": "", "account": "", "results": []}, ipxe=c))
-        table = ('<table><tr><th>MAC</th><th>主机名</th><th>IP</th><th>agent</th><th>网盘盘符</th>'
-                 '<th>VNC</th><th>操作</th><th>网盘账号</th><th>最近结果</th></tr>'
+        table = ('<table><tr><th>MAC</th><th>主机名</th><th>IP</th><th>agent</th><th>Z 盘</th>'
+                 '<th>VNC</th><th>操作</th><th>默认用户名</th><th>最近结果</th></tr>'
                  + ("".join(rows) if rows else '<tr><td colspan="9">暂无客户机记录（客户机 agent 还没心跳过）</td></tr>')
                  + '</table>')
         msg_html = ''
@@ -2380,8 +2476,11 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             '<div class="card"><h2>客户机控制</h2>' + table
             + '<p class="small">“在线”= 最近 %d 秒内收到过 agent 心跳。指令随心跳下发，'
             % agent_hub.ONLINE_WINDOW
-            + '关机/重启会立即执行；VNC 需要母盘里装好 VNC 服务端并在 agent.ini 里配好路径；'
-            + '挂载网盘前要先在右侧填好该机的网盘账号（网盘用户名）。</p>'
+            + '关机/重启会立即执行；VNC 需要母盘里装好 VNC 服务端并在 agent.ini 里配好路径。</p>'
+            + '<p class="small"><b>网盘（Z 盘）</b>：默认自动挂载，内容是服务器的“通用文件”（只读）；'
+            + '用户在客户机右下角托盘里<b>登录自己的网盘账号</b>后，Z 盘换成他自己的网盘（可写，'
+            + '里面仍能看到只读的“通用文件”）。「停用网盘」= 不给这台机器挂 Z 盘；'
+            + '“默认用户名”只是预填托盘的登录框，<b>不保存密码</b>，每次开机用户自己输一次。</p>'
             + ('<p class="small">另有 %d 台机器只有 iPXE 记录、没有 agent 心跳（母盘里还没装客户端）。</p>'
                % ipxe_only if ipxe_only else '')
             + '</div>'
@@ -2411,18 +2510,12 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             return
         args = {}
         if action == "mount":
-            account = agent_hub.account_of(mac)
-            if not account:
-                self._redirect("/web/clients?msg=" + urllib.parse.quote(
-                    "请先为该客户机设置网盘账号（网盘用户名）", safe=""))
-                return
             args["url"] = self._dav_url()
-            args["account"] = account
-        # 注：enqueue 会把“挂载意图”记在服务器上（无盘客户机重启后靠它自动挂回来）
+        # 注：enqueue 会把“是否挂网盘”的意图记在服务器上（默认挂载；无盘客户机重启后靠它对齐）
         _ok, msg = agent_hub.enqueue(mac, action, **args)
         if not _ok and action in ("mount", "unmount"):
             msg = "已记下“%s”，客户机上线后会自动同步（现在：%s）" % (
-                "挂载网盘" if action == "mount" else "卸载网盘", msg)
+                "启用网盘" if action == "mount" else "停用网盘", msg)
         self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
 
     # ---------- 管理员：默认配额 ----------

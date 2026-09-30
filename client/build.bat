@@ -18,8 +18,12 @@ if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
 "%CSC%" /nologo /target:exe /platform:anycpu /optimize+ /warn:4 ^
   /out:"%OUTDIR%\iscsi-broker-agent.exe" ^
+  /win32icon:"%~dp0agent.ico" ^
+  /resource:"%~dp0agent.ico",agent.ico ^
   /reference:System.dll ^
   /reference:System.Core.dll ^
+  /reference:System.Drawing.dll ^
+  /reference:System.Windows.Forms.dll ^
   /reference:System.Web.Extensions.dll ^
   "%~dp0Agent.cs"
 if errorlevel 1 (

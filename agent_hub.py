@@ -31,11 +31,13 @@ MAX_QUEUE = 20          # 每台机器最多排队的指令数（防止刷爆内
 MAX_RESULTS = 20        # 每台机器保留的最近执行结果条数
 COMMAND_TTL = 300       # 指令超过该秒数仍未被取走则丢弃（避免上线瞬间执行陈旧指令）
 MAX_ACCOUNT_LEN = 32    # 网盘账号名长度上限（与 users_auth 用户名规则一致）
+DAV_SESSION_TTL = 12 * 3600   # 托盘登录换来的网盘会话令牌有效期（秒）
 
 _lock = threading.RLock()
 _base_dir = None
 _token = ""
 _clients = {}    # mac -> 客户机记录（见 _ensure 的字段说明）
+_dav_sessions = {}   # 网盘会话令牌 -> {"user","exp"}（托盘登录成功后签发，客户机上不存密码）
 _seq = 0         # 指令自增 id
 
 
@@ -126,9 +128,10 @@ def _ensure(mac):
     rec = _clients.get(mac)
     if rec is None:
         now = time.time()
-        rec = {"mac": mac, "account": "", "want_mount": False, "ip": "", "hostname": "",
+        rec = {"mac": mac, "account": "", "want_mount": True, "ip": "", "hostname": "",
                "agent_ver": "", "first_seen": now, "last_seen": 0.0, "vnc_running": False,
-               "vnc_port": 0, "drive": "", "queue": [], "results": [], "last_cmd": None}
+               "vnc_port": 0, "drive": "", "dav_user": "", "dav_since": 0.0,
+               "queue": [], "results": [], "last_cmd": None}
         _clients[mac] = rec
     return rec
 
@@ -171,7 +174,11 @@ def check_token(tok) -> bool:
 
 # ---------- 心跳与状态 ----------
 def touch(mac, ip="", info=None):
-    """记录一次心跳，返回归一化后的 mac（非法返回 ""）。"""
+    """记录一次心跳/状态上报，返回归一化后的 mac（非法返回 ""）。
+
+    只更新 info 里**出现过的**字段：SYSTEM 控制进程与用户会话里的托盘进程会分别上报
+    （一个知道 VNC，一个知道 Z 盘），避免互相把对方的字段抹成空值。
+    """
     mac = _norm_mac(mac)
     if not mac:
         return ""
@@ -187,11 +194,15 @@ def touch(mac, ip="", info=None):
             rec["agent_ver"] = str(info["agent_ver"])[:32]
         if "vnc_running" in info:
             rec["vnc_running"] = bool(info.get("vnc_running"))
-        try:
-            rec["vnc_port"] = int(info.get("vnc_port") or 0)
-        except (TypeError, ValueError):
-            rec["vnc_port"] = 0
-        rec["drive"] = str(info.get("drive") or "")[:8]
+        if "vnc_port" in info:
+            try:
+                rec["vnc_port"] = int(info.get("vnc_port") or 0)
+            except (TypeError, ValueError):
+                rec["vnc_port"] = 0
+        if "drive" in info:
+            rec["drive"] = str(info.get("drive") or "")[:8]
+        if "dav_user" in info:
+            rec["dav_user"] = str(info.get("dav_user") or "")[:MAX_ACCOUNT_LEN]
     return mac
 
 
@@ -381,3 +392,48 @@ def mac_for_account(account):
             if rec.get("account") == account:
                 return mac
     return ""
+
+
+# ---------- 网盘会话令牌（客户机托盘“登录网盘”后用，避免在客户机上存账号密码） ----------
+def dav_session_issue(user):
+    """用户登录成功后签发一个网盘会话令牌（WebDAV 里当密码用）。"""
+    tok = secrets.token_urlsafe(24)
+    with _lock:
+        now = time.time()
+        for t in [t for t, s in _dav_sessions.items() if s["exp"] < now]:
+            _dav_sessions.pop(t, None)
+        _dav_sessions[tok] = {"user": user, "exp": now + DAV_SESSION_TTL}
+    return tok
+
+
+def dav_session_user(tok):
+    """会话令牌对应的网盘用户名；无效/过期返回 ""。"""
+    if not tok:
+        return ""
+    with _lock:
+        rec = _dav_sessions.get(tok)
+        if not rec:
+            return ""
+        if time.time() > rec["exp"]:
+            _dav_sessions.pop(tok, None)
+            return ""
+        return rec["user"]
+
+
+def dav_session_revoke(tok):
+    """注销：让令牌立即失效。"""
+    if not tok:
+        return
+    with _lock:
+        _dav_sessions.pop(tok, None)
+
+
+def set_dav_user(mac, user):
+    """记录/清除某台客户机当前登录的网盘账号（后台页面展示用）。"""
+    mac = _norm_mac(mac)
+    if not mac:
+        return
+    with _lock:
+        rec = _ensure(mac)
+        rec["dav_user"] = (user or "")[:MAX_ACCOUNT_LEN]
+        rec["dav_since"] = time.time() if user else 0.0

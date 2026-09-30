@@ -59,6 +59,25 @@ def _quote(rel, is_dir=False):
     return href
 
 
+COMMON = cloud_store.VIRTUAL_COMMON          # “通用文件”虚拟目录（登录用户在根目录能看到，只读）
+
+
+def _is_common(rel):
+    """路径是否落在只读的“通用文件”区。"""
+    return rel == COMMON or rel.startswith(COMMON + "/")
+
+
+def _resolve(user, rel, readonly=False):
+    """请求路径 -> 磁盘路径。
+
+    readonly（未登录的客户机，挂的是公共盘）时：请求根就是“通用文件”区本身，
+    所以把 rel 前缀上虚拟目录名，写操作那边一律拒绝。
+    """
+    if readonly:
+        rel = COMMON if not rel else COMMON + "/" + rel
+    return cloud_store.resolve(user, rel)
+
+
 def _http_date(ts):
     """RFC1123/GMT 时间（HTTP 头与 WebDAV getlastmodified 都用这个）。"""
     dt = datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)
@@ -115,8 +134,8 @@ def _send_dav_error(handler, code, msg=""):
 
 
 # ---------- 属性（PROPFIND 用） ----------
-def _prop_xml(rel, path, is_dir):
-    """一个 <D:response> 内的属性集合。"""
+def _prop_xml(rel, path, is_dir, readonly=False):
+    """一个 <D:response> 内的属性集合。readonly 的项不声明锁支持（表示写不了）。"""
     try:
         st = os.stat(path)
         mtime, size = st.st_mtime, (0 if is_dir else st.st_size)
@@ -137,17 +156,23 @@ def _prop_xml(rel, path, is_dir):
         props.append('<D:getcontentlength>%d</D:getcontentlength>' % size)
         props.append('<D:getcontenttype>%s</D:getcontenttype>' % _ctype(name))
         props.append('<D:getetag>"%d-%d"' % (int(mtime), size) + '</D:getetag>')
-    props.append('<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope>'
-                 '<D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>')
+    if readonly:
+        props.append('<D:supportedlock/>')
+    else:
+        props.append('<D:supportedlock><D:lockentry><D:lockscope><D:exclusive/></D:lockscope>'
+                     '<D:locktype><D:write/></D:locktype></D:lockentry></D:supportedlock>')
     return ('<D:response><D:href>%s</D:href><D:propstat><D:prop>%s</D:prop>'
             '<D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>'
             % (_quote(rel, is_dir), "".join(props)))
 
 
-def _list_children(user, rel):
-    """列出目录下的直接子项（跳过符号链接与“通用文件”虚拟区），返回 [(rel, path, is_dir)]。"""
+def _list_children(user, rel, readonly=False):
+    """列出目录下的直接子项（跳过符号链接），返回 [(rel, path, is_dir, readonly)]。
+
+    登录用户在根目录会额外看到只读的“通用文件”目录（与网页版网盘一致）。
+    """
     out = []
-    path = cloud_store.resolve(user, rel)
+    path = _resolve(user, rel, readonly)
     if not path or not os.path.isdir(path):
         return out
     try:
@@ -163,7 +188,12 @@ def _list_children(user, rel):
             except OSError:
                 continue
             crel = entry.name if not rel else rel + "/" + entry.name
-            out.append((crel, entry.path, is_dir))
+            out.append((crel, entry.path, is_dir, _is_common(crel) if not readonly else True))
+    # 登录用户（rel 为空）的根目录里塞一个只读“通用文件”
+    if not readonly and rel == "":
+        cpath = cloud_store.resolve(user, COMMON)
+        if cpath and os.path.isdir(cpath):
+            out.insert(0, (COMMON, cpath, True, True))
     out.sort(key=lambda t: (not t[2], t[0]))
     return out
 
@@ -177,9 +207,9 @@ def _do_options(handler):
     })
 
 
-def _do_propfind(handler, user, rel):
+def _do_propfind(handler, user, rel, readonly=False):
     depth = (handler.headers.get("Depth") or "1").strip().lower()
-    path = cloud_store.resolve(user, rel)
+    path = _resolve(user, rel, readonly)
     if path is None:
         _send_dav_error(handler, 403, "路径不合法")
         return
@@ -187,10 +217,10 @@ def _do_propfind(handler, user, rel):
         _send_dav_error(handler, 404, "不存在")
         return
     is_dir = os.path.isdir(path)
-    items = [_prop_xml(rel, path, is_dir)]
+    items = [_prop_xml(rel, path, is_dir, readonly or _is_common(rel))]
     if is_dir and depth != "0":          # Depth: infinity 也按 1 层处理（够 Windows 用）
-        for crel, cpath, cdir in _list_children(user, rel):
-            items.append(_prop_xml(crel, cpath, cdir))
+        for crel, cpath, cdir, cro in _list_children(user, rel, readonly):
+            items.append(_prop_xml(crel, cpath, cdir, cro))
     body = (_XML_HEADER + '<D:multistatus xmlns:D="DAV:">' + "".join(items) + '</D:multistatus>')
     _resp(handler, 207, body, "application/xml; charset=utf-8")
 
@@ -215,8 +245,8 @@ def _open_range(handler, path, size):
     return start, min(end, size - 1)
 
 
-def _do_get(handler, user, rel, head=False):
-    path = cloud_store.resolve(user, rel)
+def _do_get(handler, user, rel, head=False, readonly=False):
+    path = _resolve(user, rel, readonly)
     if path is None:
         _send_dav_error(handler, 403, "路径不合法")
         return
@@ -225,7 +255,7 @@ def _do_get(handler, user, rel, head=False):
             _resp(handler, 301, b"", None, {"Location": _quote(rel, True)})
             return
         rows = "".join('<li><a href="%s">%s</a></li>' % (_quote(cr, cd), _xml_escape(os.path.basename(cr)))
-                       for cr, _p, cd in _list_children(user, rel))
+                       for cr, _p, cd, _ro in _list_children(user, rel, readonly))
         _resp(handler, 200, "<html><body><ul>%s</ul></body></html>" % rows,
               "text/html; charset=utf-8")
         return
@@ -263,13 +293,16 @@ def _do_get(handler, user, rel, head=False):
             remaining -= len(chunk)
 
 
-def _do_put(handler, user, rel):
+def _do_put(handler, user, rel, readonly=False):
+    if readonly or _is_common(rel):
+        _send_dav_error(handler, 403, "通用文件为只读，写入请先登录网盘")
+        return
     if not rel:
         _send_dav_error(handler, 405, "不能写入挂载根目录")
         return
     parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-    parent = cloud_store.resolve(user, parent_rel)
-    target = cloud_store.resolve(user, rel)
+    parent = _resolve(user, parent_rel, readonly)
+    target = _resolve(user, rel, readonly)
     if parent is None or target is None:
         _send_dav_error(handler, 403, "路径不合法")
         return
@@ -327,13 +360,16 @@ def _cleanup(path):
         pass
 
 
-def _do_mkcol(handler, user, rel):
+def _do_mkcol(handler, user, rel, readonly=False):
+    if readonly or _is_common(rel):
+        _send_dav_error(handler, 403, "通用文件为只读，不能新建文件夹")
+        return
     if not rel:
         _send_dav_error(handler, 405, "挂载根目录已存在")
         return
     name = rel.rsplit("/", 1)[-1]
     parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
-    target = cloud_store.resolve(user, rel)
+    target = _resolve(user, rel, readonly)
     if target is None:
         _send_dav_error(handler, 403, "路径不合法")
         return
@@ -347,11 +383,14 @@ def _do_mkcol(handler, user, rel):
     _resp(handler, 201, b"")
 
 
-def _do_delete(handler, user, rel):
+def _do_delete(handler, user, rel, readonly=False):
+    if readonly or _is_common(rel):
+        _send_dav_error(handler, 403, "通用文件为只读，不能删除")
+        return
     if not rel:
         _send_dav_error(handler, 405, "不能删除挂载根目录")
         return
-    path = cloud_store.resolve(user, rel)
+    path = _resolve(user, rel, readonly)
     if path is None:
         _send_dav_error(handler, 403, "路径不合法")
         return
@@ -383,7 +422,7 @@ def _dest_rel(handler):
     return rel.rstrip("/")
 
 
-def _do_move(handler, user, rel):
+def _do_move(handler, user, rel, readonly=False):
     if not rel:
         _send_dav_error(handler, 405, "不能移动挂载根目录")
         return
@@ -391,8 +430,11 @@ def _do_move(handler, user, rel):
     if not dst_rel:
         _send_dav_error(handler, 400, "Destination 头不合法")
         return
-    src = cloud_store.resolve(user, rel)
-    dst = cloud_store.resolve(user, dst_rel)
+    if readonly or _is_common(rel) or _is_common(dst_rel):
+        _send_dav_error(handler, 403, "通用文件为只读，不能改名/移动")
+        return
+    src = _resolve(user, rel, readonly)
+    dst = _resolve(user, dst_rel, readonly)
     if src is None or dst is None:
         _send_dav_error(handler, 403, "路径不合法")
         return
@@ -422,8 +464,8 @@ def _do_move(handler, user, rel):
     _resp(handler, 201, b"")
 
 
-def _do_lock(handler, user, rel):
-    path = cloud_store.resolve(user, rel)
+def _do_lock(handler, user, rel, readonly=False):
+    path = _resolve(user, rel, readonly)
     if path is None:
         _send_dav_error(handler, 403, "路径不合法")
         return
@@ -445,19 +487,21 @@ def _do_lock(handler, user, rel):
     _resp(handler, 200, body, "application/xml; charset=utf-8", {"Lock-Token": "<%s>" % token})
 
 
-def _do_unlock(handler, user, rel):
+def _do_unlock(handler, user, rel, readonly=False):
     with _lock:
         _locks.pop(rel, None)
     _resp(handler, 204, b"")
 
 
 # ---------- 入口 ----------
-def handle(handler, user, rel):
+def handle(handler, user, rel, readonly=False):
     """处理一次 WebDAV 请求。
 
-    handler：BaseHTTPRequestHandler（方法在 handler.command，正文在 handler.rfile）
-    user   ：已认证的网盘用户名（调用方负责认证与 MAC->账号 映射）
-    rel    ：挂载根（/dav/）下的相对路径，已 URL 解码、以 "/" 分隔、不含前后斜杠
+    handler ：BaseHTTPRequestHandler（方法在 handler.command，正文在 handler.rfile）
+    user    ：已认证的网盘用户名（调用方负责认证；未登录客户机传 MAC）
+    rel     ：挂载根（/dav/）下的相对路径，已 URL 解码、以 "/" 分隔、不含前后斜杠
+    readonly：True = 只读的“通用文件”公共盘（未登录客户机挂的 Z 盘），
+              此时 rel 的根就是通用文件区，任何写操作一律拒绝
     """
     if rel and (".." in rel.split("/") or "\\" in rel or rel.startswith("/")):
         _send_dav_error(handler, 403, "路径不合法")
@@ -467,21 +511,21 @@ def handle(handler, user, rel):
         if method == "OPTIONS":
             _do_options(handler)
         elif method == "PROPFIND":
-            _do_propfind(handler, user, rel)
+            _do_propfind(handler, user, rel, readonly)
         elif method in ("GET", "HEAD"):
-            _do_get(handler, user, rel, head=(method == "HEAD"))
+            _do_get(handler, user, rel, head=(method == "HEAD"), readonly=readonly)
         elif method == "PUT":
-            _do_put(handler, user, rel)
+            _do_put(handler, user, rel, readonly)
         elif method == "MKCOL":
-            _do_mkcol(handler, user, rel)
+            _do_mkcol(handler, user, rel, readonly)
         elif method == "DELETE":
-            _do_delete(handler, user, rel)
+            _do_delete(handler, user, rel, readonly)
         elif method == "MOVE":
-            _do_move(handler, user, rel)
+            _do_move(handler, user, rel, readonly)
         elif method == "LOCK":
-            _do_lock(handler, user, rel)
+            _do_lock(handler, user, rel, readonly)
         elif method == "UNLOCK":
-            _do_unlock(handler, user, rel)
+            _do_unlock(handler, user, rel, readonly)
         else:
             _resp(handler, 405, b"", None, {"Allow": "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, "
                                                      "MKCOL, MOVE, LOCK, UNLOCK"})
