@@ -150,6 +150,12 @@ web_exported = {}  # img_name -> {"tid","iqn","path","size","created"}（内存�
 
 IDLE_CHECK_INTERVAL = 30    # 每隔多少秒巡检一次
 IDLE_TIMEOUT_SECONDS = 300  # target 连续空闲(无 I_T nexus)超过这个时长就自动清理，5分钟
+# 回写锁的宽限期：回写母盘的机器一旦没有 I_T nexus（iSCSI 会话断了：正常关机/重启/
+# 拔电），就没有任何人在写母盘了，必须尽快把“回写占用”放开，否则母盘会被一台已经
+# 关机的机器锁住，别的机器既不能回写也不能后台挂载。45 秒 ≫ 发起端重连时间，
+# 又远小于 IDLE_TIMEOUT_SECONDS（target 本身仍按 5 分钟回收，避免把临时掉线、
+# 马上要重连的机器的盘删掉）。
+WRITEBACK_LOCK_GRACE = 45
 MIN_FREE_GB = 5   # OVERLAY_DIR 剩余空间低于该值(GB)时拒绝新 provision
 
 # ---- 无流量检测：识别"客户机不主动断开 iSCSI"的关机/断电（纯服务端，Windows/Linux 通用）----
@@ -533,6 +539,36 @@ def parse_idle_tids():
             idle[tid] = mac
     return idle
 
+def parse_active_nexus_tids():
+    """返回当前**有** I_T nexus（有客户机连着）的 tid 集合（尽力而为）。
+
+    与 parse_idle_tids 互补：本函数只看“还在连的”，用于判断某个 target 现在到底
+    有没有人在用（回写占用是否该继续保留）。tgtadm 查询失败时返回空集合。
+    """
+    tids = set()
+    try:
+        out = subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "show"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return tids
+    for block in re.split(r"(?=^Target \d+: )", out, flags=re.MULTILINE):
+        m = re.match(r"Target (\d+): ", block)
+        if not m:
+            continue
+        nexus_section = re.search(r"I_T nexus information:(.*?)LUN information:", block, re.DOTALL)
+        if nexus_section and "I_T nexus:" in nexus_section.group(1):
+            tids.add(m.group(1))
+    return tids
+
+def target_exists(tid):
+    """tgtadm 里是否还存在该 tid 的 target。查询失败时返回 True（保守：不确定就别当它不存在）。"""
+    try:
+        out = subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "show"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return True
+    return re.search(r"^Target %d: " % int(tid), out, re.MULTILINE) is not None
+
 def get_client_ips():
     """返回 {mac: ip}：tgt 当前有 I_T nexus 的客户机（尽力而为）。"""
     conn = {}
@@ -620,6 +656,39 @@ def force_cleanup_mac(mac, reason):
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now}] [CLEANUP] {reason} for {mac} (tid={tid})")
 
+def release_writeback_lock(img_name, reason):
+    """只解除某母盘的“回写占用”登记（不动 target/叠加盘/nbd）。返回原占用者 mac 或 ""。
+
+    给三类场景用：① 客户机已没有 I_T nexus（会话结束）宽限期到；② 后台手动解除；
+    ③ 检测到登记与 tgtadm 实际状态不一致。
+    """
+    with global_lock:
+        owner = writeback_active.pop(img_name, None)
+    if owner:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] [CLEANUP] write-back lock released for {img_name} (owner={owner}): {reason}")
+    return owner or ""
+
+def writeback_lock_stale(img_name, owner, no_nexus_since):
+    """回写占用是否已过期可解除。返回 (可解除, 原因)。
+
+    判据是“还有没有人在写这张母盘”，也就是 iSCSI 会话（I_T nexus）：
+      - 没有 nexus 且持续超过 WRITEBACK_LOCK_GRACE -> 可解除；
+      - 占用者不是当前任何在线 iSCSI 会话、tgtadm 里该 target 也不存在（比如服务重启后
+        mac_state 清空、但登记是后来加的），且持续超过宽限期 -> 可解除（防止“幽灵占用”）；
+      - 有 nexus 或还在宽限期内 -> 不能解除（临时掉线要留时间重连）。
+
+    no_nexus_since：本 target 首次被观测到“没有 I_T nexus”的时间戳（由巡检维护）。
+    """
+    if not owner or not no_nexus_since:
+        return False, ""
+    age = time.time() - no_nexus_since
+    if age < WRITEBACK_LOCK_GRACE:
+        return False, ""
+    if not parse_active_nexus_tids() and not target_exists(stable_tid(owner)):
+        return True, f"占用者 {owner} 既无在线 iSCSI 会话、target 也不存在，持续 {int(age)}s"
+    return True, f"{owner} 已无 I_T nexus 持续 {int(age)}s（会话已结束）"
+
 def idle_cleanup_worker():
     idle_since = {}        # tid -> 首次被判定为 nexus 空闲的时间戳
     no_traffic_since = {}  # mac -> 首次被判定为"无流量可疑"的时间戳
@@ -627,6 +696,25 @@ def idle_cleanup_worker():
         time.sleep(IDLE_CHECK_INTERVAL)
         try:
             now_ts = time.time()
+
+            # ---- 通道 0：回写占用只活在会话期间 ----
+            # 母盘正被回写时，只要发起端断开（关机/重启/拔电/重连失败），就尽快放开占用，
+            # 不能让一台已经关机的机器把母盘锁到 IDLE_TIMEOUT_SECONDS 甚至更久。
+            active = parse_active_nexus_tids()
+            with global_lock:
+                wb_now = dict(writeback_active)
+            for img_name, owner in wb_now.items():
+                tid = str(stable_tid(owner))          # 与 parse_*_tids 的键类型一致（都是字符串）
+                has_nexus = tid in active
+                if has_nexus:
+                    idle_since.pop(tid, None)
+                    continue
+                if tid not in idle_since:
+                    idle_since[tid] = now_ts          # 与本通道原语义一致：target 无 nexus 的起点
+                    continue
+                ok, why = writeback_lock_stale(img_name, owner, idle_since.get(tid))
+                if ok:
+                    release_writeback_lock(img_name, why)
 
             # ---- 通道 1：正常 logout（nexus 消失）后的空闲清理 ----
             idle_now = parse_idle_tids()
@@ -1272,8 +1360,36 @@ class Handler(BaseHTTPRequestHandler):
                 with global_lock:
                     owner = writeback_active.get(img_name)
                 if owner not in (None, mac):
-                    self._fail_to_menu(host, f"Image {img_name} is in write-back use by {owner}. Please try again later.")
-                    return
+                    # 占用者若已经没有 iSCSI 会话（关机/拔电/掉线没重连），把它当过期占用夺过来，
+                    # 否则一台关机的机器能把这个母盘锁很久。判据（都必须成立）：
+                    #   ① 该 target 当前没有 I_T nexus；
+                    #   ② 占用者不是“刚还在心跳”的机器（回写机开机时本来就没心跳，不能用“有心跳记录”当判据）；
+                    #   ③ L2 上 ARP 也不应答（arping 不可用时这项跳过，交给巡检的宽限期兜底）。
+                    stale = False
+                    try:
+                        owner_ip = agent_hub.ip_of(owner) or ""
+                        rec_owner = agent_hub.record_of(owner)
+                        hb_old = (not rec_owner) or \
+                            (time.time() - (rec_owner.get("last_seen") or 0)) > agent_hub.ONLINE_WINDOW
+                        arp_dead = bool(owner_ip) and client_arp_alive(owner_ip) is False
+                        if owner not in get_client_ips() and hb_old and arp_dead:
+                            stale = True
+                    except Exception:
+                        stale = False
+                    if stale:
+                        print(f"[{datetime.datetime.now()}] [CLEANUP] write-back lock taken over from "
+                              f"{owner} (no active iSCSI session) by {mac} for {img_name}")
+                        subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "delete",
+                                        "--force", "--tid", str(stable_tid(owner))],
+                                       stderr=subprocess.DEVNULL, timeout=3)
+                        with global_lock:
+                            writeback_active.pop(img_name, None)
+                            writeback_active[img_name] = mac
+                        mac_state.pop(owner, None)
+                    else:
+                        self._fail_to_menu(host, f"Image {img_name} is in write-back use by {owner}"
+                                                 ". Please try again later.")
+                        return
                 # 后台手动挂载互斥：该母盘正被后台导出（外部发起端写盘）时禁止回写
                 with global_lock:
                     exported_iqn = web_exported.get(img_name, {}).get("iqn")
@@ -1510,7 +1626,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                  '<p class="small"><a href="/web/register">注册账号</a></p></div>')
         self._send_html(_page_html("登录 - " + WEB_TITLE, body, None))
 
-    def _dashboard(self):
+    def _dashboard(self, msg=None):
         rows = collect_client_info()
         trs = "".join(
             '<tr><td>{mac}</td><td>{img}</td><td>{mode}</td><td>{st}</td><td>{ip}</td>'
@@ -1519,18 +1635,39 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 st='<span class="ok">在线</span>' if r["online"] else '空闲',
                 ip=html.escape(r["ip"]), detail=html.escape(r["detail"]))
             for r in rows) or '<tr><td colspan="6">暂无客户机记录</td></tr>'
-        wb_items = "".join(f"{html.escape(k)} ← {html.escape(v)}<br>"
-                           for k, v in sorted(writeback_active.items())) or "无"
+        # 回写占用：标明占用者现在还有没有 iSCSI 会话（没有=占用已过期，巡检会自动解除），
+        # 并给管理员一个手动解除的兜底按钮（客户机拔电/状态卡住时不用等巡检）。
+        conn = get_client_ips()
+        wb_lines = []
+        for img_name, owner in sorted(writeback_active.items()):
+            live = owner in conn
+            state = ('<span class="ok">会话正常</span>' if live
+                     else '<span class="err">已断开</span><span class="small">（占用已过期，巡检会自动解除）</span>')
+            form = ('<form method="post" action="/web/clients/cmd" class="inline-form"'
+                    ' onsubmit="return confirm(\'解除 ' + html.escape(img_name)
+                    + ' 的回写占用？只有确认占用者已关机/断线时才点。\')">'
+                    + self._csrf_hidden()
+                    + '<input type="hidden" name="action" value="release_writeback">'
+                    + '<input type="hidden" name="img" value="' + html.escape(img_name) + '">'
+                    + '<input type="submit" value="手动解除占用"></form>')
+            wb_lines.append('<p>' + html.escape(img_name) + ' ← ' + html.escape(owner) + '　'
+                            + state + '　' + form + '</p>')
+        wb_items = "".join(wb_lines) or "<p>无</p>"
         exp_items = "".join(f"{html.escape(k)} → {html.escape(v.get('iqn', ''))}<br>"
                             for k, v in sorted(web_exported.items())) or "无"
+        msg_html = '<p class="ok">' + html.escape(msg) + '</p>' if msg else ''
         body = (
-            '<div class="card"><h2>客户机名单</h2>'
+            msg_html
+            + '<div class="card"><h2>客户机名单</h2>'
             '<table><tr><th>MAC</th><th>镜像</th><th>模式</th><th>状态</th><th>IP</th><th>资源</th></tr>'
             + trs + '</table>'
             '<p class="small">“在线”表示当前有 iSCSI 连接（I_T nexus）；服务重启后内存记录会清空。</p></div>'
-            '<div class="card"><h2>回写模式占用</h2><p>' + wb_items + '</p>'
-            '<p class="small">回写模式会直接修改母盘，同一母盘同一时刻只允许一台机器回写。</p></div>'
-            '<div class="card"><h2>后台手动挂载（iSCSI）</h2><p>' + exp_items + '</p>'
+            '<div class="card"><h2>回写模式占用</h2>' + wb_items
+            + '<p class="small">回写模式会直接修改母盘，同一母盘同一时刻只允许一台机器回写。'
+            '占用只在<b>占用者有 iSCSI 会话</b>期间有效：客户机一关机/断线，'
+            '约 ' + str(WRITEBACK_LOCK_GRACE) + ' 秒后由巡检自动解除（占用者仍可在这段时间内重连）。'
+            '客户机拔电、跨 VLAN 探测不到、或状态卡住时，用上面的「手动解除占用」。</p></div>'
+            + '<div class="card"><h2>后台手动挂载（iSCSI）</h2><p>' + exp_items + '</p>'
             '<p class="small">管理入口：<a href="/web/export">iSCSI 挂载</a>。'
             '挂载中的镜像不可再被 PXE 叠加启动或回写。</p></div>'
         )
@@ -1834,7 +1971,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             if s.get("role") == "user":
                 self._redirect("/web/drive")   # 普通用户无客户机名单权限
                 return
-            self._dashboard()
+            self._dashboard(urllib.parse.parse_qs(parsed.query).get("msg", [""])[0] or None)
             return
         if path == "/web/register":   # 公开注册页（无需会话）
             self._register_page()
@@ -2735,6 +2872,13 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if action in ("upgrade_one", "upgrade_all"):
             self._do_upgrade(action == "upgrade_all",
                              form.get("mac", [""])[0], form.get("force", [""])[0] == "1")
+            return
+        if action == "release_writeback":
+            img = form.get("img", [""])[0].strip()
+            owner = release_writeback_lock(img, "管理员在后台手动解除")
+            msg = ("已解除 %s 的回写占用（原占用者 %s）" % (img, owner)) if owner \
+                else ("%s 当前没有回写占用" % img)
+            self._redirect("/?msg=" + urllib.parse.quote(msg, safe=""))
             return
         if action in ("build_release", "drop_release"):
             if action == "build_release":
