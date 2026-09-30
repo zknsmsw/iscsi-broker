@@ -3,9 +3,31 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import urllib.parse, subprocess, os, datetime, hashlib, threading, glob, time, re, secrets, html, ssl, json, base64
 import users_auth, cloud_store, netctrl, agent_hub, webdav, wsbridge  # 本地模块：多账号认证（users_auth）+ 个人网盘（cloud_store）+ 联网控制（netctrl）+ 客户机 agent 通道（agent_hub）+ 网盘 WebDAV（webdav）+ VNC WebSocket 桥（wsbridge）
 
-# ========== 请修改为你的实际绝对路径 ==========
-BASE_DIR = "/home/prts/server"   # 例如 /home/user/server
-# ============================================
+# ========== 数据根目录 BASE_DIR ==========
+# 优先级：环境变量 ISCSI_BROKER_BASE_DIR > /etc/iscsi-broker/iscsi-broker.env > 下面的默认值。
+# install.sh 会把实际路径写进那个 env 文件、由 systemd 的 EnvironmentFile 注入，
+# 所以从 git 拉下来的源码不用手改（升级/pull 也不会冲突）。
+_DEFAULT_BASE_DIR = "/home/prts/server"   # 例如 /home/user/server
+_ENV_FILE = "/etc/iscsi-broker/iscsi-broker.env"
+
+def _resolve_base_dir():
+    env = os.environ.get("ISCSI_BROKER_BASE_DIR", "").strip()
+    if env:
+        return env
+    try:
+        with open(_ENV_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("ISCSI_BROKER_BASE_DIR="):
+                    val = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if val:
+                        return val
+    except OSError:
+        pass
+    return _DEFAULT_BASE_DIR
+
+BASE_DIR = _resolve_base_dir()
+# =========================================
 
 PORT = 5000
 IMAGES_DIR = os.path.join(BASE_DIR, "images")  # 存放多个母盘 xxx.raw 的目录（数据结构保持不变）
@@ -2605,7 +2627,16 @@ if __name__ == "__main__":
     if os.geteuid() != 0:
         print("[WARN] 当前不是 root 运行！qemu-nbd 打开 /dev/nbdX 需要 root 权限。"
               "若报错出现 'Operation not permitted'，请改用 sudo 或 systemd 服务运行。")
-    subprocess.run(["modprobe", "nbd", "max_part=8", f"nbds_max={NBD_MAX}"], check=True)
+    # nbd 模块只在“路线 B（qcow2 叠加盘）”需要；装不上时只告警不退出，
+    # 否则没有 nbd 模块的机器（走 reflink 路线 A）会一直被 systemd 重启。
+    try:
+        subprocess.run(["modprobe", "nbd", "max_part=8", f"nbds_max={NBD_MAX}"],
+                       check=True, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[WARN] 加载 nbd 内核模块失败：{e}")
+        if not USE_REFLINK:
+            print("[WARN] 当前是 qcow2 回退模式，没有 nbd 时客户机无法启动！"
+                  "请安装 linux-modules-extra / 内核 nbd 模块后重启本服务。")
     init_cleanup()
     tune_sysctl()
     threading.Thread(target=idle_cleanup_worker, daemon=True).start()

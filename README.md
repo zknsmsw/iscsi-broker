@@ -71,6 +71,7 @@
 | `webdav.py` | **网盘 WebDAV 端点**：把 `cloud_store` 的个人网盘暴露成 WebDAV，供 Windows 客户机映射盘符（PROPFIND/GET/PUT/MKCOL/DELETE/MOVE/LOCK 等，复用云盘的路径安全与配额）。 |
 | `wsbridge.py` | **VNC 的 WebSocket 桥**：浏览器 --ws--> 服务器 --tcp 5900--> 客户机（纯标准库实现 RFC6455）。 |
 | `client/` | **客户机客户端**：`Agent.cs`（源码）+ `build.bat`（用系统自带 csc 编译）+ `agent.ini.example` + `README.md`（部署说明）。 |
+| `install.sh` | **服务端一键安装**：识别发行版装依赖、装到 `/opt/iscsi-broker`、建数据目录、注册并启动 `iscsi-broker.service`（含 `--uninstall`）。 |
 | `web/vnc/` | 内置的 **noVNC** 静态资源（`core/`、`vendor/pako/`，MPL-2.0，见同目录 `LICENSE.txt`）+ 管理页 `viewer.html`；只有管理员会话能访问。 |
 
 ---
@@ -78,7 +79,7 @@
 ## 三、目录结构（运行时自动生成）
 
 ```
-/home/prts/server/                  ← BASE_DIR（OVERLAY_DIR = BASE_DIR，可改）
+/home/prts/server/                  ← BASE_DIR（OVERLAY_DIR = BASE_DIR；用 install.sh 或环境变量指定）
 ├── images/                          ← 母盘目录，手动放置 xxx.raw（不会自动创建！）
 ├── admin.conf                       ← 管理员密码（加盐 SHA256 哈希）
 ├── users.conf                       ← 注册用户列表（每行 用户名$sha256$salt$digest$配额）
@@ -162,15 +163,60 @@
 
 ### 2. 服务器准备与启动
 
+**（推荐）一键安装**：在 clone 出来的仓库目录里跑
+
 ```bash
-# 1) 修改 iscsi_broker.py 顶部 BASE_DIR 为实际绝对路径
-# 2) 安装依赖（以 Debian/Ubuntu 为例）
-apt install python3 tgt qemu-utils iproute2 iputils-arping util-linux dnsmasq ipxe
-# 3) 准备母盘目录并放入镜像
+git clone https://github.com/zknsmsw/iscsi-broker.git
+cd iscsi-broker
+sudo bash install.sh
+```
+
+它会：按发行版装依赖（Debian/Ubuntu/Fedora/RHEL/openSUSE/Arch 自动识别）→ 把程序装到
+`/opt/iscsi-broker`（源码目录不动，方便以后 `git pull`）→ 建数据根目录并写
+`/etc/iscsi-broker/iscsi-broker.env`（数据目录就写在这里，**不用再手改源码里的 BASE_DIR**）
+→ 注册并启动 `iscsi-broker.service`（开机自启，日志进 journald）。
+
+常用参数：
+
+```bash
+sudo bash install.sh --base-dir /data/server     # 数据根目录（母盘/网盘/配置），默认 /home/prts/server
+sudo bash install.sh --install-dir /opt/broker   # 程序目录，默认 /opt/iscsi-broker
+sudo bash install.sh --no-deps --no-start        # 只装文件+注册服务，不装依赖、不启动
+sudo bash install.sh --uninstall                 # 停止并卸载服务（数据目录保留）
+```
+
+装完还需要手动做三件事：把母盘 `.raw` 放进 `<数据目录>/images/`、配 dnsmasq 的 DHCP/TFTP
+（见本节第 4 小节）、给客户机母盘装客户端 agent（见第 7 小节和 `client/README.md`）。
+
+常用命令：
+
+```bash
+systemctl status iscsi-broker      # 服务状态
+journalctl -u iscsi-broker -f      # 实时日志
+systemctl restart iscsi-broker     # 重启（会重新清理遗留 target/叠加盘）
+```
+
+升级（拉新代码后重跑安装，会重新拷贝程序并重启服务）：
+
+```bash
+cd iscsi-broker && git pull && sudo bash install.sh --no-deps
+```
+
+数据目录会被设为 `0700`（里面是密码哈希、网盘数据）；`--base-dir` 指向已有共享目录前请留意这点。
+
+**手动安装**（不想用脚本时）：
+
+```bash
+# 1) 安装依赖（以 Debian/Ubuntu 为例）
+apt install python3 tgt qemu-utils iproute2 iputils-arping util-linux dnsmasq ipxe iptables kmod
+# 2) 准备数据目录并放入母盘
 mkdir -p /home/prts/server/images
 #    把 xxx.raw 母盘放进去（如 win11.raw）；母盘怎么做见下一节
-# 4) 把仓库里的 web/ 目录放到主程序同目录（VNC 控制页要用内置 noVNC）
-#    目录结构：/home/prts/server/iscsi_broker.py + /home/prts/server/web/vnc/...
+# 3) 指定数据目录（二选一）：
+#    a. 环境变量：export ISCSI_BROKER_BASE_DIR=/home/prts/server
+#    b. 写 /etc/iscsi-broker/iscsi-broker.env 一行 ISCSI_BROKER_BASE_DIR=/home/prts/server
+#    （都不做则用源码默认值 /home/prts/server，不用改源码）
+# 4) 程序目录里要有 web/（VNC 控制页用内置 noVNC），即仓库原样放好即可
 # 5) 给 LAN 口配静态 IP（示例，网卡名按实际改）
 ip addr add 10.1.1.1/24 dev enp3s0
 ip link set enp3s0 up
@@ -445,7 +491,7 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
 
 | 配置 | 默认 | 说明 |
 |------|------|------|
-| `BASE_DIR` | `/home/prts/server` | 服务器数据根目录（**部署前必改**） |
+| `BASE_DIR` | `/home/prts/server` | 服务器数据根目录（母盘/网盘/配置/叠加盘都在这）。优先级：环境变量 `ISCSI_BROKER_BASE_DIR` > `/etc/iscsi-broker/iscsi-broker.env` > 上面这个默认值；`install.sh` 会替你写好那个 env 文件，所以不用改源码 |
 | `PORT` / `WEB_PORT` | 5000 / 8080 | iPXE 供给端口 / Web 后台端口 |
 | `DEFAULT_IMAGE` | `win11` | 启动菜单默认高亮镜像 |
 | `FORCE_MODE` | `auto` | `auto` / `reflink` / `qcow2` |
