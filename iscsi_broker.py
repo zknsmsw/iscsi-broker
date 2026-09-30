@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-import urllib.parse, subprocess, os, datetime, hashlib, threading, glob, time, re, secrets, html, ssl
-import users_auth, cloud_store, netctrl  # 本地模块：多账号认证（users_auth）+ 个人网盘（cloud_store）+ 联网控制（netctrl）
+import urllib.parse, subprocess, os, datetime, hashlib, threading, glob, time, re, secrets, html, ssl, json, base64
+import users_auth, cloud_store, netctrl, agent_hub, webdav, wsbridge  # 本地模块：多账号认证（users_auth）+ 个人网盘（cloud_store）+ 联网控制（netctrl）+ 客户机 agent 通道（agent_hub）+ 网盘 WebDAV（webdav）+ VNC WebSocket 桥（wsbridge）
 
 # ========== 请修改为你的实际绝对路径 ==========
 BASE_DIR = "/home/prts/server"   # 例如 /home/user/server
@@ -51,6 +51,8 @@ WEB_ENABLED = True            # 是否启用简易 Web 管理后台（改密码/
 WEB_PORT = 8080               # 后台端口，浏览器访问 http://<服务器IP>:8080/
 WEB_TITLE = "iSCSI Broker 管理后台"
 ADMIN_PASS_FILE = os.path.join(OVERLAY_DIR, "admin.conf")  # 管理员密码持久化文件（iPXE 与 Web 共用，可改）
+WEB_VNC_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "vnc"))
+# 内置 noVNC（VNC 控制页）静态资源目录，与主程序同级的 web/vnc/；缺失时只有 VNC 页面不可用
 # ========================================================
 
 # =================== 可选 HTTPS ===================
@@ -721,7 +723,8 @@ a{color:#2563eb;text-decoration:none;margin-right:14px}
 .inline-form{display:inline;margin:0}
 .inline-form input[type=submit]{padding:2px 8px;font-size:12px}"""
 
-NAV_ADMIN = ('<p><a href="/">客户机名单</a><a href="/web/create">创建空白盘</a>'
+NAV_ADMIN = ('<p><a href="/">客户机名单</a><a href="/web/clients">客户机控制</a>'
+             '<a href="/web/create">创建空白盘</a>'
              '<a href="/web/export">iSCSI 挂载</a><a href="/web/password">修改密码</a>'
              '<a href="/web/users">用户与配额</a>'
              '<a href="/web/common">通用文件</a><a href="/web/settings">默认配额</a>'
@@ -1528,10 +1531,201 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                  + '填服务器 IP 后在上表选择要连的 IQN（写直达母盘，请谨慎操作）。</p></div>')
         self._send_html(_page_html("iSCSI 挂载", body, NAV_ADMIN))
 
+    # ---------- VNC 控制（后台内嵌 noVNC：浏览器 --ws--> 服务器 --> 客户机 5900） ----------
+    # 静态资源是 vendored 的 noVNC（web/vnc/core 与 web/vnc/vendor，MPL-2.0）；
+    # 只有管理员会话能访问，普通用户的网盘页面不涉及这些 JS（继续 IE11 兼容）。
+    VNC_MIME = {".js": "text/javascript", ".mjs": "text/javascript",
+                ".html": "text/html; charset=utf-8", ".css": "text/css",
+                ".json": "application/json", ".png": "image/png",
+                ".svg": "image/svg+xml", ".gif": "image/gif", ".ico": "image/x-icon",
+                ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8",
+                ".map": "application/json"}
+
+    def _vnc_require_admin(self):
+        """VNC 页面与桥都只给管理员。返回会话或 None（已写出响应）。"""
+        s = self._session()
+        if not s:
+            self._redirect("/")
+            return None
+        if s.get("role") != "admin":
+            self.send_error(403, "forbidden")
+            return None
+        return s
+
+    def _vnc_info(self, params):
+        mac = "".join(c for c in (params.get("mac", [""])[0]).lower()
+                      if c in "0123456789abcdef")
+        rec = agent_hub.record_of(mac)
+        if not rec:
+            self._send_json({"ok": False, "mac": mac, "err": "该客户机还没跑 agent（没有心跳记录）"})
+            return
+        self._send_json({"ok": True, "mac": mac, "online": rec.get("online", False),
+                         "hostname": rec.get("hostname", ""), "ip": rec.get("ip", ""),
+                         "vnc_running": rec.get("vnc_running", False),
+                         "vnc_port": rec.get("vnc_port") or 5900,
+                         "drive": rec.get("drive", "")})
+
+    def _serve_vnc_file(self, path):
+        """从 web/vnc/ 下发 noVNC 静态文件（防目录穿越，按扩展名给 MIME）。"""
+        rel = urllib.parse.unquote(path[len("/vnc/"):])
+        ext = os.path.splitext(rel)[1].lower()
+        if ext not in self.VNC_MIME:
+            self.send_error(404)
+            return
+        full = os.path.normpath(os.path.join(WEB_VNC_DIR, rel.replace("/", os.sep)))
+        if not full.startswith(WEB_VNC_DIR + os.sep) or not os.path.isfile(full):
+            self.send_error(404)
+            return
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", self.VNC_MIME[ext])
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "max-age=600")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _vnc_dispatch(self, path, params):
+        """处理 /vnc、/vnc/info、/vnc/ws 与 /vnc/<静态文件>。"""
+        if path == "/vnc/ws":
+            if not self._vnc_require_admin():
+                return
+            mac = "".join(c for c in (params.get("mac", [""])[0]).lower()
+                          if c in "0123456789abcdef")
+            rec = agent_hub.record_of(mac)
+            if not rec:
+                self.send_error(502, "unknown client")
+                return
+            host = rec.get("ip") or ""
+            port = rec.get("vnc_port") or 5900
+            if not host:
+                self.send_error(502, "client has no known IP")
+                return
+            try:
+                wsbridge.handle(self, host, port)
+            except wsbridge.BridgeError as e:
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{now}] [ERROR] VNC bridge to {mac} ({host}:{port}) failed: {e.msg}")
+                self.send_error(e.code, e.msg)
+            except Exception as e:
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{now}] [ERROR] VNC bridge error: {e}")
+                self.send_error(500)
+            return
+        if not self._vnc_require_admin():
+            return
+        if path == "/vnc/info":
+            self._vnc_info(params)
+            return
+        if path == "/vnc":
+            self._serve_vnc_file("/vnc/viewer.html")
+            return
+        self._serve_vnc_file(path)
+
+    # ---------- WebDAV：个人网盘挂载（客户机映射盘符用） ----------
+    def _dav_auth(self):
+        """WebDAV 的 HTTP Basic 认证，成功返回网盘用户名，失败返回 None。
+
+        两种身份都支持：
+          1) 客户机 agent：用户名 = 自己的 MAC，密码 = agent 接入令牌
+             → 用管理员在“客户机控制”页指定的 网盘账号（客户机上不存网盘密码）
+          2) 网盘账号：用户名 + 密码（浏览器、发起端手工连时用）
+        """
+        hdr = self.headers.get("Authorization", "")
+        if not hdr.lower().startswith("basic "):
+            return None
+        try:
+            raw = base64.b64decode(hdr.split(None, 1)[1].strip()).decode("utf-8", "replace")
+        except Exception:
+            return None
+        user, sep, pwd = raw.partition(":")
+        if not sep:
+            return None
+        user = user.strip()
+        if not user:
+            return None
+        if agent_hub.check_token(pwd):
+            mac = "".join(c for c in user.lower() if c in "0123456789abcdef")
+            account = agent_hub.account_of(mac)
+            if account:
+                return account
+            return None
+        return user if users_auth.check_login(user, pwd) else None
+
+    def _dav_dispatch(self):
+        """把 /dav/ 下的请求交给 webdav 模块。"""
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == webdav.MOUNT_PREFIX.rstrip("/"):   # /dav -> /dav/（发起端少写斜杠时）
+            self.send_response(301)
+            self.send_header("Location", webdav.MOUNT_PREFIX)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if not parsed.path.startswith(webdav.MOUNT_PREFIX):
+            self.send_error(404)
+            return
+        user = self._dav_auth()
+        if not user:
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="iSCSI Broker cloud"')
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        # 首次使用自动建网盘根目录（与网盘页面一致），否则客户机挂载会拿到 404
+        try:
+            os.makedirs(cloud_store.user_home(user), exist_ok=True)
+        except Exception:
+            pass
+        rel = urllib.parse.unquote(parsed.path[len(webdav.MOUNT_PREFIX):]).strip("/")
+        webdav.handle(self, user, rel)
+
+    def do_OPTIONS(self):
+        if urllib.parse.urlparse(self.path).path.startswith(webdav.MOUNT_PREFIX):
+            self._dav_dispatch()
+            return
+        self.send_error(404)
+
+    def do_PROPFIND(self):
+        self._dav_dispatch()
+
+    def do_PUT(self):
+        self._dav_dispatch()
+
+    def do_MKCOL(self):
+        self._dav_dispatch()
+
+    def do_DELETE(self):
+        self._dav_dispatch()
+
+    def do_MOVE(self):
+        self._dav_dispatch()
+
+    def do_LOCK(self):
+        self._dav_dispatch()
+
+    def do_UNLOCK(self):
+        self._dav_dispatch()
+
+    def do_HEAD(self):
+        if urllib.parse.urlparse(self.path).path.startswith(webdav.MOUNT_PREFIX):
+            self._dav_dispatch()
+            return
+        self.send_error(404)
+
     # ---------- GET ----------
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        if path == "/vnc" or path.startswith("/vnc/"):
+            self._vnc_dispatch(path, urllib.parse.parse_qs(parsed.query))
+            return
+        if path == "/dav" or path.startswith(webdav.MOUNT_PREFIX):
+            self._dav_dispatch()
+            return
         if path in ("/", "/web", "/web/"):
             s = self._session()
             if not s:
@@ -1567,7 +1761,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._do_download(s)
             return
         if path in ("/web/users", "/web/settings", "/web/common", "/web/create",
-                    "/web/password", "/web/common/download", "/web/netctrl", "/web/export"):
+                    "/web/password", "/web/common/download", "/web/netctrl", "/web/export",
+                    "/web/clients"):
             s = self._session()
             if not self._role_gate(s, "admin"):
                 return
@@ -1577,6 +1772,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._password_page(params.get("msg", [""])[0] or None)
             elif path == "/web/users":
                 self._users_page(params.get("msg", [""])[0] or None)
+            elif path == "/web/clients":
+                self._clients_page(params.get("msg", [""])[0] or None)
             elif path == "/web/settings":
                 self._settings_page(params.get("msg", [""])[0] or None)
             elif path == "/web/netctrl":
@@ -1593,6 +1790,13 @@ class WebAdminHandler(BaseHTTPRequestHandler):
     # ---------- POST ----------
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
+        # 客户机 agent 通道：不走会话 Cookie，靠接入令牌认证（见 agent_hub）
+        if path == "/agent/poll":
+            self._agent_poll()
+            return
+        if path == "/agent/result":
+            self._agent_result()
+            return
         if path == "/web/login":
             self._do_login(self._form())
             return
@@ -1629,11 +1833,13 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if path in ("/web/users/quota", "/web/settings", "/web/common/delete",
                     "/web/create", "/web/password",
                     "/web/netctrl/default", "/web/netctrl/mac",
-                    "/web/export", "/web/export/unmount"):
+                    "/web/export", "/web/export/unmount", "/web/clients/cmd"):
             if not self._role_gate(s, "admin"):
                 return
             if path == "/web/users/quota":
                 self._do_users_quota(form)
+            elif path == "/web/clients/cmd":
+                self._do_clients_cmd(form)
             elif path == "/web/settings":
                 self._do_settings(form)
             elif path == "/web/netctrl/default":
@@ -1976,6 +2182,227 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             _ok, msg = users_auth.set_user_quota(name, bytes_n)
         self._redirect("/web/users?msg=" + urllib.parse.quote(msg, safe=""))
 
+    # ---------- 管理员：客户机控制（agent 通道 / 关机重启 / 网盘挂载 / VNC） ----------
+    # 客户机里跑 agent（见 client/），它只主动向服务器心跳，不开放入站端口：
+    #   POST /agent/poll    心跳 + 取一条待执行指令
+    #   POST /agent/result  回报执行结果
+    # 两者都靠 agent_hub 的接入令牌认证，不走浏览器会话。
+    CMD_LABELS = {"shutdown": "关机", "reboot": "重启", "vnc_start": "启用 VNC",
+                  "vnc_stop": "停用 VNC", "mount": "挂载网盘", "unmount": "卸载网盘"}
+
+    def _send_json(self, obj, code=200):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json_body(self):
+        """读取并解析请求体 JSON（客户机 agent 用，体积很小）。非法返回 None。"""
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            length = 0
+        length = min(max(length, 0), 64 * 1024)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            data = json.loads(raw.decode("utf-8", "replace") or "{}")
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _dav_url(self):
+        """本机 WebDAV 根地址（按当前请求的 Host 拼，兼容 HTTPS/自定义端口）。"""
+        scheme = "https" if HTTPS_ENABLED else "http"
+        return "%s://%s/dav/" % (scheme, self.headers.get("Host", ""))
+
+    def _agent_poll(self):
+        """客户机 agent 心跳：更新在线状态并下发一条待执行指令。"""
+        data = self._json_body()
+        if data is None:
+            self._send_json({"ok": False, "err": "bad json"}, 400)
+            return
+        if not agent_hub.check_token(data.get("token")):
+            self._send_json({"ok": False, "err": "bad token"}, 403)
+            return
+        info = data.get("info") if isinstance(data.get("info"), dict) else {}
+        mac, cmd = agent_hub.poll(data.get("mac"), ip=self.client_address[0], info=info)
+        if not mac:
+            self._send_json({"ok": False, "err": "bad mac"}, 400)
+            return
+        self._send_json({"ok": True, "mac": mac, "account": agent_hub.account_of(mac),
+                         "dav": self._dav_url(), "mount": agent_hub.mount_wanted(mac),
+                         "cmd": cmd})
+
+    def _agent_result(self):
+        """客户机 agent 回报指令执行结果。"""
+        data = self._json_body()
+        if data is None or not agent_hub.check_token(data.get("token")):
+            self._send_json({"ok": False, "err": "bad request"}, 400)
+            return
+        ok, err = agent_hub.result(data.get("mac"), data.get("id"),
+                                   data.get("ok", False), data.get("msg", ""))
+        self._send_json({"ok": ok, "err": err}, 200 if ok else 400)
+
+    def _cmd_form(self, mac, action, label, confirm=None):
+        """生成“下发指令”的内联表单。"""
+        onsubmit = ''
+        if confirm:
+            onsubmit = ' onsubmit="return confirm(\'' + confirm.replace("'", "") + '\')"'
+        return ('<form method="post" action="/web/clients/cmd" class="inline-form"' + onsubmit + '>'
+                + self._csrf_hidden()
+                + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
+                + '<input type="hidden" name="action" value="' + html.escape(action) + '">'
+                + '<input type="submit" value="' + html.escape(label) + '"></form>')
+
+    def _client_row(self, rec, ipxe=None):
+        """渲染客户机控制表的一行。rec 为 agent_hub 记录（或仅有 mac 的占位记录）。"""
+        mac = rec.get("mac", "")
+        online = bool(rec.get("online"))
+        if online:
+            st = '<span class="ok">在线</span>'
+        elif ipxe:
+            st = '<span class="err">未装 agent</span>'
+        else:
+            st = '离线'
+        sep = ' '
+        acts = []
+        if online:
+            acts.append(self._cmd_form(mac, "shutdown", "关机", "确定远程关机？客户机将立即关闭。"))
+            acts.append(self._cmd_form(mac, "reboot", "重启", "确定远程重启？客户机将立即重启。"))
+            if rec.get("vnc_running"):
+                acts.append(self._cmd_form(mac, "vnc_stop", "停用 VNC"))
+                acts.append('<a href="/vnc?mac=' + urllib.parse.quote(mac, safe="")
+                            + '" target="_blank">VNC 画面</a>')
+            else:
+                acts.append(self._cmd_form(mac, "vnc_start", "启用 VNC"))
+            if rec.get("want_mount"):
+                acts.append(self._cmd_form(mac, "unmount", "卸载网盘"))
+            elif rec.get("account"):
+                acts.append(self._cmd_form(mac, "mount", "挂载网盘"))
+            else:
+                acts.append('<span class="small">先设网盘账号</span>')
+        else:
+            acts.append('—')
+        # 网盘账号设置表单（离线也能先设好）
+        acc_form = ('<form method="post" action="/web/clients/cmd" class="inline-form">'
+                    + self._csrf_hidden()
+                    + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
+                    + '<input type="hidden" name="action" value="set_account">'
+                    + '<input type="text" name="account" size="8" value="'
+                    + html.escape(rec.get("account") or "") + '">'
+                    + '<input type="submit" value="保存"></form>')
+        res = rec.get("results") or []
+        if res:
+            r = res[0]
+            cls = 'ok' if r.get("ok") else 'err'
+            when = datetime.datetime.fromtimestamp(r.get("ts") or 0).strftime("%m-%d %H:%M:%S")
+            res_html = ('<span class="' + cls + '">' + html.escape(self.CMD_LABELS.get(
+                r.get("type") or "", r.get("type") or "指令")) + (' 成功' if r.get("ok") else ' 失败')
+                + '</span> <span class="small">' + when + '</span>')
+            if r.get("msg"):
+                res_html += '<br><span class="small">' + html.escape(r["msg"]) + '</span>'
+        else:
+            res_html = '<span class="small">—</span>'
+        vnc = ('<span class="ok">运行中 :%s</span>' % (rec.get("vnc_port") or 5900)) \
+            if rec.get("vnc_running") else '<span class="small">未运行</span>'
+        if rec.get("drive"):
+            drive_txt = html.escape(rec["drive"])
+        elif rec.get("want_mount"):
+            drive_txt = '<span class="small">待挂载</span>'
+        else:
+            drive_txt = '—'
+        ipxe_txt = ""
+        if ipxe:
+            ipxe_txt = '<br><span class="small">' + html.escape(
+                ("iPXE: %s %s" % (ipxe.get("img") or "-", ipxe.get("mode") or "")).strip()) + '</span>'
+        return ('<tr><td>' + html.escape(mac) + ipxe_txt + '</td><td>'
+                + html.escape(rec.get("hostname") or "—") + '</td><td>'
+                + html.escape(rec.get("ip") or "—") + '</td><td>' + st + '</td><td>'
+                + drive_txt + '</td><td>' + vnc + '</td><td>'
+                + sep.join(acts) + '</td><td>' + acc_form + '</td><td>' + res_html + '</td></tr>')
+
+    def _clients_page(self, msg=None):
+        records = agent_hub.snapshot()
+        seen = {r["mac"] for r in records}
+        rows = [self._client_row(r) for r in records]
+        ipxe_only = 0
+        for c in collect_client_info():          # iPXE 侧见过的机器（用于对照谁还没装 agent）
+            if c["mac"] in seen:
+                continue
+            ipxe_only += 1
+            rows.append(self._client_row({"mac": c["mac"], "online": False, "ip": c.get("ip") or "",
+                                          "hostname": "", "vnc_running": False, "vnc_port": 0,
+                                          "drive": "", "account": "", "results": []}, ipxe=c))
+        table = ('<table><tr><th>MAC</th><th>主机名</th><th>IP</th><th>agent</th><th>网盘盘符</th>'
+                 '<th>VNC</th><th>操作</th><th>网盘账号</th><th>最近结果</th></tr>'
+                 + ("".join(rows) if rows else '<tr><td colspan="9">暂无客户机记录（客户机 agent 还没心跳过）</td></tr>')
+                 + '</table>')
+        msg_html = ''
+        if msg:
+            cls = 'err' if ("失败" in msg or "不在线" in msg or "不合法" in msg
+                            or "请先" in msg or "已满" in msg) else 'ok'
+            msg_html = '<p class="' + cls + '">' + html.escape(msg) + '</p>'
+        tok = agent_hub.token()
+        body = (
+            '<div class="card"><h2>客户机 agent 接入令牌</h2>' + msg_html
+            + '<p class="small">把这个令牌和服务器地址填进客户机母盘的 <b>agent.ini</b>。'
+            + '令牌同时用于 agent 通道和网盘（WebDAV）认证，客户机上不需要存网盘密码。</p>'
+            + '<pre>' + html.escape(tok) + '</pre>'
+            + '<form method="post" action="/web/clients/cmd" class="inline-form" '
+            + 'onsubmit="return confirm(\'重置后所有客户机都要改 agent.ini，确定？\')">'
+            + self._csrf_hidden()
+            + '<input type="hidden" name="action" value="rotate_token">'
+            + '<input type="submit" value="重置令牌"></form></div>'
+            '<div class="card"><h2>客户机控制</h2>' + table
+            + '<p class="small">“在线”= 最近 %d 秒内收到过 agent 心跳。指令随心跳下发，'
+            % agent_hub.ONLINE_WINDOW
+            + '关机/重启会立即执行；VNC 需要母盘里装好 VNC 服务端并在 agent.ini 里配好路径；'
+            + '挂载网盘前要先在右侧填好该机的网盘账号（网盘用户名）。</p>'
+            + ('<p class="small">另有 %d 台机器只有 iPXE 记录、没有 agent 心跳（母盘里还没装客户端）。</p>'
+               % ipxe_only if ipxe_only else '')
+            + '</div>'
+            '<div class="card"><h2>客户机 agent 配置示例（母盘：agent.ini）</h2>'
+            + '<pre>' + html.escape(
+                "[server]\n"
+                "url=http://%s\n" % (self.headers.get("Host", "10.1.1.1:8080"))
+                + "token=" + tok + "\n"
+                "interval=3\n\n"
+                "[vnc]\nexe=C:\\Program Files\\TightVNC\\tvnserver.exe\nargs=-run\nport=5900\n\n"
+                "[dav]\nletter=Z\n") + '</pre>'
+            + '<p class="small">完整部署步骤见仓库 README「客户机客户端」一节。</p></div>'
+        )
+        self._send_html(_page_html("客户机控制", body, NAV_ADMIN))
+
+    def _do_clients_cmd(self, form):
+        """处理客户机控制页的下发按钮（关机/重启/VNC/挂载/账号/令牌）。"""
+        action = form.get("action", [""])[0]
+        if action == "rotate_token":
+            agent_hub.rotate_token()
+            self._redirect("/web/clients?msg=" + urllib.parse.quote("令牌已重置，请更新各客户机的 agent.ini", safe=""))
+            return
+        mac = form.get("mac", [""])[0]
+        if action == "set_account":
+            _ok, msg = agent_hub.set_account(mac, form.get("account", [""])[0])
+            self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
+            return
+        args = {}
+        if action == "mount":
+            account = agent_hub.account_of(mac)
+            if not account:
+                self._redirect("/web/clients?msg=" + urllib.parse.quote(
+                    "请先为该客户机设置网盘账号（网盘用户名）", safe=""))
+                return
+            args["url"] = self._dav_url()
+            args["account"] = account
+        # 注：enqueue 会把“挂载意图”记在服务器上（无盘客户机重启后靠它自动挂回来）
+        _ok, msg = agent_hub.enqueue(mac, action, **args)
+        if not _ok and action in ("mount", "unmount"):
+            msg = "已记下“%s”，客户机上线后会自动同步（现在：%s）" % (
+                "挂载网盘" if action == "mount" else "卸载网盘", msg)
+        self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
+
     # ---------- 管理员：默认配额 ----------
     def _settings_page(self, msg=None):
         cur = users_auth.get_default_quota()
@@ -2162,6 +2589,11 @@ if __name__ == "__main__":
     users_auth.setup(OVERLAY_DIR, lambda pwd: verify_password(pwd, ADMIN_PW_STORED))
     cloud_store.setup(os.path.join(BASE_DIR, "cloud"))
     print(f"[{datetime.datetime.now()}] [START] Cloud drive: {os.path.join(BASE_DIR, 'cloud')}")
+
+    # 客户机 agent 控制通道（接入令牌 + 心跳状态 + 指令队列）：令牌落盘，重启不变
+    agent_hub.setup(OVERLAY_DIR)
+    print(f"[{datetime.datetime.now()}] [START] Client agent channel ready (token file: "
+          f"{os.path.join(OVERLAY_DIR, agent_hub.TOKEN_FILE_NAME)})")
 
     # 联网控制：接管转发/NAT（按客户机 MAC 控制上网），并启动规则巡检线程
     if NETCTRL_ENABLED:

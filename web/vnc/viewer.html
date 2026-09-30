@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VNC 控制 - iSCSI Broker</title>
+<!--
+  管理页：通过服务器的 WebSocket 桥（/vnc/ws?mac=…）看客户机画面并操作。
+  用的是 noVNC（web/vnc/core，MPL-2.0，见同目录 LICENSE.txt）。
+  只有管理员会话能打开；普通用户网盘页面不走这里，保持 IE11 兼容（零 JS / ES5）。
+-->
+<style>
+  html, body { height: 100%; margin: 0; background: #2b2f36; color: #e8eaed;
+               font: 13px/1.5 "Microsoft YaHei", Arial, sans-serif; }
+  #bar { display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+         background: #1f2329; border-bottom: 1px solid #3a4048; flex-wrap: wrap; }
+  #bar b { color: #fff; }
+  #status { padding: 2px 8px; border-radius: 10px; background: #3a4048; }
+  #status.ok { background: #1b5e20; }
+  #status.err { background: #8e1616; }
+  #info { color: #9aa0a6; }
+  button, input, textarea { font: inherit; border-radius: 4px; border: 1px solid #4a515a;
+                            background: #2b2f36; color: #e8eaed; padding: 3px 8px; }
+  button { cursor: pointer; background: #2563eb; border-color: #2563eb; color: #fff; }
+  button.ghost { background: #2b2f36; border-color: #4a515a; color: #e8eaed; }
+  #screen { position: absolute; top: 44px; left: 0; right: 0; bottom: 0; background: #000; }
+  #screen canvas { margin: 0 auto; display: block; }
+  #paste { position: absolute; right: 10px; bottom: 10px; width: 260px; height: 60px;
+           display: none; }
+  #pwbox { display: none; }
+  a { color: #8ab4f8; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <b>VNC</b>
+  <span id="status">未连接</span>
+  <span id="info">读取状态中…</span>
+  <span style="flex:1"></span>
+  <span id="pwbox"><input id="pw" type="password" placeholder="VNC 密码" size="12">
+    <button id="pwgo" class="ghost">发送</button></span>
+  <button id="cad" class="ghost">Ctrl+Alt+Del</button>
+  <button id="scale" class="ghost">缩放：开</button>
+  <button id="pastebtn" class="ghost">粘贴板</button>
+  <button id="reconnect">重新连接</button>
+  <a href="/web/clients" target="_blank">客户机控制</a>
+</div>
+<div id="screen"></div>
+<textarea id="paste" placeholder="在这里粘贴文本，然后点“发送到客户机”"></textarea>
+
+<script type="module">
+import RFB from '/vnc/core/rfb.js';
+
+const params = new URLSearchParams(location.search);
+const mac = (params.get('mac') || '').toLowerCase().replace(/[^0-9a-f]/g, '');
+const elStatus = document.getElementById('status');
+const elInfo = document.getElementById('info');
+const elScreen = document.getElementById('screen');
+const elPwBox = document.getElementById('pwbox');
+const elPw = document.getElementById('pw');
+const elPaste = document.getElementById('paste');
+
+let rfb = null;
+let scaleViewport = true;
+let password = '';
+
+function setStatus(text, cls) {
+  elStatus.textContent = text;
+  elStatus.className = cls || '';
+}
+
+async function loadInfo() {
+  if (mac.length !== 12) { elInfo.textContent = '缺少 mac 参数'; return; }
+  try {
+    const r = await fetch('/vnc/info?mac=' + encodeURIComponent(mac));
+    const j = await r.json();
+    if (!j.ok) { elInfo.textContent = j.err || '读取状态失败'; return; }
+    elInfo.textContent = (j.hostname || j.mac) + ' ' + (j.ip || '')
+      + ' · agent ' + (j.online ? '在线' : '离线')
+      + ' · VNC ' + (j.vnc_running ? ('运行中 :' + j.vnc_port) : '未运行');
+  } catch (e) {
+    elInfo.textContent = '读取状态失败：' + e;
+  }
+}
+
+function wsUrl() {
+  const proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
+  return proto + location.host + '/vnc/ws?mac=' + encodeURIComponent(mac);
+}
+
+function connect() {
+  if (mac.length !== 12) { setStatus('mac 参数不对', 'err'); return; }
+  if (rfb) { try { rfb.disconnect(); } catch (e) {} rfb = null; }
+  elScreen.innerHTML = '';
+  setStatus('连接中…', '');
+  try {
+    rfb = new RFB(elScreen, wsUrl(), { credentials: { password: password } });
+  } catch (e) {
+    setStatus('无法建立连接：' + e, 'err');
+    return;
+  }
+  rfb.scaleViewport = scaleViewport;
+  rfb.background = '#000';
+  rfb.addEventListener('connect', () => { setStatus('已连接', 'ok'); elPwBox.style.display = 'none'; });
+  rfb.addEventListener('disconnect', (e) => {
+    setStatus(e.detail.clean ? '连接已断开' : '连接异常断开（客户机没在线/没开 VNC？）', 'err');
+    loadInfo();
+  });
+  rfb.addEventListener('securityfailure', (e) => {
+    setStatus('VNC 认证失败（status ' + e.detail.status + '）', 'err');
+    elPwBox.style.display = '';
+    elPw.focus();
+  });
+  rfb.addEventListener('credentialsrequired', (e) => {
+    const types = (e.detail && e.detail.types) || [];
+    if (types.indexOf('password') >= 0) {
+      setStatus('需要 VNC 密码', '');
+      elPwBox.style.display = '';
+      elPw.focus();
+    }
+  });
+  rfb.addEventListener('clipboard', (e) => {
+    if (e.detail && e.detail.text) { elPaste.value = e.detail.text; elPaste.style.display = 'block'; }
+  });
+}
+
+document.getElementById('pwgo').addEventListener('click', () => {
+  password = elPw.value;
+  if (rfb) rfb.sendCredentials({ password: password });
+  elPwBox.style.display = 'none';
+});
+elPw.addEventListener('keydown', (e) => { if (e.key === 'Enter') document.getElementById('pwgo').click(); });
+
+document.getElementById('cad').addEventListener('click', () => { if (rfb) rfb.sendCtrlAltDel(); });
+document.getElementById('reconnect').addEventListener('click', connect);
+document.getElementById('scale').addEventListener('click', (e) => {
+  scaleViewport = !scaleViewport;
+  if (rfb) rfb.scaleViewport = scaleViewport;
+  e.target.textContent = '缩放：' + (scaleViewport ? '开' : '关');
+});
+document.getElementById('pastebtn').addEventListener('click', () => {
+  const visible = elPaste.style.display === 'block';
+  elPaste.style.display = visible ? 'none' : 'block';
+  if (visible && rfb && elPaste.value) rfb.clipboardPasteFrom(elPaste.value);
+  if (!visible) elPaste.focus();
+});
+
+loadInfo().then(connect);
+</script>
+</body>
+</html>

@@ -46,16 +46,32 @@
 - 被禁机器仍可 PXE/iPXE 无盘启动并使用 iSCSI 盘（只禁外网，不碰服务器自身服务）；客户机互访不受影响；MAC 可被伪造（二层局域网通病）；
 - 规则改动前自动 `iptables-save` 快照备份到 `netctrl_backup/`（保留最近 20 份）。
 
+### 7. 客户机客户端（agent：远程控制 / 网盘 / 关机重启）
+- 客户机母盘里放一个常驻小程序（`client/`，C# 单 exe，Win10/11 自带运行时，免安装），
+  开机以 SYSTEM 身份自动运行；它**不开放任何入站端口**，只每隔几秒主动向服务器心跳。
+- Web 后台「客户机控制」页（`/web/clients`）可对每台机器：
+  - **远程关机 / 重启**（立即执行）；
+  - **VNC 控制**：一键拉起客户机上的 VNC 服务端，页内嵌 noVNC 直接看画面、发按键、粘贴板；
+  - **网盘挂载**：把服务器个人网盘通过 **WebDAV** 映射成客户机上的盘符（无盘客户机重启后
+    自动挂回来，不需要再点一次）。
+- 指令走心跳通道下发（客户机在 NAT/防火墙后面也能控制），接入令牌 + MAC 绑定；
+  挂载意图存在服务器侧，客户机的本地状态丢了也不影响。
+
 ---
 
 ## 二、文件说明
 
 | 文件 | 用途 |
 |------|------|
-| `iscsi_broker.py` | **主程序**：两个 HTTP 服务（端口 5000 iPXE 供给脚本 / 端口 8080 Web 管理后台）+ iSCSI 供给、叠加盘、空闲清理、账号与网盘页面。 |
+| `iscsi_broker.py` | **主程序**：两个 HTTP 服务（端口 5000 iPXE 供给脚本 / 端口 8080 Web 管理后台）+ iSCSI 供给、叠加盘、空闲清理、账号与网盘页面、客户机 agent 通道与 VNC 桥的路由。 |
 | `users_auth.py` | **账号认证模块**：注册 / 登录校验 / 配额管理 / 默认配额，用户数据持久化到 `users.conf`、`cloud.conf`。 |
 | `cloud_store.py` | **网盘存储模块**：目录列表、上传（流式 multipart 解析）、下载、建文件夹、配额统计、通用文件管理，含路径穿越与符号链接防护。 |
 | `netctrl.py` | **联网控制模块**：`netctrl.conf` 状态读写、FORWARD/NAT 规则托管（iptables 按 MAC 过滤 + MASQUERADE）、开机/巡检规则对齐、改动前自动备份。 |
+| `agent_hub.py` | **客户机 agent 通道**：接入令牌、心跳与在线状态、指令队列（关机/重启/VNC/挂载）、MAC→网盘账号与挂载意图（`agent_token.conf`、`agents.conf`）。 |
+| `webdav.py` | **网盘 WebDAV 端点**：把 `cloud_store` 的个人网盘暴露成 WebDAV，供 Windows 客户机映射盘符（PROPFIND/GET/PUT/MKCOL/DELETE/MOVE/LOCK 等，复用云盘的路径安全与配额）。 |
+| `wsbridge.py` | **VNC 的 WebSocket 桥**：浏览器 --ws--> 服务器 --tcp 5900--> 客户机（纯标准库实现 RFC6455）。 |
+| `client/` | **客户机客户端**：`Agent.cs`（源码）+ `build.bat`（用系统自带 csc 编译）+ `agent.ini.example` + `README.md`（部署说明）。 |
+| `web/vnc/` | 内置的 **noVNC** 静态资源（`core/`、`vendor/pako/`，MPL-2.0，见同目录 `LICENSE.txt`）+ 管理页 `viewer.html`；只有管理员会话能访问。 |
 
 ---
 
@@ -69,6 +85,8 @@
 ├── cloud.conf                       ← 默认配额（一行 default_quota=<字节>）
 ├── netctrl.conf                     ← 联网控制配置（一行 default=allow|deny + 每 MAC 一行 <mac>=allow|deny）
 ├── netctrl_backup/                  ← iptables-save 快照（接管/改动前自动备份，保留最近 20 份）
+├── agent_token.conf                 ← 客户机 agent 接入令牌（一行 token=<值>，后台可重置）
+├── agents.conf                      ← 每台客户机一行 <mac>$<网盘账号>$<挂载意图 0|1>
 ├── cloud/                           ← 网盘数据根
 │   ├── <用户名>/                    ← 每个用户的私有目录
 │   ├── _common/                     ← 通用文件（对所有账号只读展示为"通用文件"）
@@ -100,9 +118,18 @@
 | XFS/btrfs 文件系统 | 路线 A reflink 直出（不支持自动回退路线 B） |
 
 ### Python 依赖
-**纯标准库**（无第三方包）：`http.server`、`urllib.parse`、`subprocess`、`os`、`datetime`、`hashlib`、`threading`、`glob`、`time`、`re`、`secrets`、`html`、`ssl`、`tempfile`。
+**纯标准库**（无第三方包）：`http.server`、`urllib.parse`、`subprocess`、`os`、`datetime`、`hashlib`、`threading`、`glob`、`time`、`re`、`secrets`、`html`、`ssl`、`tempfile`、`json`、`socket`、`base64`、`struct`、`uuid`。
 
 > 注意：Windows 上可编译、可 import，但完整运行（tgt/qemu-nbd/modprobe）仅限 Linux。
+
+### 客户机侧依赖（客户端 agent，可选功能）
+| 依赖 | 用途 |
+|------|------|
+| Windows 10/11 | 编译用系统自带 `csc.exe`（免装 SDK）；运行用系统自带 .NET Framework 4.x（免装运行时） |
+| VNC 服务端（TightVNC / UltraVNC 等，可选） | 要用「VNC 控制」才需要，推荐装成 Windows 服务（可看登录界面） |
+| 浏览器（Chrome/Edge/Firefox） | 管理员看 VNC 画面用；普通用户的网盘页面仍是 IE11 兼容 |
+
+> `web/vnc/` 下的 noVNC 是唯一的前端第三方资源（MPL-2.0，随附 `LICENSE.txt`），只在管理员页加载。
 
 ---
 
@@ -130,7 +157,8 @@
 - **客户机的默认网关必须指向服务器 LAN 口 IP**（由 dnsmasq 下发 `option:router`）。这样客户机出外网的流量才会经过服务器的 FORWARD + MASQUERADE，按 MAC 的联网控制（NETCTRL）才有意义；网关留空则客户机不能上网，但无盘启动照常。
 - **服务器**：WAN 口接外网 / 上级路由（默认路由所在的网卡）；LAN 口接交换机，配静态 IP（示例 `10.1.1.1/24`）。脚本会自动探测网卡（带默认路由的=外网卡，另一张有 IPv4 且 UP 的=内网卡），多网卡或探测不准时用 `NETCTRL_LAN_IF` / `NETCTRL_WAN_IF` 显式指定。
 - 脚本启动时会开启 `net.ipv4.ip_forward=1`、关闭 IPv6 转发（客户机不分配 IPv6，防止绕过联网控制），并按配置清空 / 重建 FORWARD、POSTROUTING 规则。
-- 用到的端口：`67/udp` DHCP、`69/udp` TFTP（均由 dnsmasq 提供，只开在 LAN 口）、`5000/tcp` iPXE 供给、`8080/tcp` Web 后台、`3260/tcp` iSCSI。若服务器开了 ufw / firewalld，需在 LAN 口放行这些端口。
+- 用到的端口：`67/udp` DHCP、`69/udp` TFTP（均由 dnsmasq 提供，只开在 LAN 口）、`5000/tcp` iPXE 供给、`8080/tcp` Web 后台（同时承载客户机 agent 通道 `/agent/*`、网盘 WebDAV `/dav/` 与 VNC 的 WebSocket 桥 `/vnc/ws`）、`3260/tcp` iSCSI。若服务器开了 ufw / firewalld，需在 LAN 口放行这些端口。
+- 客户机 agent 与 VNC 都是**服务器主动连客户机**（VNC 桥连客户机 5900），所以客户机侧不需要放开任何入站端口给外网，只需允许来自服务器的连接。
 
 ### 2. 服务器准备与启动
 
@@ -141,10 +169,12 @@ apt install python3 tgt qemu-utils iproute2 iputils-arping util-linux dnsmasq ip
 # 3) 准备母盘目录并放入镜像
 mkdir -p /home/prts/server/images
 #    把 xxx.raw 母盘放进去（如 win11.raw）；母盘怎么做见下一节
-# 4) 给 LAN 口配静态 IP（示例，网卡名按实际改）
+# 4) 把仓库里的 web/ 目录放到主程序同目录（VNC 控制页要用内置 noVNC）
+#    目录结构：/home/prts/server/iscsi_broker.py + /home/prts/server/web/vnc/...
+# 5) 给 LAN 口配静态 IP（示例，网卡名按实际改）
 ip addr add 10.1.1.1/24 dev enp3s0
 ip link set enp3s0 up
-# 5) 启动（需 root）
+# 6) 启动（需 root）
 sudo python3 iscsi_broker.py
 ```
 
@@ -375,18 +405,39 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
 
 ### 5. Web 使用流程
 浏览器访问 `http://<服务器IP>:8080/`：
-- **管理员**：用户名 `admin` + 密码（默认 `admin123`，**部署前务必修改**）→ 管理后台（客户机名单 / 创建空白盘 / iSCSI 挂载 / 修改密码 / 用户与配额 / 默认配额 / 通用文件 / 联网控制）。
+- **管理员**：用户名 `admin` + 密码（默认 `admin123`，**部署前务必修改**）→ 管理后台（客户机名单 / 客户机控制 / 创建空白盘 / iSCSI 挂载 / 修改密码 / 用户与配额 / 默认配额 / 通用文件 / 联网控制）。
   - **iSCSI 挂载**页：选一张“空闲”的母盘点挂载 → 页面返回 IQN → 在任意机器上用 iSCSI 发起端连接该 IQN（服务器 IP:3260）即得到一块写直达母盘的可写盘；用完回后台点“卸载”。
+  - **客户机控制**页：远程关机 / 重启、启用停用 VNC（页内看画面）、给客户机指定网盘账号并挂载/卸载网盘（详见第七节）。
 - **普通用户**：先"注册账号"（用户名 + 密码）→ 登录 → 我的网盘：
   - 上传文件（单文件，受配额限制）、下载文件、新建文件夹；
   - 根目录可见"通用文件"文件夹（只读，内容由管理员维护）。
 
-> Web 页面兼容 IE11（零 JS / 仅 ES5、单文件上传、表格布局，无 flex/grid）。
+> 普通用户的页面（登录 / 注册 / 我的网盘）继续兼容 IE11（零 JS / 仅 ES5、表格布局、无 flex/grid）；
+> 管理员的「VNC 控制」页用内置 noVNC，需要现代浏览器（Chrome/Edge/Firefox）。
 
 ### 6. iPXE 使用流程
 1. 客户机从网络引导进入启动菜单，选择镜像 → 服务器生成叠加盘并返回 `sanboot iscsi:...` 指令 → 连盘启动。
 2. 菜单中选 **Admin Mode** → 提示输入用户名（必须是 `admin`）与密码 → 选择镜像以**回写模式**启动（直接写母盘）。
 3. 供给失败时（镜像被后台挂载 / 被别的客户机回写 / 母盘不存在 / 服务器空间不足等）会在屏幕上打印原因，稍候自动回到启动菜单，换一个镜像或去后台处理后可重试；回菜单后不会自动超时选默认镜像，需要手动选择。
+
+### 7. 客户机客户端（agent）
+客户机是无盘的，客户端要**做进母盘**（Admin 回写模式启动一次装好，之后所有普通模式启动的机器都自带）：
+
+1. 服务器后台「客户机控制」页拿**接入令牌**；
+2. 母盘里解出 `client/dist/iscsi-broker-agent.exe` + `agent.ini`（怎么编译见 `client/README.md`），
+   填 `url=http://<服务器IP>:8080` 与 `token=<接入令牌>`；要用 VNC 就在 `[vnc]` 里填 VNC 服务端的 exe 或服务名；
+3. 客户机里管理员执行 `iscsi-broker-agent.exe test` 确认配置，再 `iscsi-broker-agent.exe install`
+   （装成“开机以 SYSTEM 运行”的计划任务）；
+4. 之后在后台「客户机控制」页就能对该机 关机 / 重启 / 启用 VNC（页内看画面）/ 挂载网盘。
+
+要点：
+- agent **只主动外连**（每几秒一次心跳），不开放入站端口，指令随心跳下发、执行完回报；
+- 网盘挂载 = 服务器把个人网盘用 **WebDAV** 暴露（`/dav/`），agent 配好 Windows 的
+  WebDAV 重定向器（注册表 + WebClient 服务）后在交互用户会话里 `net use` 成盘符；
+  挂载意图记在服务器侧，客户机重启/重新登录后会自动挂回来；
+- 接入令牌同时用于 agent 通道和网盘 WebDAV 认证（用户名填 MAC），**客户机上不需要存网盘密码**；
+- 令牌等于控制权，只在内网用；怀疑泄漏可在后台一键重置（重置后各机要改 `agent.ini`）。
+- 详细部署、`agent.ini` 字段、排错命令见 `client/README.md`。
 
 ---
 
