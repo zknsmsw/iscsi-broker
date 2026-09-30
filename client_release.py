@@ -279,7 +279,9 @@ def _find_compiler():
         p = shutil.which(name)
         if p:
             return p
-    for p in (r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
+    # PATH 里没有时再试常见安装位置（有些发行版的 mono 不在服务进程的 PATH 里）
+    for p in ("/usr/bin/mcs", "/usr/local/bin/mcs", "/usr/bin/csc", "/usr/local/bin/csc",
+              r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
               r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"):
         if os.path.isfile(p):
             return p
@@ -288,6 +290,33 @@ def _find_compiler():
 
 def compiler_available():
     return bool(_find_compiler())
+
+
+def source_dir_candidates(base_dir=None):
+    """可能的客户端源码目录（按优先级）：显式传入 > 数据目录 client_src/ > client/。
+
+    为什么需要多个：程序通常装在 /opt/iscsi-broker（只有 .py + web/），而 git clone 出来的
+    源码在另一个目录；install.sh 会把 client/ 一起拷到程序目录，但老部署 / 从压缩包解压的
+    部署不一定有。管理员也可以把 Agent.cs 放到 <BASE_DIR>/client_src/ 让服务器编译。
+    """
+    out = []
+    if base_dir:
+        out.append(base_dir)
+    if _dir:
+        data_root = os.path.dirname(_dir)          # _dir 是 <BASE_DIR>/client_dist
+        out.append(os.path.join(data_root, "client_src"))
+    return out
+
+
+def find_source_dir(base_dir=None):
+    """找一个含 client/Agent.cs 的源码根目录；没有返回 ""。"""
+    cands = list(source_dir_candidates(base_dir))
+    # 程序自身所在目录（源码目录可能就在程序目录下）
+    cands.append(os.path.dirname(os.path.abspath(__file__)))
+    for c in cands:
+        if c and os.path.isfile(os.path.join(c, "client", "Agent.cs")):
+            return c
+    return ""
 
 
 def read_source_version(agent_cs):
@@ -306,14 +335,21 @@ def read_source_version(agent_cs):
 def build(source_dir, ver=None, notes=""):
     """用服务器上装的 C# 编译器编译 client/Agent.cs，收录成新版本。
 
-    source_dir：仓库根目录（client/Agent.cs 在其中）。
+    source_dir：源码根目录（其下有 client/Agent.cs）；传 ""/None 时自动在
+    <BASE_DIR>/client_src/ 与程序目录里找。
     返回 (ok, msg, ver)。编译失败/没编译器时 ok=False，msg 是给人看的说明。
     """
     _require_setup()
-    agent_cs = os.path.join(source_dir, "client", "Agent.cs")
-    icon = os.path.join(source_dir, "client", "agent.ico")
-    if not os.path.isfile(agent_cs):
-        return False, "找不到客户端源码：%s" % agent_cs, ""
+    root = source_dir if (source_dir and os.path.isfile(os.path.join(source_dir, "client", "Agent.cs"))) \
+        else find_source_dir(source_dir)
+    if not root:
+        tried = "、".join(source_dir_candidates(source_dir) + [os.path.dirname(os.path.abspath(__file__))])
+        return (False, "服务器上找不到客户端源码 client/Agent.cs（找过：%s）。"
+                       "可以在服务器上跑 install.sh 把 client/ 一起装好、或把 Agent.cs 放到 "
+                       "<数据目录>/client_src/、或直接在 Windows 上跑 client\\build.bat 后在后台上传 exe"
+               % tried, "")
+    agent_cs = os.path.join(root, "client", "Agent.cs")
+    icon = os.path.join(root, "client", "agent.ico")
     cc = _find_compiler()
     if not cc:
         return (False, "服务器上没有 C# 编译器（mono-mcs / csc），无法在这里编译；"

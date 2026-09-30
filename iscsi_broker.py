@@ -2755,8 +2755,10 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                  + '</table>')
         msg_html = ''
         if msg:
-            cls = 'err' if ("失败" in msg or "不在线" in msg or "不合法" in msg
-                            or "请先" in msg or "已满" in msg) else 'ok'
+            # 提示颜色：明确以“失败：”开头的（编译/上传/删除等）一定是错误，不要显示成绿色成功
+            cls = 'err' if (msg.startswith("失败") or "失败" in msg or "不在线" in msg
+                            or "不合法" in msg or "请先" in msg or "已满" in msg
+                            or "找不到" in msg) else 'ok'
             msg_html = '<p class="' + cls + '">' + html.escape(msg) + '</p>'
         tok = agent_hub.token()
         body = (
@@ -2882,6 +2884,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             return
         if action in ("build_release", "drop_release"):
             if action == "build_release":
+                # 传程序所在目录：源码与程序同目录（install.sh 会把 client/ 一起装上）时能找到；
+                # 找不到时 client_release 还会去 <数据目录>/client_src/，并给出可操作的提示
                 ok, msg, _ver = client_release.build(
                     os.path.dirname(os.path.abspath(__file__)),
                     ver=(form.get("ver", [""])[0] or "").strip() or None)
@@ -2891,7 +2895,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                     ok, msg = True, "已删除该发布版本"
                 except client_release.ReleaseError as e:
                     ok, msg = False, str(e)
-            self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
+            self._redirect("/web/clients?msg=" + urllib.parse.quote(("" if ok else "失败：") + msg, safe=""))
             return
         mac = form.get("mac", [""])[0]
         if action == "set_account":

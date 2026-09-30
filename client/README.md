@@ -165,10 +165,15 @@ letter=Z                    ; 网盘映射到哪个盘符
   `<exe目录>\agent-update.log`。同版本也可以「强制重装」（修坏掉的 exe）。
   服务端发布新版的两条路（后台「客户机控制」页 →「客户端发布」卡片）：
   1. **上传**：在 Windows 上跑 `client\build.bat`，把 `dist\iscsi-broker-agent.exe` 传上去；
-  2. **服务器自己编译**：服务器装了 mono 的 `mcs`/`csc` 时，可以直接点「编译当前源码并发布」
-     （拉到最新代码后一键出新版），也可以用命令行：
+  2. **服务器自己编译**：服务器上有 C# 编译器（Debian/Ubuntu `apt install mono-mcs`，
+     Fedora/RHEL `dnf install mono-devel`）时，可以直接点「编译当前源码并发布」
+     （`git pull` 后一键出新版），也可以用命令行：
      `python3 iscsi_broker.py --build-client [--client-ver 1.1]`、
      `python3 iscsi_broker.py --publish-client <exe> [--client-ver 1.1]`。
+     编译需要 `client/Agent.cs`：`install.sh` 会把它一起装到程序目录
+     （`/opt/iscsi-broker/client/Agent.cs`）；如果服务器上没有这份源码（比如程序是手工拷的、
+     或部署早于这个功能），把 `Agent.cs` 与 `agent.ico` 放进 `<数据目录>/client_src/` 即可，
+     服务器也会去那里找；实在都没有就只能走上面的“上传”。
 
   > **无盘客户机的注意点**：普通 PXE 客户机每次开机都是母盘 + 全新叠加盘，客户机里
   > 替换掉的 exe **不会保留到下次开机**（回写模式的客户机才会落盘）。所以对无盘机来说，
