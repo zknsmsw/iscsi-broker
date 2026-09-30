@@ -961,6 +961,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/boot.ipxe":
             host = self.headers['Host']
             images = list_images()
+            # 出错后回到菜单时不带 --timeout：带超时的话默认镜像每 15 秒会被自动重试一次，
+            # 一直卡在“报错 → 回菜单 → 超时又报错”的循环里（不带超时则等用户按键）。
+            no_timeout = params.get("notimeout", [""])[0] == "1"
 
             if not images:
                 # 没有任何母盘时，给出明确提示而不是生成空菜单
@@ -975,10 +978,10 @@ class Handler(BaseHTTPRequestHandler):
                 for img in images:
                     lines.append(f"item {img} {img}")
                 lines.append("item admin_mode Admin Mode (password required)")
-                lines.append(
-                    f"choose --default {default_img} --timeout 15000 target "
-                    f"|| goto cancel"
-                )
+                choose_opts = f"--default {default_img} "
+                if not no_timeout:
+                    choose_opts += "--timeout 15000 "
+                lines.append(f"choose {choose_opts}target || goto cancel")
                 lines.append("goto ${target}")
                 for img in images:
                     lines.append(f":{img}")
@@ -997,9 +1000,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/prov":
+            host = self.headers['Host']
             mac = params.get("mac", ["unknown"])[0].replace(":", "").strip().lower()
             if mac == "unknown":
-                self.send_error(400)
+                self._fail_to_menu(host, "Client MAC missing in request.")
                 return
 
             # 联网控制：客户机开机（PXE 请求供给）即确保/覆写其转发规则
@@ -1015,7 +1019,7 @@ class Handler(BaseHTTPRequestHandler):
             if not os.path.isfile(base_img):
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{now}] [ERROR] Image not found for {mac}: {base_img}")
-                self.send_error(404, f"Image '{img_name}' not found")
+                self._fail_to_menu(host, f"Image '{img_name}' not found on server.")
                 return
 
             server_ip = self.headers.get('Host', '').split(':')[0]
@@ -1036,7 +1040,7 @@ class Handler(BaseHTTPRequestHandler):
                     wb_owner = writeback_active.get(img_name)
                 if wb_owner:
                     print(f"[{now}] [ERROR] {mac}: image {img_name} is in write-back use by {wb_owner}, refuse")
-                    self.send_error(503, f"Image {img_name} is in write-back use by {wb_owner}")
+                    self._fail_to_menu(host, f"Image {img_name} is in write-back use by {wb_owner}. Please try again later.")
                     return
 
                 # 后台手动挂载互斥：母盘正被后台导出（外部 iSCSI 发起端在写盘）时，
@@ -1045,14 +1049,14 @@ class Handler(BaseHTTPRequestHandler):
                     exported_iqn = web_exported.get(img_name, {}).get("iqn")
                 if exported_iqn:
                     print(f"[{now}] [ERROR] {mac}: image {img_name} is manually exported ({exported_iqn}), refuse")
-                    self.send_error(503, f"Image {img_name} is manually exported via web; unmount it in admin UI first")
+                    self._fail_to_menu(host, f"Image {img_name} is manually exported via web ({exported_iqn}). Unmount it in web admin first.")
                     return
 
                 try:
                     ensure_overlay_space()
                 except Exception as e:
                     print(f"[{now}] [ERROR] {mac}: {e}")
-                    self.send_error(503, str(e))
+                    self._fail_to_menu(host, str(e))
                     return
 
                 try:
@@ -1140,7 +1144,7 @@ class Handler(BaseHTTPRequestHandler):
                     subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "delete",
                                     "--force", "--tid", str(tid)],
                                    stderr=subprocess.DEVNULL, timeout=3)
-                    self.send_error(500)
+                    self._fail_to_menu(host, f"Boot failed: {e}")
             return
 
         # ================== 管理员模式 ==================
@@ -1168,15 +1172,15 @@ class Handler(BaseHTTPRequestHandler):
             user = params.get("user", [""])[0]
             pwd = params.get("pwd", [""])[0]
             if user != "admin":
-                self._admin_denied(host, "Admin account required!")
+                self._fail_to_menu(host, "Admin account required!")
                 return
             if admin_ratelimited(self.client_address[0]):
                 time.sleep(1)
-                self._admin_denied(host, "Too many attempts, try again later!")
+                self._fail_to_menu(host, "Too many attempts, try again later!")
                 return
             if users_auth.check_login(user, pwd) != "admin":
                 time.sleep(1)
-                self._admin_denied(host, "Wrong password!")
+                self._fail_to_menu(host, "Wrong password!")
                 return
             tok = admin_token_issue(mac)
             self._admin_wb_menu(host, mac, tok)
@@ -1188,7 +1192,7 @@ class Handler(BaseHTTPRequestHandler):
             mac = params.get("mac", [""])[0].replace(":", "").strip().lower()
             tok = params.get("tok", [""])[0]
             if not admin_token_ok(mac, tok):
-                self._admin_denied(host, "Invalid or expired admin token!")
+                self._fail_to_menu(host, "Invalid or expired admin token!")
                 return
             self._admin_wb_menu(host, mac, tok)
             return
@@ -1208,24 +1212,24 @@ class Handler(BaseHTTPRequestHandler):
             if not mac or not admin_token_ok(mac, tok):
                 now_dbg = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{now_dbg}] [ERROR] wb_prov denied: mac={mac!r} tok_len={len(tok)} img={img_name!r}")
-                self._admin_denied(host, "Invalid or expired admin token!")
+                self._fail_to_menu(host, "Invalid or expired admin token!")
                 return
             base_img = os.path.join(IMAGES_DIR, f"{img_name}.raw")
             if not img_name or not os.path.isfile(base_img):
-                self._admin_denied(host, f"Image not found: {img_name}")
+                self._fail_to_menu(host, f"Image not found: {img_name}")
                 return
             lock = get_mac_lock(mac)
             with lock:
                 with global_lock:
                     owner = writeback_active.get(img_name)
                 if owner not in (None, mac):
-                    self._admin_denied(host, f"Image {img_name} is in write-back use by {owner}. Please try again later.")
+                    self._fail_to_menu(host, f"Image {img_name} is in write-back use by {owner}. Please try again later.")
                     return
                 # 后台手动挂载互斥：该母盘正被后台导出（外部发起端写盘）时禁止回写
                 with global_lock:
                     exported_iqn = web_exported.get(img_name, {}).get("iqn")
                 if exported_iqn:
-                    self._admin_denied(host, f"Image {img_name} is manually exported via web ({exported_iqn}). Unmount it in web admin first.")
+                    self._fail_to_menu(host, f"Image {img_name} is manually exported via web ({exported_iqn}). Unmount it in web admin first.")
                     return
                 # 提示性告警：其他客户机仍持有该母盘的叠加盘时回写，旧叠加盘将保持快照状态
                 with global_lock:
@@ -1242,7 +1246,7 @@ class Handler(BaseHTTPRequestHandler):
                     ensure_overlay_space()
                 except Exception as e:
                     print(f"[{now}] [ERROR] {mac}: {e}")
-                    self._admin_denied(host, f"Server disk space low: {e}")
+                    self._fail_to_menu(host, f"Server disk space low: {e}")
                     return
                 try:
                     # 清掉该 mac 上一次占用的所有资源
@@ -1278,7 +1282,7 @@ class Handler(BaseHTTPRequestHandler):
                     mac_state.pop(mac, None)
                     with global_lock:
                         writeback_active.pop(img_name, None)
-                    self.send_error(500)
+                    self._fail_to_menu(host, f"Write-back boot failed: {e}")
             return
 
         self.send_error(404)
@@ -1327,15 +1331,22 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return verify_password(pwd, stored)
 
-    def _admin_denied(self, host, msg):
-        """密码错误/操作被拒时返回提示脚本，稍候自动回到启动菜单。
+    def _fail_to_menu(self, host, msg):
+        """供给失败（密码错误 / 镜像被占用 / 空间不足等）时返回提示脚本，稍候自动回到启动菜单。
+
+        必须用 HTTP 200 + iPXE 脚本，不能用 send_error()：非 2xx 会让 iPXE 的 `chain`
+        直接失败，触发引导脚本里的 `|| goto cancel` 掉进 iPXE shell——客户机只看到一句
+        报错，既看不到原因也回不到菜单（管理员回写模式与普通叠加模式必须表现一致）。
+
+        回菜单时带 notimeout=1：否则默认镜像会在菜单超时后被自动重试，一直循环报错。
         不用 prompt --key：新版 iPXE 要求 --key 必须带参数（等特定键码），
         不带直接报 "Option 'key' requires an argument" 并中断脚本。"""
+        safe = "".join(c for c in msg if c not in "\r\n")[:200]   # 防消息里的换行拆出额外 iPXE 命令
         self._serve_script(
             "#!ipxe\n"
-            f"echo {msg}\n"
+            f"echo {safe}\n"
             "sleep 2\n"
-            f"chain {self._scheme()}://{host}/boot.ipxe || goto cancel\n"
+            f"chain {self._scheme()}://{host}/boot.ipxe?notimeout=1 || goto cancel\n"
             ":cancel\n"
             "shell\n"
         )
