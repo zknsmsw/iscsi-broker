@@ -182,6 +182,7 @@ sudo bash install.sh
 sudo bash install.sh --base-dir /data/server     # 数据根目录（母盘/网盘/配置），默认 /home/prts/server
 sudo bash install.sh --install-dir /opt/broker   # 程序目录，默认 /opt/iscsi-broker
 sudo bash install.sh --no-deps --no-start        # 只装文件+注册服务，不装依赖、不启动
+sudo bash install.sh -y                          # 所有询问自动答“是”（无人值守）
 sudo bash install.sh --uninstall                 # 停止并卸载服务（数据目录保留）
 ```
 
@@ -201,6 +202,30 @@ systemctl restart iscsi-broker     # 重启（会重新清理遗留 target/叠�
 ```bash
 cd iscsi-broker && git pull && sudo bash install.sh --no-deps
 ```
+
+升级时脚本会：沿用原来写好的数据目录（`/etc/iscsi-broker/iscsi-broker.env`）→ 把旧程序目录备份到
+`/opt/iscsi-broker.bak` → 重新拷程序 → 重启服务。**数据目录（母盘/网盘/账号配置）不会被改动。**
+
+回滚到上一个版本：
+
+```bash
+sudo rm -rf /opt/iscsi-broker && sudo mv /opt/iscsi-broker.bak /opt/iscsi-broker
+sudo systemctl restart iscsi-broker
+```
+
+**已经用老办法部署过（手跑 `python3 iscsi_broker.py`、或把 `BASE_DIR` 直接改在源码里）**
+
+不要直接 `git pull`（源码被改过会冲突、手跑的实例和新服务会抢 5000/8080 端口）。按这个顺序迁移：
+
+```bash
+# 1) 进旧目录（有 iscsi_broker.py 的地方），先跑一次新安装脚本，让它接管：
+sudo bash install.sh -y            # 探测旧数据目录 → 停旧实例 → 备份旧程序 → 装 /opt → 起 systemd
+# 2) 旧目录里的本地改动已经没用了（数据目录已写进 /etc/iscsi-broker/iscsi-broker.env）：
+git checkout -- iscsi_broker.py    # 之后 git pull 就不会再冲突
+```
+
+脚本会自动找出数据目录（顺序：`/etc/iscsi-broker/*.env` → 正在运行的实例 → 旧源码里写死的
+`BASE_DIR`）；认错了就用 `--base-dir` 显式指定，数据目录里的东西不会被改动。
 
 数据目录会被设为 `0700`（里面是密码哈希、网盘数据）；`--base-dir` 指向已有共享目录前请留意这点。
 

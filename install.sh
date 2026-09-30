@@ -37,7 +37,11 @@ DO_TFTP=1
 DO_START=1
 DO_UNINSTALL=0
 DO_PURGE=0
+ASSUME_YES=0
+BASE_DIR_GIVEN=0
 PY_BIN=""
+LEGACY_BASE=""       # 从旧部署里探测到的数据目录
+LEGACY_SRC=""        # 旧部署的程序目录/源码位置
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROG_FILES=(iscsi_broker.py users_auth.py cloud_store.py netctrl.py agent_hub.py webdav.py wsbridge.py)
@@ -53,17 +57,25 @@ die()  { echo "${c_err}[FAIL]${c_end} $*" >&2; exit 1; }
 usage() {
   cat <<'EOF'
 用法：sudo bash install.sh [参数]
-  --base-dir DIR     数据根目录（母盘/网盘/配置放这里），默认 /home/prts/server
+  首次安装和升级都用这一条：已经装过就自动按“升级”处理（沿用原数据目录、备份旧程序、重启服务）。
+
+  --base-dir DIR     数据根目录（母盘/网盘/配置放这里）。不写的话：先读 /etc/iscsi-broker/*.env，
+                     再探测旧部署源码/正在运行的实例，最后才用默认 /home/prts/server
   --install-dir DIR  程序安装目录，默认 /opt/iscsi-broker
-  --no-deps          跳过依赖安装
+  --no-deps          跳过依赖安装（升级时常用：sudo bash install.sh --no-deps）
   --no-tftp          不往 TFTP 目录复制 iPXE 引导文件
   --no-start         只注册服务，不立即启动
+  -y | --yes         所有询问都自动回答“是”（无人值守）
   --uninstall        停止并卸载服务（数据目录保留）
   --purge            卸载并删除程序目录（数据目录仍保留）
   -h | --help        显示本帮助
 
-装完后还需要手动做：放母盘 .raw、配 dnsmasq 的 DHCP/TFTP、给客户机母盘装客户端 agent
-（分别见 README 第五节 3/4/7 与 client/README.md）。
+升级/迁移：
+  升级：cd 仓库 && git pull && sudo bash install.sh --no-deps
+  接管旧部署（源码里手改过 BASE_DIR、进程是手跑的）：在旧目录直接跑一次本脚本，
+      它会抓出旧数据目录、停掉旧进程、备份旧程序，然后交给 systemd 统一管理。
+      跑完建议执行：git checkout -- iscsi_broker.py   （数据目录已写进 env 文件，源码不用再改）
+  回滚：rm -rf /opt/iscsi-broker && mv /opt/iscsi-broker.bak /opt/iscsi-broker && systemctl restart iscsi-broker
 EOF
   exit 0
 }
@@ -71,11 +83,12 @@ EOF
 # ---------------- 参数 ----------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base-dir)    BASE_DIR="${2:-}"; shift 2;;
+    --base-dir)    BASE_DIR="${2:-}"; BASE_DIR_GIVEN=1; shift 2;;
     --install-dir) INSTALL_DIR="${2:-}"; shift 2;;
     --no-deps)     DO_DEPS=0; shift;;
     --no-tftp)     DO_TFTP=0; shift;;
     --no-start)    DO_START=0; shift;;
+    -y|--yes)      ASSUME_YES=1; shift;;
     --uninstall)   DO_UNINSTALL=1; shift;;
     --purge)       DO_UNINSTALL=1; DO_PURGE=1; shift;;
     -h|--help)     usage;;
@@ -165,6 +178,177 @@ check_python() {
   "$PY_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' \
     || die "python3 版本太低：$ver，需要 3.10+"
   ok "Python：$PY_BIN（$ver）"
+}
+
+# ---------------- 已装/旧部署探测（升级与迁移用） ----------------
+confirm() {
+  [[ $ASSUME_YES -eq 1 ]] && return 0
+  [[ -t 0 ]] || return 1
+  local ans=""
+  read -r -p "$1 [y/N] " ans
+  [[ "$ans" =~ ^[Yy]$ ]]
+}
+
+base_dir_from_file() {
+  # 老部署是把 BASE_DIR 直接写在源码里的（形如 BASE_DIR = "/xxx"），这里抓出来；
+  # 新源码写的是 BASE_DIR = _resolve_base_dir()，没有引号字面量，所以不会误抓。
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  sed -n 's/^[[:space:]]*BASE_DIR[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -1
+}
+
+env_file_base_dir() {
+  [[ -r "$ENV_FILE" ]] || return 0
+  sed -n 's/^[[:space:]]*ISCSI_BROKER_BASE_DIR[[:space:]]*=[[:space:]]*\(.*\)$/\1/p' "$ENV_FILE" \
+    | head -1 | tr -d '"' | tr -d "'"
+}
+
+proc_script() {
+  # 进程命令行里的 iscsi_broker.py 路径
+  local pid="$1"
+  tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null | grep 'iscsi_broker\.py$' | head -1
+}
+
+running_brokers() {
+  # 输出 "pid<TAB>脚本路径"（脚本路径可能为空）；永远返回 0，避免 set -e 把安装中断
+  local pid script
+  if command -v pgrep >/dev/null 2>&1; then
+    for pid in $(pgrep -f 'iscsi_broker\.py' 2>/dev/null || true); do
+      [[ "$pid" == "$$" ]] && continue
+      script="$(proc_script "$pid")"
+      printf '%s\t%s\n' "$pid" "$script"
+    done
+  else
+    ps -eo pid=,args= 2>/dev/null | grep '[i]scsi_broker\.py' | while read -r pid rest; do
+      printf '%s\t%s\n' "$pid" "$(echo "$rest" | tr ' ' '\n' | grep 'iscsi_broker\.py$' | head -1)"
+    done
+  fi
+  return 0
+}
+
+foreign_units() {
+  # 引用了 iscsi_broker.py 的 systemd 单元（排除我们自己的）
+  local f
+  for f in /etc/systemd/system/*.service /etc/systemd/system/*/*.service; do
+    [[ -f "$f" ]] || continue
+    [[ "$(basename "$f")" == "$UNIT_NAME" ]] && continue
+    if grep -qs 'iscsi_broker\.py' "$f"; then basename "$f"; fi
+  done
+}
+
+detect_legacy() {
+  local e pid script base
+  e="$(env_file_base_dir)"
+  if [[ -n "$e" ]]; then
+    LEGACY_BASE="$e"; LEGACY_SRC="$INSTALL_DIR"
+    msg "检测到已安装（存在 $ENV_FILE）：数据目录 $e —— 按“升级”处理，数据不动"
+    return 0
+  fi
+  # 从正在跑的旧实例上抓它的数据目录
+  while IFS=$'\t' read -r pid script; do
+    [[ -n "${pid:-}" ]] || continue
+    if [[ -z "${script:-}" && -d "/proc/$pid" ]]; then
+      script="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)/iscsi_broker.py"
+    fi
+    base="$(base_dir_from_file "$script")"
+    if [[ -n "$base" && -z "$LEGACY_BASE" ]]; then
+      LEGACY_BASE="$base"; LEGACY_SRC="$(dirname "$script")"
+    fi
+  done < <(running_brokers)
+  # 再扫常见位置里“老源码”写死的 BASE_DIR（含你现在这个 clone）
+  if [[ -z "$LEGACY_BASE" ]]; then
+    for script in "$SRC_DIR/iscsi_broker.py" "$INSTALL_DIR/iscsi_broker.py" \
+                  /root/iscsi-broker/iscsi_broker.py /opt/iscsi-broker/iscsi_broker.py; do
+      base="$(base_dir_from_file "$script")"
+      if [[ -n "$base" ]]; then
+        LEGACY_BASE="$base"; LEGACY_SRC="$(dirname "$script")"
+        break
+      fi
+    done
+  fi
+  if [[ -n "$LEGACY_BASE" ]]; then
+    msg "检测到旧部署（$LEGACY_SRC）：数据目录 $LEGACY_BASE —— 会接管并沿用它"
+  fi
+}
+
+resolve_base_dir() {
+  if [[ $BASE_DIR_GIVEN -eq 1 ]]; then
+    msg "数据目录（--base-dir 指定）：$BASE_DIR"
+  elif [[ -n "$LEGACY_BASE" ]]; then
+    BASE_DIR="$LEGACY_BASE"
+    msg "沿用已有数据目录：$BASE_DIR（升级/接管不会动里面的数据）"
+  else
+    msg "没探测到已有安装，使用默认数据目录：$BASE_DIR"
+    if [[ ! -d "$BASE_DIR" ]]; then
+      warn "该目录不存在，会新建。若你的母盘/网盘在别处，请用 --base-dir 指定，例如："
+      warn "    sudo bash install.sh --base-dir /你的/实际/数据目录"
+    fi
+  fi
+}
+
+warn_dirty_source() {
+  command -v git >/dev/null 2>&1 || return 0
+  [[ -d "$SRC_DIR/.git" ]] || return 0
+  if ! git -C "$SRC_DIR" diff --quiet -- iscsi_broker.py 2>/dev/null; then
+    if git -C "$SRC_DIR" diff -- iscsi_broker.py 2>/dev/null | grep -q 'BASE_DIR'; then
+      warn "本目录的 iscsi_broker.py 把 BASE_DIR 改在源码里了（老部署常见做法）。"
+      warn "数据目录已经写进 $ENV_FILE，装完后建议执行下面这条，以后 git pull 才不会冲突："
+      warn "    git -C $SRC_DIR checkout -- iscsi_broker.py"
+    else
+      warn "本目录源码有未提交改动（升级前建议先 git stash 或提交，免得 git pull 冲突）"
+    fi
+  fi
+}
+
+stop_old_instances() {
+  local units unit rows pid
+  units="$(foreign_units)"
+  if [[ -n "$units" ]]; then
+    warn "发现别的 systemd 单元也在跑本程序（会和新服务抢 5000/8080 端口）："
+    echo "$units" | sed 's/^/         /'
+    if confirm "停用并删除这些单元，统一交给 $UNIT_NAME 管理？"; then
+      for unit in $units; do
+        systemctl stop "$unit" 2>/dev/null || true
+        systemctl disable "$unit" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$unit"
+        ok "已停用并删除 $unit"
+      done
+      command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
+    else
+      warn "保留这些单元：请自己确认它们不会和新服务同时跑"
+    fi
+  fi
+  rows="$(running_brokers || true)"
+  [[ -n "$rows" ]] || return 0
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+    msg "旧实例由 $UNIT_NAME 管理，稍后 restart 会替换掉它"
+    return 0
+  fi
+  warn "发现正在运行的 iscsi_broker.py 进程（不是 systemd 管理的）："
+  echo "$rows" | sed 's/^/         /'
+  if confirm "现在停掉它们（否则新服务起不来）？"; then
+    while IFS=$'\t' read -r pid _rest; do
+      [[ -n "${pid:-}" ]] && kill "$pid" 2>/dev/null || true
+    done <<< "$rows"
+    sleep 2
+    while IFS=$'\t' read -r pid _rest; do
+      [[ -n "${pid:-}" ]] && kill -9 "$pid" 2>/dev/null || true
+    done <<< "$rows"
+    ok "已停止旧实例"
+  else
+    warn "没停旧实例：新服务可能因端口被占用而起不来"
+  fi
+}
+
+backup_prev() {
+  [[ -f "$INSTALL_DIR/iscsi_broker.py" ]] || return 0
+  local bak="$INSTALL_DIR.bak"
+  rm -rf "$bak"
+  if cp -a "$INSTALL_DIR" "$bak"; then
+    ok "已备份旧程序目录到 $bak（回滚：rm -rf $INSTALL_DIR && mv $bak $INSTALL_DIR && systemctl restart $UNIT_NAME）"
+  else
+    warn "备份旧程序目录失败，继续安装"
+  fi
 }
 
 # ---------------- 安装/卸载 ----------------
@@ -321,6 +505,7 @@ print_summary() {
   echo "${c_ok}========================================${c_end}"
   echo " 程序目录   : $INSTALL_DIR"
   echo " 数据目录   : $BASE_DIR  （母盘放 $BASE_DIR/images/）"
+  [[ -d "$INSTALL_DIR.bak" ]] && echo " 旧版本备份 : $INSTALL_DIR.bak（回滚方法见 install.sh --help）"
   echo " 服务名     : $UNIT_NAME（开机自启）"
   echo " 常用命令   : systemctl status|restart|stop $UNIT_NAME"
   echo "              journalctl -u $UNIT_NAME -f"
@@ -346,9 +531,14 @@ detect_distro
 if [[ $DO_UNINSTALL -eq 1 ]]; then
   do_uninstall
 fi
-echo "${c_info}== iSCSI Broker 安装 ==${c_end}  源码目录：$SRC_DIR"
+echo "${c_info}== iSCSI Broker 安装/升级 ==${c_end}  源码目录：$SRC_DIR"
 install_deps
 check_python
+detect_legacy
+resolve_base_dir
+warn_dirty_source
+stop_old_instances
+backup_prev
 install_files
 prepare_data_dir
 write_env_file
