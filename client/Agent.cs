@@ -542,12 +542,23 @@ namespace IscsiBrokerAgent
                 si.lpDesktop = "winsta0\\default";
                 PROCESS_INFORMATION pi;
                 string cmd = "\"" + exe + "\"" + (arguments.Length > 0 ? " " + arguments : "");
-                if (!CreateProcessAsUser(hDup, null, cmd, IntPtr.Zero, IntPtr.Zero, false,
-                                         CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-                                         IntPtr.Zero, null, ref si, out pi))
+                // 用目标用户的用户环境块：否则子进程继承的是 SYSTEM 的环境（TEMP=Windows\Temp 等），
+                // 托盘里 net use / explorer / 临时文件都会踩坑
+                IntPtr env = IntPtr.Zero;
+                bool haveEnv = CreateEnvironmentBlock(out env, hDup, false);
+                try
                 {
-                    err = "CreateProcessAsUser 失败（错误码 " + Marshal.GetLastWin32Error() + "）";
-                    return 0;
+                    if (!CreateProcessAsUser(hDup, null, cmd, IntPtr.Zero, IntPtr.Zero, false,
+                                             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
+                                             haveEnv ? env : IntPtr.Zero, null, ref si, out pi))
+                    {
+                        err = "CreateProcessAsUser 失败（错误码 " + Marshal.GetLastWin32Error() + "）";
+                        return 0;
+                    }
+                }
+                finally
+                {
+                    if (haveEnv && env != IntPtr.Zero) DestroyEnvironmentBlock(env);
                 }
                 CloseHandle(pi.hThread);
                 CloseHandle(pi.hProcess);
@@ -617,7 +628,8 @@ namespace IscsiBrokerAgent
             }
         }
 
-        /// <summary>Windows 的 WebDAV 重定向器（WebClient 服务）是否在运行。挂 Z 盘前必须为真。</summary>
+        /// <summary>Windows 的 WebDAV 重定向器（WebClient 服务）是否在运行。</summary>
+        // 返回 false 且 info 非空 = 确认没在跑；info 为空 = 查不到（别据此下结论）。
         private static bool WebClientRunning(out string info)
         {
             string outp;
@@ -809,9 +821,13 @@ namespace IscsiBrokerAgent
             if (rc == 0) { msg = "已挂载 " + _letter + ": → " + url; return true; }
             msg = "net use 失败(rc=" + rc + ")：" + outp;
             string wc;
-            if (!WebClientRunning(out wc))
+            bool wcRun = WebClientRunning(out wc);
+            if (!wcRun && wc.Trim().Length > 0)
                 msg += "  [提示] Windows 的 WebDAV 重定向器（WebClient 服务）没在运行，"
                      + "报“找不到网络名”就是这个原因；请以管理员执行：net start WebClient";
+            else if (!wcRun)
+                msg += "  [提示] 连 WebClient 服务状态都查不到（命令输出为空），"
+                     + "请确认托盘进程是以登录用户身份运行、且有临时目录写权限";
             return false;
         }
 
@@ -1054,7 +1070,10 @@ namespace IscsiBrokerAgent
         private static string CmdOutFile()
         {
             if (_cmdOutFile == null)
-                _cmdOutFile = Path.Combine(Path.GetTempPath(), "iscsi-broker-agent-cmd.txt");
+                // 每个进程一个文件名：SYSTEM 进程和用户会话里的托盘进程会各跑各的，
+                // 共用一个文件会出现“SYSTEM 建的文件用户覆盖不了 → 输出全丢”的情况
+                _cmdOutFile = Path.Combine(Path.GetTempPath(),
+                    "iscsi-broker-agent-cmd-" + Process.GetCurrentProcess().Id + ".txt");
             return _cmdOutFile;
         }
 
@@ -1249,5 +1268,12 @@ namespace IscsiBrokerAgent
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool FreeConsole();
+
+        [DllImport("userenv.dll", SetLastError = true)]
+        private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken,
+                                                          bool bInherit);
+
+        [DllImport("userenv.dll", SetLastError = true)]
+        private static extern bool DestroyEnvironmentBlock(IntPtr lpEnvironment);
     }
 }
