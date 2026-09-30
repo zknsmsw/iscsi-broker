@@ -591,13 +591,39 @@ namespace IscsiBrokerAgent
                     }
                 }
                 string outp;
-                RunShell("sc config WebClient start= demand", 10000, out outp);
-                RunShell("net start WebClient", 20000, out outp);
+                // 设成自动启动：Windows 默认是"手动"，开机后 WebClient 一直是 STOPPED，
+                // 这时 net use http://… 就报“系统错误 67 找不到网络名”，Z 盘自然挂不上。
+                int rc1 = RunShell("sc config WebClient start= auto", 10000, out outp);
+                Log("WebClient: sc config start=auto rc=" + rc1 + " " + outp.Replace("\r\n", " "));
+                string state;
+                if (WebClientRunning(out state))
+                {
+                    Log("WebClient: 服务在运行，WebDAV 盘可以挂载");
+                }
+                else
+                {
+                    int rc2 = RunShell("net start WebClient", 20000, out outp);
+                    Log("WebClient: net start rc=" + rc2 + " " + outp.Replace("\r\n", " "));
+                    if (!WebClientRunning(out state))
+                        Log("WebClient: 服务仍不是 RUNNING —— Z 盘会挂不上（net use 报“找不到网络名”）。"
+                            + "请以管理员在客户机上执行 net start WebClient 排查：" + state.Replace("\r\n", " "));
+                }
             }
             catch (Exception e)
             {
                 Log("配置 WebClient 失败（可能不影响已配好的机器）：" + e.Message);
+                Log("→ 这一般是因为进程不是 SYSTEM 身份（手动双击运行就是这样）："
+                    + "写 HKLM 和拉起用户会话托盘都需要 SYSTEM，请用 install 装的计划任务启动。");
             }
+        }
+
+        /// <summary>Windows 的 WebDAV 重定向器（WebClient 服务）是否在运行。挂 Z 盘前必须为真。</summary>
+        private static bool WebClientRunning(out string info)
+        {
+            string outp;
+            int rc = RunShell("sc query WebClient", 10000, out outp);
+            info = outp;
+            return rc == 0 && outp.IndexOf("RUNNING", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         // ---------------- VNC ----------------
@@ -724,9 +750,16 @@ namespace IscsiBrokerAgent
                 UpdateTrayMenu();
                 Remount();                                // 开机先挂只读公共盘
                 PostStatus();
+                int tick = 0;
                 System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
                 timer.Interval = 20000;
-                timer.Tick += delegate { PostStatus(); };
+                timer.Tick += delegate
+                {
+                    PostStatus();
+                    tick++;
+                    // 挂载失败过（WebClient 还没起来、网络还没通等）就每分钟自动重试一次
+                    if (!_mountOk && (tick % 3) == 0) Remount();
+                };
                 timer.Start();
                 Application.Run();                        // 跑消息循环，直到“退出托盘”
                 _trayIcon.Visible = false;
@@ -775,6 +808,10 @@ namespace IscsiBrokerAgent
             _mountOk = (rc == 0);
             if (rc == 0) { msg = "已挂载 " + _letter + ": → " + url; return true; }
             msg = "net use 失败(rc=" + rc + ")：" + outp;
+            string wc;
+            if (!WebClientRunning(out wc))
+                msg += "  [提示] Windows 的 WebDAV 重定向器（WebClient 服务）没在运行，"
+                     + "报“找不到网络名”就是这个原因；请以管理员执行：net start WebClient";
             return false;
         }
 
