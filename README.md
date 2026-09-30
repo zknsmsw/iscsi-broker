@@ -172,16 +172,34 @@ cd iscsi-broker
 sudo bash install.sh
 ```
 
-它会：按发行版装依赖（Debian/Ubuntu/Fedora/RHEL/openSUSE/Arch 自动识别）→ 把程序装到
-`/opt/iscsi-broker`（源码目录不动，方便以后 `git pull`）→ 建数据根目录并写
-`/etc/iscsi-broker/iscsi-broker.env`（数据目录就写在这里，**不用再手改源码里的 BASE_DIR**）
+它会：按发行版装依赖（Debian/Ubuntu/Fedora/RHEL/openSUSE/Arch 自动识别）→ 装程序 → 建数据根目录
+并写 `/etc/iscsi-broker/iscsi-broker.env`（数据目录就写在这里，**不用再手改源码里的 BASE_DIR**）
 → 注册并启动 `iscsi-broker.service`（开机自启，日志进 journald）。
+
+**两种装法，选一个：**
+
+| | 默认（拷贝） | `--in-place`（原地） |
+|---|---|---|
+| 程序位置 | `/opt/iscsi-broker`（源码目录不动） | 就用 clone 出来的这个目录 |
+| 升级 | `git pull && sudo bash install.sh --no-deps` | `git pull && sudo systemctl restart iscsi-broker` |
+| 好处 | 部署与源码分离：systemd 执行的文件 root 独占、clone 可以随便移动/删除、`git checkout` 不影响正在跑的代码 | 一次 pull 就生效，没有"两份代码不一致"的问题 |
+| 代价 | 每次 pull 后要重跑脚本 | 要求该目录**只有 root 能写**（否则普通用户改一下 `iscsi_broker.py` 就能拿到 root），脚本会检查并提示 chown/chmod |
+
+```bash
+sudo bash install.sh              # 默认：装到 /opt/iscsi-broker
+sudo bash install.sh --in-place   # 原地：直接给当前目录注册 systemd 服务
+```
+
+> 仓库就放服务器上、自己维护的场景，`--in-place` 更顺手；想让"跑的东西"和"源码/工作区"彻底分开，
+> 就用默认装法。原地装法下 systemd 执行的就是你 `git pull` 出来的代码，所以**别在服务运行时改动
+> 正在执行的 .py**（改完 `systemctl restart` 即可）。
 
 常用参数：
 
 ```bash
 sudo bash install.sh --base-dir /data/server     # 数据根目录（母盘/网盘/配置），默认 /home/prts/server
-sudo bash install.sh --install-dir /opt/broker   # 程序目录，默认 /opt/iscsi-broker
+sudo bash install.sh --in-place                  # 不拷贝，用当前目录注册服务
+sudo bash install.sh --install-dir /opt/broker   # 程序目录（仅默认装法），默认 /opt/iscsi-broker
 sudo bash install.sh --no-deps --no-start        # 只装文件+注册服务，不装依赖、不启动
 sudo bash install.sh -y                          # 所有询问自动答“是”（无人值守）
 sudo bash install.sh --uninstall                 # 停止并卸载服务（数据目录保留）
@@ -204,8 +222,11 @@ systemctl restart iscsi-broker     # 重启（会重新清理遗留 target/叠�
 cd iscsi-broker && git pull && sudo bash install.sh --no-deps
 ```
 
+> 用 `--in-place` 装的不用重跑脚本，`git pull && sudo systemctl restart iscsi-broker` 即可
+> （脚本只在第一次注册服务、写 env 文件时需要跑）。
+
 升级时脚本会：沿用原来写好的数据目录（`/etc/iscsi-broker/iscsi-broker.env`）→ 把旧程序目录备份到
-`/opt/iscsi-broker.bak` → 重新拷程序 → 重启服务。**数据目录（母盘/网盘/账号配置）不会被改动。**
+`/opt/iscsi-broker.bak`（仅默认装法）→ 重新拷程序 → 重启服务。**数据目录（母盘/网盘/账号配置）不会被改动。**
 
 回滚到上一个版本：
 
@@ -221,6 +242,7 @@ sudo systemctl restart iscsi-broker
 ```bash
 # 1) 进旧目录（有 iscsi_broker.py 的地方），先跑一次新安装脚本，让它接管：
 sudo bash install.sh -y            # 探测旧数据目录 → 停旧实例 → 备份旧程序 → 装 /opt → 起 systemd
+#    （想让它就地跑、不搬去 /opt，加 --in-place：sudo bash install.sh --in-place -y）
 # 2) 旧目录里的本地改动已经没用了（数据目录已写进 /etc/iscsi-broker/iscsi-broker.env）：
 git checkout -- iscsi_broker.py    # 之后 git pull 就不会再冲突
 ```

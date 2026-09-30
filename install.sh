@@ -38,8 +38,10 @@ DO_START=1
 DO_UNINSTALL=0
 DO_PURGE=0
 ASSUME_YES=0
+IN_PLACE=0           # --in-place：不拷贝，直接给当前目录注册 systemd 服务
 BASE_DIR_GIVEN=0
 PY_BIN=""
+PROG_DIR=""          # 实际运行代码的目录（原地模式=当前目录，否则=/opt/iscsi-broker）
 LEGACY_BASE=""       # 从旧部署里探测到的数据目录
 LEGACY_SRC=""        # 旧部署的程序目录/源码位置
 
@@ -59,23 +61,33 @@ usage() {
 用法：sudo bash install.sh [参数]
   首次安装和升级都用这一条：已经装过就自动按“升级”处理（沿用原数据目录、备份旧程序、重启服务）。
 
+  两种装法，选一个：
+    （默认）拷贝到 /opt/iscsi-broker 再注册服务：
+        好处是“部署”和“源码”分离——systemd 执行的文件 root 独占、clone 可以随便移动或删除、
+        git 操作不会影响正在跑的代码；代价是每次 git pull 后要重跑本脚本。
+    --in-place  不拷贝，直接给当前目录注册服务（推荐给“仓库就放服务器上、自己维护”的场景）：
+        一次 git pull + systemctl restart 就生效，没有两份代码；前提是这个目录只有 root 能写
+        （脚本会检查并提示 chown/chmod），否则普通用户改一下 iscsi_broker.py 就能拿到 root。
+
   --base-dir DIR     数据根目录（母盘/网盘/配置放这里）。不写的话：先读 /etc/iscsi-broker/*.env，
                      再探测旧部署源码/正在运行的实例，最后才用默认 /home/prts/server
-  --install-dir DIR  程序安装目录，默认 /opt/iscsi-broker
+  --install-dir DIR  程序安装目录（仅默认装法用），默认 /opt/iscsi-broker
+  --in-place         不拷贝程序，直接用当前目录（配合 git pull 升级最方便）
   --no-deps          跳过依赖安装（升级时常用：sudo bash install.sh --no-deps）
   --no-tftp          不往 TFTP 目录复制 iPXE 引导文件
   --no-start         只注册服务，不立即启动
   -y | --yes         所有询问都自动回答“是”（无人值守）
-  --uninstall        停止并卸载服务（数据目录保留）
-  --purge            卸载并删除程序目录（数据目录仍保留）
+  --uninstall        停止并卸载服务（数据目录保留；原地模式不会删源码目录）
+  --purge            卸载并删除程序目录（--in-place 时不生效）
   -h | --help        显示本帮助
 
 升级/迁移：
-  升级：cd 仓库 && git pull && sudo bash install.sh --no-deps
-  接管旧部署（源码里手改过 BASE_DIR、进程是手跑的）：在旧目录直接跑一次本脚本，
-      它会抓出旧数据目录、停掉旧进程、备份旧程序，然后交给 systemd 统一管理。
-      跑完建议执行：git checkout -- iscsi_broker.py   （数据目录已写进 env 文件，源码不用再改）
-  回滚：rm -rf /opt/iscsi-broker && mv /opt/iscsi-broker.bak /opt/iscsi-broker && systemctl restart iscsi-broker
+  默认装法：cd 仓库 && git pull && sudo bash install.sh --no-deps
+  原地装法：cd 仓库 && git pull && sudo systemctl restart iscsi-broker
+  接管旧部署（源码里手改过 BASE_DIR、进程是手跑的）：在旧目录跑一次本脚本，它会抓出旧数据
+      目录、停掉旧进程、然后交给 systemd 统一管理；跑完建议 git checkout -- iscsi_broker.py
+      （数据目录已写进 env 文件，源码不用再改），以后 git pull 就不会冲突。
+  回滚：默认装法用 <install-dir>.bak；原地装法用 git（git checkout <旧提交> 后 restart）。
 EOF
   exit 0
 }
@@ -88,6 +100,7 @@ while [[ $# -gt 0 ]]; do
     --no-deps)     DO_DEPS=0; shift;;
     --no-tftp)     DO_TFTP=0; shift;;
     --no-start)    DO_START=0; shift;;
+    --in-place)    IN_PLACE=1; shift;;
     -y|--yes)      ASSUME_YES=1; shift;;
     --uninstall)   DO_UNINSTALL=1; shift;;
     --purge)       DO_UNINSTALL=1; DO_PURGE=1; shift;;
@@ -341,6 +354,10 @@ stop_old_instances() {
 }
 
 backup_prev() {
+  if [[ $IN_PLACE -eq 1 ]]; then
+    msg "原地模式不备份程序目录（版本回滚用 git）"
+    return 0
+  fi
   [[ -f "$INSTALL_DIR/iscsi_broker.py" ]] || return 0
   local bak="$INSTALL_DIR.bak"
   rm -rf "$bak"
@@ -357,6 +374,11 @@ install_files() {
   for f in "${PROG_FILES[@]}"; do
     [[ -f "$SRC_DIR/$f" ]] || die "缺少 $f —— 请在仓库根目录运行本脚本"
   done
+  if [[ $IN_PLACE -eq 1 ]]; then
+    PROG_DIR="$SRC_DIR"
+    msg "原地安装：代码就留在 $PROG_DIR（不拷贝，升级靠 git pull）"
+    return 0
+  fi
   msg "安装程序到 $INSTALL_DIR"
   mkdir -p "$INSTALL_DIR"
   for f in "${PROG_FILES[@]}"; do
@@ -371,7 +393,33 @@ install_files() {
   if [[ -f "$SRC_DIR/README.md" ]]; then
     install -m 0644 "$SRC_DIR/README.md" "$INSTALL_DIR/README.md"
   fi
+  PROG_DIR="$INSTALL_DIR"
   ok "程序文件就绪"
+}
+
+# 原地模式的权限检查：systemd 以 root 跑这里的代码，所以只能 root 能写
+check_in_place_safety() {
+  [[ $IN_PLACE -eq 1 ]] || return 0
+  [[ -f "$SRC_DIR/iscsi_broker.py" ]] || die "--in-place 需要在有 iscsi_broker.py 的目录里运行"
+  local owner unsafe
+  owner="$(stat -c '%U' "$SRC_DIR" 2>/dev/null || echo '?')"
+  unsafe="$(find "$SRC_DIR" -maxdepth 1 \( -name '*.py' -o -name 'web' -o -name '.' \) -perm /022 -print 2>/dev/null | head -3 || true)"
+  if [[ "$owner" != "root" ]]; then
+    warn "原地模式：$SRC_DIR 属主是 $owner（不是 root）。systemd 会以 root 执行这里的代码，"
+    warn "任何能写这个目录的用户都等于能拿到 root。"
+    if confirm "现在 chown -R root:root $SRC_DIR（之后 git pull 也要用 root 执行）？"; then
+      chown -R root:root "$SRC_DIR" && ok "已改为 root 所有"
+    else
+      warn "保持原样 —— 请自行确保该目录只有 root 可写"
+    fi
+  fi
+  if [[ -n "$unsafe" ]]; then
+    warn "以下路径对同组/其他用户可写："
+    echo "$unsafe" | sed 's/^/         /'
+    if confirm "去掉组/其他的写权限（chmod -R go-w $SRC_DIR）？"; then
+      chmod -R go-w "$SRC_DIR" && ok "已收紧写权限"
+    fi
+  fi
 }
 
 prepare_data_dir() {
@@ -403,7 +451,7 @@ write_unit() {
   cat > "$UNIT_FILE" <<EOF
 [Unit]
 Description=iSCSI Broker (iPXE 无盘启动 + iSCSI 供给 + Web 管理后台 + 个人网盘/客户机控制)
-Documentation=file://$INSTALL_DIR/README.md
+Documentation=file://$PROG_DIR/README.md
 After=network-online.target tgt.service
 Wants=network-online.target
 # 说明：tgt.service 由 tgt 包提供；若该单元不存在，systemd 只会记一条告警，不影响启动
@@ -412,9 +460,9 @@ Wants=network-online.target
 Type=simple
 User=root
 # tgtadm / qemu-nbd / modprobe / iptables 都需要 root
-WorkingDirectory=$INSTALL_DIR
+WorkingDirectory=$PROG_DIR
 EnvironmentFile=-$ENV_FILE
-ExecStart=$PY_BIN $INSTALL_DIR/iscsi_broker.py
+ExecStart=$PY_BIN $PROG_DIR/iscsi_broker.py
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
@@ -425,7 +473,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
   chmod 0644 "$UNIT_FILE"
-  ok "写 systemd 单元 $UNIT_FILE"
+  ok "写 systemd 单元 $UNIT_FILE（ExecStart=$PROG_DIR/iscsi_broker.py）"
 }
 
 setup_tftp() {
@@ -486,10 +534,14 @@ do_uninstall() {
   command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload || true
   rm -f "$ENV_FILE"; rmdir "$ENV_DIR" 2>/dev/null || true
   if [[ $DO_PURGE -eq 1 ]]; then
-    rm -rf "$INSTALL_DIR"
-    ok "已删除程序目录 $INSTALL_DIR"
+    if [[ $IN_PLACE -eq 1 ]]; then
+      warn "--purge 在 --in-place 模式下不删除源码目录（$SRC_DIR），要删请自己处理"
+    else
+      rm -rf "$INSTALL_DIR"
+      ok "已删除程序目录 $INSTALL_DIR"
+    fi
   else
-    msg "程序目录保留：$INSTALL_DIR（想一起删就加 --purge）"
+    msg "程序目录保留：$PROG_DIR"
   fi
   ok "卸载完成；数据目录 $BASE_DIR 未改动"
   exit 0
@@ -503,7 +555,7 @@ print_summary() {
   echo "${c_ok}========================================${c_end}"
   echo "${c_ok} iSCSI Broker 安装完成${c_end}"
   echo "${c_ok}========================================${c_end}"
-  echo " 程序目录   : $INSTALL_DIR"
+  echo " 程序目录   : $PROG_DIR$( [[ $IN_PLACE -eq 1 ]] && echo "（原地模式，升级：git pull && systemctl restart $UNIT_NAME）" )"
   echo " 数据目录   : $BASE_DIR  （母盘放 $BASE_DIR/images/）"
   [[ -d "$INSTALL_DIR.bak" ]] && echo " 旧版本备份 : $INSTALL_DIR.bak（回滚方法见 install.sh --help）"
   echo " 服务名     : $UNIT_NAME（开机自启）"
@@ -532,11 +584,13 @@ if [[ $DO_UNINSTALL -eq 1 ]]; then
   do_uninstall
 fi
 echo "${c_info}== iSCSI Broker 安装/升级 ==${c_end}  源码目录：$SRC_DIR"
+PROG_DIR="$INSTALL_DIR"
 install_deps
 check_python
 detect_legacy
 resolve_base_dir
 warn_dirty_source
+check_in_place_safety
 stop_old_instances
 backup_prev
 install_files
