@@ -301,9 +301,12 @@ def _adopt_locked(ver, tmp_path, source, notes=""):
     src_ver = source_version()
     if src_ver and src_ver != ver:
         raise ReleaseError(
-            "版本号 %s 与 client/Agent.cs 里的 VERSION (%s) 不一致：客户机会无限循环更新"
-            "（换上去后仍报 v%s）。请先把 client/Agent.cs 的 VERSION 改成 %s 再重新编译上传，"
-            "或把版本号改成 %s 表示就是这份源码编出来的。" % (ver, src_ver, src_ver, ver, src_ver))
+            "版本号 %s 与服务器上 client/Agent.cs 里的 VERSION (%s) 不一致：客户机按 exe 内编译进去的"
+            " VERSION 判断新旧，不一致会导致无限循环更新（换上去后仍报 v%s）。"
+            "三种处理方式任选：① 把 client/Agent.cs 的 VERSION 改成 %s 后重新编译上传；"
+            "② 版本号填 %s（表示就是当前这份源码编出来的）；"
+            "③ 如果你本地已经改过 VERSION，先在服务器上 git pull 让源码同步，再重传。"
+            % (ver, src_ver, src_ver, ver, src_ver))
     if not _looks_like_exe(tmp_path):
         raise ReleaseError("这个文件不像 Windows 可执行文件（没有 MZ/PE 头），拒绝收录")
     ok, why = validate_client_exe(tmp_path)
