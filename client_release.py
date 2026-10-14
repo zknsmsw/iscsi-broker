@@ -34,6 +34,7 @@ MAX_UPLOAD = 32 * 1024 * 1024     # 上传/编译产物大小上限（够放 200
 
 _lock = threading.RLock()
 _dir = None            # 发布库目录（setup 后有效）
+_prog_dir = None       # 程序目录（用于读 client/Agent.cs 里的 VERSION）
 _index = {"current": "", "releases": []}   # releases 按版本升序（新→旧由调用方决定）
 _loaded = False
 
@@ -68,13 +69,18 @@ def ver_ok(ver):
 
 
 # ---------- 初始化 / 落盘 ----------
-def setup(base_dir):
-    """初始化发布库目录并读入 index.json（不存在就建）。"""
-    global _dir, _index, _loaded
+def setup(base_dir, prog_dir=None):
+    """初始化发布库目录并读入 index.json（不存在就建）。
+
+    prog_dir 是程序目录（存放 client/Agent.cs 的地方），用于读客户机源码里的 VERSION——
+    发布时必须用它校验“发布版本号 == exe 内编译的 VERSION”，否则客户机会无限循环更新。
+    """
+    global _dir, _index, _loaded, _prog_dir
     with _lock:
         _dir = os.path.join(base_dir, DIR_NAME)
         os.makedirs(_dir, exist_ok=True)
         _index = _read_index_locked()
+        _prog_dir = prog_dir or None    # 每次 setup 都以本次参数为准（不传就表示不校验源码版本）
         _loaded = True
         return _dir
 
@@ -288,6 +294,16 @@ def _adopt_locked(ver, tmp_path, source, notes=""):
     """把已就绪的临时 exe 收录成该版本的发布文件并更新 index。"""
     if not ver_ok(ver):
         raise ReleaseError("版本号非法（只允许 A.B 或 A.B.C）：%r" % (ver,))
+    # 发布版本号必须等于 exe 里编译进去的 VERSION：客户机就是拿它和本机 VERSION 比大小来
+    # 判断“要不要更新/有没有更新成功”的。两者不一致（例如源码 VERSION=1.1，后台按 89.64
+    # 发布）会让客户机换上后仍然报 1.1，于是服务器永远认为它有新版 —— 无限循环更新，
+    # 每轮都会杀掉托盘、重启后台进程。这里直接拒绝，从源头掐掉。
+    src_ver = source_version()
+    if src_ver and src_ver != ver:
+        raise ReleaseError(
+            "版本号 %s 与 client/Agent.cs 里的 VERSION (%s) 不一致：客户机会无限循环更新"
+            "（换上去后仍报 v%s）。请先把 client/Agent.cs 的 VERSION 改成 %s 再重新编译上传，"
+            "或把版本号改成 %s 表示就是这份源码编出来的。" % (ver, src_ver, src_ver, ver, src_ver))
     if not _looks_like_exe(tmp_path):
         raise ReleaseError("这个文件不像 Windows 可执行文件（没有 MZ/PE 头），拒绝收录")
     ok, why = validate_client_exe(tmp_path)
@@ -360,13 +376,16 @@ def available_for(cur):
 
 
 # ---------- 写入：上传 ----------
-def source_version(prog_dir):
+def source_version(prog_dir=None):
     """读客户端源码里的 VERSION（供后台上传时“版本号留空”用）；读不到返回 ""。
 
     注：这里只**读一个版本号**用于校验/展示，服务器不编译客户端（见模块说明）。
     """
+    base = prog_dir or _prog_dir
+    if not base:
+        return ""
     try:
-        with open(os.path.join(prog_dir, "client", "Agent.cs"), "r",
+        with open(os.path.join(base, "client", "Agent.cs"), "r",
                   encoding="utf-8", errors="replace") as f:
             m = re.search(r'VERSION\s*=\s*"([^"]+)"', f.read())
         v = (m.group(1) if m else "").strip()

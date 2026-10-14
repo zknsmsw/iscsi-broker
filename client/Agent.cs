@@ -114,6 +114,11 @@ namespace IscsiBrokerAgent
         private static bool _dryRun;
         private static bool _mountRequested = true;   // 默认就给客户机挂 Z 盘（只读通用文件）
         private static bool _mountOk;
+        // 上一次“更新到某版本”的记录：用于识别“发布版本号与 exe 内 VERSION 对不上”导致的无限循环更新
+        // （每次都换上去、重启后仍报旧版本，服务器于是又推一次）。持久化在 agent.state 里。
+        private static string _lastUpdVer = "";
+        private static string _lastUpdFrom = "";
+        private static DateTime _lastUpdAt = DateTime.MinValue;
         private static int _trayPid;                  // SYSTEM 进程拉起的托盘进程（用户会话里）
         private static uint _traySession = INVALID_SESSION;
         // ---- 以下只在托盘进程里用 ----
@@ -230,6 +235,13 @@ namespace IscsiBrokerAgent
                     string k = kv[0].Trim().ToLowerInvariant(), v = kv[1].Trim();
                     if (k == "mount") _mountRequested = (v == "1");
                     else if (k == "mount_ok") _mountOk = (v == "1");
+                    else if (k == "update_ver") _lastUpdVer = v;
+                    else if (k == "update_from") _lastUpdFrom = v;
+                    else if (k == "update_at")
+                    {
+                        try { _lastUpdAt = DateTime.Parse(v); }
+                        catch { _lastUpdAt = DateTime.MinValue; }
+                    }
                 }
             }
             catch (Exception e) { Log("读取 agent.state 失败：" + e.Message); }
@@ -241,7 +253,10 @@ namespace IscsiBrokerAgent
             {
                 File.WriteAllText(_statePath,
                     "mount=" + (_mountRequested ? "1" : "0") + "\r\n" +
-                    "mount_ok=" + (_mountOk ? "1" : "0") + "\r\n");
+                    "mount_ok=" + (_mountOk ? "1" : "0") + "\r\n" +
+                    "update_ver=" + _lastUpdVer + "\r\n" +
+                    "update_from=" + _lastUpdFrom + "\r\n" +
+                    "update_at=" + (_lastUpdAt == DateTime.MinValue ? "" : _lastUpdAt.ToString("s")) + "\r\n");
             }
             catch (Exception e) { Log("写 agent.state 失败：" + e.Message); }
         }
@@ -480,6 +495,20 @@ namespace IscsiBrokerAgent
                     Report(id, true, "已是最新版本 v" + VERSION + "，未要求强制重装，跳过");
                     return;
                 }
+                // 无限循环护栏：上一次刚更新到 vX，重启后本机仍然是同一个旧 VERSION，
+                // 说明“发布版本号”和 exe 里编译进去的 VERSION 对不上（例如源码 VERSION=1.1，
+                // 后台却按 89.64 发布）。这时再换一遍也没用，只会不停杀进程/重启托盘。
+                if (uver.Length > 0 && !uforce && uver == _lastUpdVer && _lastUpdFrom == VERSION
+                    && (DateTime.Now - _lastUpdAt).TotalHours < 2.0)
+                {
+                    string loopMsg = "已跳过：上次更新到 v" + uver + " 之后本机仍是 v" + VERSION
+                        + "，说明发布版本号与 exe 内的 VERSION 不一致（会无限循环更新）。"
+                        + "请把 client/Agent.cs 的 VERSION 改成 " + uver + " 后重新编译上传，"
+                        + "或在后台把版本号改成 " + VERSION + " 重新发布。";
+                    Log("指令 #" + id + " 结果：失败 " + loopMsg);
+                    Report(id, false, loopMsg);
+                    return;
+                }
                 string umsg;
                 UpdatePlan plan = DownloadUpdate(uver, uurl, usha, usize, out umsg);
                 if (plan == null)
@@ -495,6 +524,12 @@ namespace IscsiBrokerAgent
                     Report(id, false, smsg);
                     return;
                 }
+                // 记下这次“更新到哪个版本、当时本机是哪个版本”，重启后若还是同一个旧版本，
+                // 上面的护栏就会拦住下一次，避免无限循环。必须在退出前落盘。
+                _lastUpdVer = uver;
+                _lastUpdFrom = VERSION;
+                _lastUpdAt = DateTime.Now;
+                SaveState();
                 Log("指令 #" + id + " 结果：成功 已下载校验 v" + plan.Ver + "，本进程退出等替换");
                 Report(id, true, "更新到 v" + plan.Ver + "：已下载并校验 sha256，正在退出替换");
                 Thread.Sleep(500);
@@ -551,6 +586,13 @@ namespace IscsiBrokerAgent
                 return;                              // 没人登录：等用户登录后下一轮再说
             if (_trayPid != 0 && _traySession == sid && ProcessAlive(_trayPid))
                 return;                              // 已经在跑
+            if (_trayPid != 0 && _traySession == sid)
+            {
+                // 同一个会话里上次拉起的托盘已经不在了：要么它自己退出，要么启动就失败。
+                // 记一条（限流），否则日志里只看到“已在会话 1 启动托盘”反复出现，看不出毛病。
+                LogOnce("tray-died", "上次的托盘 pid=" + _trayPid + " 已不在，重新拉起"
+                                     + "（反复出现说明托盘启动即失败，看 agent.log 里有没有「托盘进程启动」）", 60);
+            }
             if (_trayPid != 0)
                 TryKill(_trayPid);                   // 会话切换：干掉旧会话里的托盘
             string err;
@@ -985,10 +1027,18 @@ namespace IscsiBrokerAgent
 
         private static int TrayMain()
         {
+            // 第一行就落日志：托盘起不来（比如 .NET 运行时初始化失败弹 “This application could
+            // not be started.”）时这条不会出现，能立刻把“进程根本没起来”和“起来后又退出”分开。
+            Log("托盘进程启动 pid=" + Process.GetCurrentProcess().Id
+                + " session=" + Process.GetCurrentProcess().SessionId);
             bool created;
             using (var mutex = new Mutex(true, "iscsi-broker-agent-tray", out created))
             {
-                if (!created) return 0;                  // 本会话已有托盘在跑
+                if (!created)
+                {
+                    Log("本会话已有托盘在跑，本进程退出");   // 老代码在这里静默 return 0，日志里查不出原因
+                    return 0;
+                }
                 try { FreeConsole(); } catch { }         // 从控制台/命令行启动时收掉黑窗口
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
@@ -1847,6 +1897,15 @@ namespace IscsiBrokerAgent
             if (!force && CompareVer(ver, VERSION) <= 0)
             {
                 NotifyTip("已是最新版本 v" + VERSION + "（服务器发布 v" + ver + "）");
+                return;
+            }
+            // 与 SYSTEM 进程里同一道护栏：版本号对不上时别再请求，否则只会无限循环
+            if (!force && ver == _lastUpdVer && _lastUpdFrom == VERSION
+                && (DateTime.Now - _lastUpdAt).TotalHours < 2.0)
+            {
+                NotifyTip("服务器发布 v" + ver + " 与本机 exe 内的 VERSION v" + VERSION
+                          + " 对不上：上次更新后本机版本没变。请把 client/Agent.cs 的 VERSION 改成 "
+                          + ver + " 重新编译上传，否则会一直循环更新。");
                 return;
             }
             int cmp = CompareVer(ver, VERSION);

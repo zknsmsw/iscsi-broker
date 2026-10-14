@@ -3406,7 +3406,7 @@ if __name__ == "__main__":
     # 客户机客户端发布库（托盘「检查更新」从这里拉新版 exe）。
     # 注意：客户端只在 Windows 上用 client\build.bat 编译，服务器不编译，只负责存放与分发。
     print(f"[{datetime.datetime.now()}] [START] Client release store: "
-          f"{client_release.setup(BASE_DIR)}")
+          f"{client_release.setup(BASE_DIR, os.path.dirname(os.path.abspath(__file__)))}")
 
     # 命令行维护入口（不启动服务）：
     #   python3 iscsi_broker.py --publish-client <exe路径> --client-ver 1.1
