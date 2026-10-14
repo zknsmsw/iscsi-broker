@@ -1578,6 +1578,39 @@ namespace IscsiBrokerAgent
             catch { return false; }
         }
 
+        /// <summary>
+        /// 试运行下载到的 exe：先就地跑一次，失败再拷到 exe 同目录跑一次
+        /// （那个目录才是它最终要运行的位置，也避开 %TEMP% 被执行策略挡住的情况）。
+        /// 成功时 localPath 给出可用于替换的文件；失败返回 false 并给出原因。
+        /// </summary>
+        private static bool ProbeNewExeWithFallback(string downloaded, out string localPath, out string err)
+        {
+            localPath = downloaded;
+            err = "";
+            string err1;
+            if (ProbeNewExe(downloaded, out err1)) return true;
+            string near = ExePath() + ".new";
+            try
+            {
+                TryDelete(near);
+                File.Copy(downloaded, near, true);
+                string err2;
+                if (ProbeNewExe(near, out err2))
+                {
+                    localPath = near;
+                    TryDelete(downloaded);
+                    return true;
+                }
+                TryDelete(near);
+                err = err1 + "；换到 exe 同目录再试同样失败：" + err2;
+            }
+            catch (Exception e)
+            {
+                err = err1 + "；换到 exe 同目录再试失败：" + e.Message;
+            }
+            return false;
+        }
+
         private static string FileVersionOf(string path)
         {
             try
@@ -1586,6 +1619,46 @@ namespace IscsiBrokerAgent
                 return v == null ? "" : v.Trim();
             }
             catch { return ""; }
+        }
+
+        /// <summary>
+        /// 换上去之前先试运行下载到的新 exe（`test` 模式：只读配置、打印、退出，不联网不挂盘）。
+        /// 返回 true = 能正常启动并退出码 0；false = 起不来（文件坏了 / .NET 运行时初始化失败），
+        /// 由调用方放弃更新。为什么必须做：无盘客户机的 exe 一旦换成坏的就没法自己回滚，
+        /// 而且 .NET 的失败表现只是一个 “This application could not be started.” 弹窗。
+        /// 探测进程在 SYSTEM 会话里跑，弹窗用户看不见；超时即判定失败并杀掉它。
+        /// </summary>
+        private static bool ProbeNewExe(string path, out string err)
+        {
+            err = "";
+            if (_dryRun) return true;
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(path, "test");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                psi.WorkingDirectory = Path.GetDirectoryName(path);
+                using (Process p = Process.Start(psi))
+                {
+                    if (!p.WaitForExit(20000))
+                    {
+                        try { p.Kill(); } catch { }
+                        err = "启动后 20 秒仍未退出（.NET 运行时无法初始化或文件损坏）";
+                        return false;
+                    }
+                    if (p.ExitCode != 0)
+                    {
+                        err = "自检退出码 " + p.ExitCode;
+                        return false;
+                    }
+                }
+                return true;
+            }
+            catch (Exception e)
+            {
+                err = "启动失败：" + e.Message;
+                return false;
+            }
         }
 
         // ---------- 问服务器 / 下载 / 替换 ----------
@@ -1720,7 +1793,20 @@ namespace IscsiBrokerAgent
                 Log("提示：下载文件没带文件版本信息（csc 不带 AssemblyFileVersion 时正常）");
             else if (CompareVer(fver, ver) != 0)
                 Log("提示：下载文件的文件版本 v" + fver + " 与目标 v" + ver + " 不同（继续替换）");
-            Log("客户端 v" + ver + " 下载完成：" + got + " 字节，sha256=" + local);
+            // ④ 换上去之前先试着跑一次：下载物哪怕 sha256/大小都对，也可能是个被截断或
+            //    工具链不对的 exe —— 换上后 Windows 只会弹 “This application could not be
+            //    started.”，无盘客户机换掉的 exe 自己没法回滚。这里先用 `test` 空跑一遍
+            //    （不碰网络、不挂盘、不关机），起不来就放弃更新、保留当前版本。
+            string probeErr, probedFile;
+            if (!ProbeNewExeWithFallback(newFile, out probedFile, out probeErr))
+            {
+                TryDelete(newFile);
+                msg = "下载到的新客户端在本机跑不起来（" + probeErr + "），已放弃更新，当前版本未改动";
+                Log("客户端更新中止：" + msg);
+                return null;
+            }
+            newFile = probedFile;
+            Log("客户端 v" + ver + " 下载完成：" + got + " 字节，sha256=" + local + "，试运行通过");
             UpdatePlan plan = new UpdatePlan();
             plan.Ver = ver;
             plan.Sha = local;

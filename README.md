@@ -565,6 +565,9 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
   「检查更新」只向服务器 `POST /agent/request-update` **请求**升级（托盘跑在登录用户会话里、是普通用户
   令牌，杀不掉 SYSTEM 进程也改不了被占用的 exe），由 SYSTEM 身份的 agent 进程在下一次心跳执行
   下载/校验/替换；后台「客户机控制」页也能对单台/全部客户机下发升级指令。
+  **发布库有双重防线**：后台上传发布时校验 PE 完整性 + CLR 头 + CLR 元数据（截断的、原生 exe、
+  非 `build.bat` 工具链的产物一律拒收）；客户机下载校验 sha256 后还会用 `test` 空跑一遍新 exe，
+  跑不起来就放弃更新、保留当前版本——无盘客户机换掉的 exe 自己没法回滚，这两道闸门都不省。
   发布新版：**只能在 Windows 上编译**（`client\build.bat`），把产物通过后台「客户端发布 → 上传并发布」
   传上去（或命令行 `python3 iscsi_broker.py --publish-client <exe> --client-ver 1.1`）；
   服务器只负责存放与分发，不做 Linux 交叉编译。

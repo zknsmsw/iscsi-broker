@@ -153,6 +153,119 @@ def _looks_like_exe(path):
         return False
 
 
+# ---------- 上传产物的深度校验 ----------
+# 只查 MZ/PE 是不够的：**被截断的 exe 头部依然完好**，sha256/大小也自洽，客户机
+# 下载校验全部通过、换上去之后 Windows 只会弹 “This application could not be
+# started.”（.NET 运行时初始化失败），而且无盘客户机换掉的 exe 自己没法回滚。
+# 所以收录前必须验证：
+#   ① 每个节区的原始数据都完整落在文件内（截断必挂）；
+#   ② 存在 CLR 头（IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR ≠ 0）——客户端必须是
+#      build.bat（csc，.NET Framework 4.x）编出来的托管程序，客户机才跑得起来；
+#   ③ CLR 头与 CLR 元数据都在文件内，且元数据签名是 BSJB。
+_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR = 14
+_PE32_MAGIC = 0x10B
+_PE32PLUS_MAGIC = 0x20B
+
+
+def _parse_pe(data):
+    """解析 PE 头，返回 {"sections":[...], "dirs":{idx:(rva,size)}, "size":n}；非法返回 None。"""
+    if len(data) < 0x40 or data[0:2] != b"MZ":
+        return None
+    pe_off = int.from_bytes(data[0x3C:0x40], "little")
+    if pe_off < 0x40 or pe_off + 24 > len(data) or data[pe_off:pe_off + 4] != b"PE\x00\x00":
+        return None
+    coff = pe_off + 4
+    num_sections = int.from_bytes(data[coff + 2:coff + 4], "little")
+    size_opt = int.from_bytes(data[coff + 16:coff + 18], "little")
+    opt = coff + 20
+    if size_opt < 96 or opt + size_opt > len(data) or num_sections > 96:
+        return None
+    magic = int.from_bytes(data[opt:opt + 2], "little")
+    if magic not in (_PE32_MAGIC, _PE32PLUS_MAGIC):
+        return None
+    num_dd = int.from_bytes(data[opt + 92:opt + 94], "little")
+    dd_off = opt + (96 if magic == _PE32_MAGIC else 112)
+    dirs = {}
+    for i in range(min(num_dd, 16)):
+        base = dd_off + i * 8
+        if base + 8 > opt + size_opt or base + 8 > len(data):
+            break
+        dirs[i] = (int.from_bytes(data[base:base + 4], "little"),
+                   int.from_bytes(data[base + 4:base + 8], "little"))
+    sections = []
+    sec_off = opt + size_opt
+    for i in range(num_sections):
+        b = sec_off + i * 40
+        if b + 40 > len(data):
+            return None
+        sections.append({
+            "vsize": int.from_bytes(data[b + 8:b + 12], "little"),
+            "vaddr": int.from_bytes(data[b + 12:b + 16], "little"),
+            "raw_size": int.from_bytes(data[b + 16:b + 20], "little"),
+            "raw_ptr": int.from_bytes(data[b + 20:b + 24], "little"),
+        })
+    return {"sections": sections, "dirs": dirs, "size": len(data)}
+
+
+def _rva_to_off(pe, rva):
+    """RVA -> 文件偏移；落在文件外返回 None。"""
+    for s in pe["sections"]:
+        if s["vaddr"] <= rva < s["vaddr"] + max(s["vsize"], s["raw_size"]):
+            off = s["raw_ptr"] + (rva - s["vaddr"])
+            return off if off < pe["size"] else None
+    return None
+
+
+def validate_client_exe(path):
+    """深度校验客户端 exe 是否是“能被客户机跑起来的 .NET 程序集”。
+
+    返回 (True, "") 或 (False, 中文原因)。这是收录前的最后一道闸门：宁可拒绝一个
+    可疑产物，也不能把坏 exe 推给无盘客户机（它们没法自己回滚）。
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return False, "读不到文件：%s" % e
+    if size < 4096:
+        return False, "文件太小（%d 字节），不像编译产物" % size
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        return False, "读不到文件：%s" % e
+    pe = _parse_pe(data)
+    if pe is None:
+        return False, "不是合法的 Windows PE 文件（MZ/PE 头或可选头异常）"
+    for s in pe["sections"]:
+        if s["raw_size"] == 0:
+            continue
+        if s["raw_ptr"] + s["raw_size"] > pe["size"]:
+            return False, ("文件不完整：数据段超出文件末尾（%d > %d 字节），"
+                           "通常是上传/编译被截断，不是完整的 exe"
+                           % (s["raw_ptr"] + s["raw_size"], pe["size"]))
+    com = pe["dirs"].get(_IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR)
+    if not com or com[0] == 0 or com[1] == 0:
+        return False, ("不是 .NET 程序集（缺少 CLR 头）：客户端必须在 Windows 上用 "
+                       "client\\build.bat 编译（csc / .NET Framework），"
+                       "其它工具链的产物客户机跑不起来")
+    clr_off = _rva_to_off(pe, com[0])
+    if clr_off is None or clr_off + 0x48 > len(data):
+        return False, "CLR 头越界（文件可能损坏或被截断）"
+    clr = data[clr_off:clr_off + 0x48]
+    if int.from_bytes(clr[0:4], "little") < 0x48:
+        return False, "CLR 头长度非法"
+    meta_rva = int.from_bytes(clr[8:12], "little")
+    meta_size = int.from_bytes(clr[12:16], "little")
+    if meta_rva == 0 or meta_size < 0x10:
+        return False, "缺少 CLR 元数据（不是完整程序集）"
+    meta_off = _rva_to_off(pe, meta_rva)
+    if meta_off is None or meta_off + meta_size > len(data):
+        return False, "CLR 元数据越界（文件可能被截断）"
+    if data[meta_off:meta_off + 4] != b"BSJB":
+        return False, "CLR 元数据签名不对（文件损坏）"
+    return True, ""
+
+
 def _record(ver, path, source, notes=""):
     return {"ver": ver, "file": _exe_name(ver), "sha256": _sha256_file(path),
             "size": os.path.getsize(path), "built": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -177,6 +290,9 @@ def _adopt_locked(ver, tmp_path, source, notes=""):
         raise ReleaseError("版本号非法（只允许 A.B 或 A.B.C）：%r" % (ver,))
     if not _looks_like_exe(tmp_path):
         raise ReleaseError("这个文件不像 Windows 可执行文件（没有 MZ/PE 头），拒绝收录")
+    ok, why = validate_client_exe(tmp_path)
+    if not ok:
+        raise ReleaseError("拒绝收录：%s" % why)
     size = os.path.getsize(tmp_path)
     if size <= 0 or size > MAX_UPLOAD:
         raise ReleaseError("文件大小不合适：%d 字节" % size)
