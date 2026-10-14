@@ -1905,7 +1905,8 @@ namespace IscsiBrokerAgent
             try
             {
                 File.WriteAllText(cmdFile,
-                                  SwapScript(exe, plan.NewFile, plan.Ver, VERSION, plan.Sha, pid, logFile),
+                                  SwapScript(exe, plan.NewFile, plan.Ver, VERSION, plan.Sha,
+                                             plan.Size, pid, logFile),
                                   Encoding.Default);
             }
             catch (Exception e)
@@ -1932,7 +1933,7 @@ namespace IscsiBrokerAgent
 
         /// <summary>替换脚本内容（纯 ASCII，避免 cmd 代码页问题）。</summary>
         private static string SwapScript(string exe, string newFile, string newVer, string oldVer,
-                                         string sha, int pid, string logPath)
+                                         string sha, long size, int pid, string logPath)
         {
             string image = Path.GetFileName(exe);
             StringBuilder sb = new StringBuilder();
@@ -1946,6 +1947,7 @@ namespace IscsiBrokerAgent
             sb.Append("set \"OLD_VER=" + oldVer + "\"\r\n");
             sb.Append("set \"NEW_VER=" + newVer + "\"\r\n");
             sb.Append("set \"EXPECT_SHA=" + sha + "\"\r\n");
+            sb.Append("set \"EXPECT_SIZE=" + size + "\"\r\n");
             sb.Append("set \"LOG=" + logPath + "\"\r\n");
             sb.Append("echo.>>\"%LOG%\" 2>nul\r\n");
             sb.Append("if not exist \"%LOG%\" set \"LOG=%TEMP%\\iscsi-broker-agent-update.log\"\r\n");
@@ -1981,29 +1983,48 @@ namespace IscsiBrokerAgent
             sb.Append("exit /b 1\r\n");
             sb.Append(":renamed\r\n");
             sb.Append("call :log \"renamed old exe to .old (tries=%R%)\"\r\n");
-            // 4) 新 exe 就位（失败重试 10 次）
+            // 4) 新 exe 就位 + **落地后校验**（失败重试 10 次）
+            //    只判断“文件存在”是不够的：move 跨卷时是“复制+删除”，中途失败会留下
+            //    半截文件，而半截 exe 的 MZ 头完好，照样能被 schtasks 拉起来，最后只表现成
+            //    一句 “This application could not be started.”。所以落地后必须核对
+            //    大小（+sha256，能取到就核），对不上就回滚回旧 exe 并重启旧版。
             sb.Append("set /a R2=0\r\n");
             sb.Append(":mvbody\r\n");
             sb.Append("move /Y \"%NEW%\" \"%EXE%\" >>\"%LOG%\" 2>&1\r\n");
-            sb.Append("if exist \"%EXE%\" goto moved\r\n");
+            sb.Append("if exist \"%EXE%\" goto mvcheck\r\n");
             sb.Append("set /a R2+=1\r\n");
-            sb.Append("if %R2% GEQ 10 goto mvfail\r\n");
+            sb.Append("if %R2% GEQ 10 goto mvroll\r\n");
             sb.Append("ping -n 2 127.0.0.1 >nul\r\n");
             sb.Append("goto mvbody\r\n");
-            sb.Append(":mvfail\r\n");
-            sb.Append("call :log \"ERROR: cannot put new exe in place after %R2% tries, rolling back\"\r\n");
+            sb.Append(":mvcheck\r\n");
+            sb.Append("for %%A in (\"%EXE%\") do set \"GOTSIZE=%%~zA\"\r\n");
+            sb.Append("call :log \"moved new exe (tries=%R2% size=%GOTSIZE% want=%EXPECT_SIZE%)\"\r\n");
+            sb.Append("if \"%GOTSIZE%\"==\"%EXPECT_SIZE%\" goto mvsha\r\n");
+            sb.Append("call :log \"ERROR: size mismatch after move (%GOTSIZE% != %EXPECT_SIZE%), rolling back\"\r\n");
+            sb.Append("del /F /Q \"%EXE%\" >nul 2>&1\r\n");
+            sb.Append("goto mvroll\r\n");
+            sb.Append(":mvsha\r\n");
+            sb.Append("if \"%EXPECT_SHA%\"==\"\" goto moved\r\n");
+            sb.Append("set \"GOTSH=\"\r\n");
+            sb.Append("for /f \"skip=1 delims=\" %%H in ('certutil -hashfile \"%EXE%\" SHA256 2^>nul') do if not defined GOTSH set \"GOTSH=%%H\"\r\n");
+            sb.Append("if not defined GOTSH goto moved\r\n");
+            sb.Append("if /I \"%GOTSH%\"==\"%EXPECT_SHA%\" goto moved\r\n");
+            sb.Append("call :log \"ERROR: sha256 mismatch after move (got %GOTSH%), rolling back\"\r\n");
+            sb.Append("del /F /Q \"%EXE%\" >nul 2>&1\r\n");
+            sb.Append(":mvroll\r\n");
+            sb.Append("call :log \"rolling back: restore old exe and restart it\"\r\n");
             sb.Append("move /Y \"%OLD%\" \"%EXE%\" >>\"%LOG%\" 2>&1\r\n");
             sb.Append("if exist \"%EXE%\" goto rollok\r\n");
             sb.Append("call :log \"ROLLBACK FAILED: no exe at %EXE% (old file kept as %OLD%)\"\r\n");
             sb.Append("goto rollend\r\n");
             sb.Append(":rollok\r\n");
-            sb.Append("call :log \"rollback ok: old exe restored\"\r\n");
+            sb.Append("call :log \"rollback ok: old exe restored, keeping v%OLD_VER%\"\r\n");
             sb.Append(":rollend\r\n");
             sb.Append("schtasks /Run /TN \"iSCSI-Broker-Agent\" >>\"%LOG%\" 2>&1\r\n");
             sb.Append("del \"%~f0\"\r\n");
             sb.Append("exit /b 1\r\n");
             sb.Append(":moved\r\n");
-            sb.Append("call :log \"installed v%NEW_VER% at %EXE% (tries=%R2%)\"\r\n");
+            sb.Append("call :log \"installed v%NEW_VER% at %EXE% (tries=%R2%, verified)\"\r\n");
             sb.Append("del \"%EXE%.new\" >nul 2>&1\r\n");
             // 5) 重新拉起（计划任务优先，失败兜底直接起进程）
             sb.Append("schtasks /Run /TN \"iSCSI-Broker-Agent\" >>\"%LOG%\" 2>&1\r\n");
