@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-import urllib.parse, subprocess, os, sys, datetime, hashlib, threading, glob, time, re, secrets, html, ssl, json, base64
-import users_auth, cloud_store, netctrl, agent_hub, webdav, wsbridge, client_release  # 本地模块：多账号认证（users_auth）+ 个人网盘（cloud_store）+ 联网控制（netctrl）+ 客户机 agent 通道（agent_hub）+ 网盘 WebDAV（webdav）+ VNC WebSocket 桥（wsbridge）+ 客户机发布库（client_release）
+import urllib.parse, subprocess, os, datetime, hashlib, threading, glob, time, re, secrets, html, ssl, base64
+import users_auth, cloud_store, netctrl, webdav  # 本地模块：多账号认证（users_auth）+ 个人网盘（cloud_store）+ 联网控制（netctrl）+ 网盘 WebDAV（webdav）
 
 # ========== 数据根目录 BASE_DIR ==========
 # 优先级：环境变量 ISCSI_BROKER_BASE_DIR > /etc/iscsi-broker/iscsi-broker.env > 下面的默认值。
@@ -75,8 +75,6 @@ WEB_ENABLED = True            # 是否启用简易 Web 管理后台（改密码/
 WEB_PORT = 8080               # 后台端口，浏览器访问 http://<服务器IP>:8080/
 WEB_TITLE = "iSCSI Broker 管理后台"
 ADMIN_PASS_FILE = os.path.join(OVERLAY_DIR, "admin.conf")  # 管理员密码持久化文件（iPXE 与 Web 共用，可改）
-WEB_VNC_DIR = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "vnc"))
-# 内置 noVNC（VNC 控制页）静态资源目录，与主程序同级的 web/vnc/；缺失时只有 VNC 页面不可用
 # ========================================================
 
 # =================== 可选 HTTPS ===================
@@ -916,28 +914,6 @@ def admin_ratelimited(ip):
         admin_attempts[ip] = ts
         return False
 
-# ---------- 网盘登录限速（客户机托盘登录用，只统计失败次数） ----------
-DAV_LOGIN_ATTEMPT_MAX = 10        # 每 IP 在窗口期内最多失败次数
-DAV_LOGIN_ATTEMPT_WINDOW = 300    # 窗口（秒）
-dav_login_fails = {}              # ip -> [失败时间戳]
-dav_login_lock = threading.Lock()
-
-def dav_login_ratelimited(ip):
-    """该来源 IP 是否因为失败次数过多被限速。"""
-    now = time.time()
-    with dav_login_lock:
-        ts = [t for t in dav_login_fails.get(ip, []) if now - t <= DAV_LOGIN_ATTEMPT_WINDOW]
-        dav_login_fails[ip] = ts
-        return len(ts) >= DAV_LOGIN_ATTEMPT_MAX
-
-def dav_login_failed(ip):
-    with dav_login_lock:
-        dav_login_fails.setdefault(ip, []).append(time.time())
-
-def dav_login_reset(ip):
-    with dav_login_lock:
-        dav_login_fails.pop(ip, None)
-
 PAGE_CSS = """body{font-family:"Microsoft YaHei",Arial,sans-serif;background:#f4f6f8;margin:0;padding:24px;color:#222}
 .wrap{max-width:880px;margin:0 auto}
 h1{font-size:20px;margin-top:0}
@@ -954,7 +930,7 @@ a{color:#2563eb;text-decoration:none;margin-right:14px}
 .inline-form{display:inline;margin:0}
 .inline-form input[type=submit]{padding:2px 8px;font-size:12px}"""
 
-NAV_ADMIN = ('<p><a href="/">客户机名单</a><a href="/web/clients">客户机控制</a>'
+NAV_ADMIN = ('<p><a href="/">客户机名单</a>'
              '<a href="/web/create">创建空白盘</a>'
              '<a href="/web/export">iSCSI 挂载</a><a href="/web/password">修改密码</a>'
              '<a href="/web/users">用户与配额</a>'
@@ -1498,18 +1474,18 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if owner not in (None, mac):
                     # 占用者若已经没有 iSCSI 会话（关机/拔电/掉线没重连），把它当过期占用夺过来，
-                    # 否则一台关机的机器能把这个母盘锁很久。判据（都必须成立）：
-                    #   ① 该 target 当前没有 I_T nexus；
-                    #   ② 占用者不是“刚还在心跳”的机器（回写机开机时本来就没心跳，不能用“有心跳记录”当判据）；
-                    #   ③ L2 上 ARP 也不应答（arping 不可用时这项跳过，交给巡检的宽限期兜底）。
+                    # 否则一台关机的机器能把这个母盘锁很久。判据只看 tgtadm：该 MAC 的 target
+                    # 当前没有 I_T nexus（get_client_ips() 就是从 tgtadm 输出里解析 nexus 的），
+                    # 与巡检 writeback_lock_stale() 的口径一致——母盘在“有没有人在写”这件事上
+                    # 只取决于会话。
+                    # 额外要求 tgtadm show 本身返回成功：get_client_ips() 查询失败时也会返回空
+                    # 字典，那种“查不到”不能当成“没有会话”，否则 tgt 抽风时会误抢别人的锁。
                     stale = False
                     try:
-                        owner_ip = agent_hub.ip_of(owner) or ""
-                        rec_owner = agent_hub.record_of(owner)
-                        hb_old = (not rec_owner) or \
-                            (time.time() - (rec_owner.get("last_seen") or 0)) > agent_hub.ONLINE_WINDOW
-                        arp_dead = bool(owner_ip) and client_arp_alive(owner_ip) is False
-                        if owner not in get_client_ips() and hb_old and arp_dead:
+                        shown = subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target",
+                                                "--op", "show"],
+                                               capture_output=True, text=True, timeout=5)
+                        if shown.returncode == 0 and owner not in get_client_ips():
                             stale = True
                     except Exception:
                         stale = False
@@ -1674,50 +1650,6 @@ class Handler(BaseHTTPRequestHandler):
             "shell\n"
         )
 
-def _form_boundary(content_type):
-    """从 multipart/form-data 的 Content-Type 里取 boundary（无引号）；没有返回 None。"""
-    for part in (content_type or "").split(";"):
-        k, _, v = part.strip().partition("=")
-        if k.lower() == "boundary" and v:
-            return v.strip().strip('"').encode("utf-8", "replace")
-    return None
-
-
-def _parse_multipart(body, boundary):
-    """把 multipart/form-data 的完整请求体解析成 {字段名: [str 或 bytes]}。
-
-    只用于后台上传小的客户端 exe（上限见 client_release.MAX_UPLOAD），所以整包读进内存，
-    不引入 cgi 模块（3.13 已移除）。文件字段的值是 bytes，普通字段是 str。
-    """
-    delim = b"--" + boundary
-    fields = {}
-    if not body.startswith(delim):
-        return fields
-    for part in body[len(delim):].split(delim):
-        if part[:2] == b"--":                     # 结束标记
-            break
-        part = part[2:] if part[:2] == b"\r\n" else part.lstrip(b"\r\n")
-        if part.endswith(b"\r\n"):
-            part = part[:-2]
-        head, sep, val = part.partition(b"\r\n\r\n")
-        if not sep:
-            continue
-        name, filename = None, None
-        for line in head.decode("utf-8", "replace").split("\r\n"):
-            if line.lower().startswith("content-disposition:"):
-                for item in line.split(";"):
-                    k, _, v = item.strip().partition("=")
-                    if k.lower() == "name":
-                        name = v.strip().strip('"')
-                    elif k.lower() == "filename":
-                        filename = v.strip().strip('"')
-        if not name:
-            continue
-        fields.setdefault(name, []).append(val if filename is not None else
-                                            val.decode("utf-8", "replace"))
-    return fields
-
-
 class WebAdminHandler(BaseHTTPRequestHandler):
     """简易 Web 管理后台：修改密码 / 创建空白盘 / 查看客户机名单 / 多账号与个人网盘。"""
     def log_message(self, fmt, *args):
@@ -1801,11 +1733,10 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             live = owner in conn
             state = ('<span class="ok">会话正常</span>' if live
                      else '<span class="err">已断开</span><span class="small">（占用已过期，巡检会自动解除）</span>')
-            form = ('<form method="post" action="/web/clients/cmd" class="inline-form"'
+            form = ('<form method="post" action="/web/writeback/release" class="inline-form"'
                     ' onsubmit="return confirm(\'解除 ' + html.escape(img_name)
                     + ' 的回写占用？只有确认占用者已关机/断线时才点。\')">'
                     + self._csrf_hidden()
-                    + '<input type="hidden" name="action" value="release_writeback">'
                     + '<input type="hidden" name="img" value="' + html.escape(img_name) + '">'
                     + '<input type="submit" value="手动解除占用"></form>')
             wb_lines.append('<p>' + html.escape(img_name) + ' ← ' + html.escape(owner) + '　'
@@ -1824,7 +1755,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             + '<p class="small">回写模式会直接修改母盘，同一母盘同一时刻只允许一台机器回写。'
             '占用只在<b>占用者有 iSCSI 会话</b>期间有效：客户机一关机/断线，'
             '约 ' + str(WRITEBACK_LOCK_GRACE) + ' 秒后由巡检自动解除（占用者仍可在这段时间内重连）。'
-            '客户机拔电、跨 VLAN 探测不到、或状态卡住时，用上面的「手动解除占用」。</p></div>'
+            '客户机拔电、或状态卡住时，用上面的「手动解除占用」。</p></div>'
             + '<div class="card"><h2>后台手动挂载（iSCSI）</h2><p>' + exp_items + '</p>'
             '<p class="small">管理入口：<a href="/web/export">iSCSI 挂载</a>。'
             '挂载中的镜像不可再被 PXE 叠加启动或回写。</p></div>'
@@ -1915,131 +1846,27 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                  + '填服务器 IP 后在上表选择要连的 IQN（写直达母盘，请谨慎操作）。</p></div>')
         self._send_html(_page_html("iSCSI 挂载", body, NAV_ADMIN))
 
-    # ---------- VNC 控制（后台内嵌 noVNC：浏览器 --ws--> 服务器 --> 客户机 5900） ----------
-    # 静态资源是 vendored 的 noVNC（web/vnc/core 与 web/vnc/vendor，MPL-2.0）；
-    # 只有管理员会话能访问，普通用户的网盘页面不涉及这些 JS（继续 IE11 兼容）。
-    VNC_MIME = {".js": "text/javascript", ".mjs": "text/javascript",
-                ".html": "text/html; charset=utf-8", ".css": "text/css",
-                ".json": "application/json", ".png": "image/png",
-                ".svg": "image/svg+xml", ".gif": "image/gif", ".ico": "image/x-icon",
-                ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8",
-                ".map": "application/json"}
-
-    def _vnc_require_admin(self):
-        """VNC 页面与桥都只给管理员。返回会话或 None（已写出响应）。"""
-        s = self._session()
-        if not s:
-            self._redirect("/")
-            return None
-        if s.get("role") != "admin":
-            self.send_error(403, "forbidden")
-            return None
-        return s
-
-    def _vnc_info(self, params):
-        mac = "".join(c for c in (params.get("mac", [""])[0]).lower()
-                      if c in "0123456789abcdef")
-        rec = agent_hub.record_of(mac)
-        if not rec:
-            self._send_json({"ok": False, "mac": mac, "err": "该客户机还没跑 agent（没有心跳记录）"})
-            return
-        self._send_json({"ok": True, "mac": mac, "online": rec.get("online", False),
-                         "hostname": rec.get("hostname", ""), "ip": rec.get("ip", ""),
-                         "vnc_running": rec.get("vnc_running", False),
-                         "vnc_port": rec.get("vnc_port") or 5900,
-                         "drive": rec.get("drive", "")})
-
-    def _serve_vnc_file(self, path):
-        """从 web/vnc/ 下发 noVNC 静态文件（防目录穿越，按扩展名给 MIME）。"""
-        rel = urllib.parse.unquote(path[len("/vnc/"):])
-        ext = os.path.splitext(rel)[1].lower()
-        if ext not in self.VNC_MIME:
-            self.send_error(404)
-            return
-        full = os.path.normpath(os.path.join(WEB_VNC_DIR, rel.replace("/", os.sep)))
-        if not full.startswith(WEB_VNC_DIR + os.sep) or not os.path.isfile(full):
-            self.send_error(404)
-            return
-        try:
-            with open(full, "rb") as f:
-                data = f.read()
-        except OSError:
-            self.send_error(404)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", self.VNC_MIME[ext])
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "max-age=600")
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _vnc_dispatch(self, path, params):
-        """处理 /vnc、/vnc/info、/vnc/ws 与 /vnc/<静态文件>。"""
-        if path == "/vnc/ws":
-            if not self._vnc_require_admin():
-                return
-            mac = "".join(c for c in (params.get("mac", [""])[0]).lower()
-                          if c in "0123456789abcdef")
-            rec = agent_hub.record_of(mac)
-            if not rec:
-                self.send_error(502, "unknown client")
-                return
-            host = rec.get("ip") or ""
-            port = rec.get("vnc_port") or 5900
-            if not host:
-                self.send_error(502, "client has no known IP")
-                return
-            try:
-                wsbridge.handle(self, host, port)
-            except wsbridge.BridgeError as e:
-                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{now}] [ERROR] VNC bridge to {mac} ({host}:{port}) failed: {e.msg}")
-                self.send_error(e.code, e.msg)
-            except Exception as e:
-                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{now}] [ERROR] VNC bridge error: {e}")
-                self.send_error(500)
-            return
-        if not self._vnc_require_admin():
-            return
-        if path == "/vnc/info":
-            self._vnc_info(params)
-            return
-        if path == "/vnc":
-            self._serve_vnc_file("/vnc/viewer.html")
-            return
-        self._serve_vnc_file(path)
-
-    # ---------- WebDAV：个人网盘挂载（客户机映射盘符用） ----------
+    # ---------- WebDAV：个人网盘（浏览器 / 任意 WebDAV 客户端访问） ----------
     def _dav_auth(self):
-        """WebDAV 的 HTTP Basic 认证。返回 (网盘用户名, 是否只读)；失败返回 (None, False)。
+        """WebDAV 的 HTTP Basic 认证：网盘账号 + 密码。
 
-        三种身份：
-          1) MAC + agent 接入令牌 → 未登录的客户机：挂的是**只读“通用文件”公共盘**
-          2) 账号 + 密码 → 浏览器 / iSCSI 发起端手工连：完整个人网盘（可写，根目录里
-             还能看到只读的“通用文件”子目录）
-          3) 账号 + 登录会话令牌 → 客户机托盘「登录网盘」后换来的（客户机上不存密码）
+        返回网盘用户名；未提供凭据或校验失败返回 None。
+        登录成功后根目录里还能看到只读的“通用文件”子目录。
         """
         hdr = self.headers.get("Authorization", "")
         if not hdr.lower().startswith("basic "):
-            return None, False
+            return None
         try:
             raw = base64.b64decode(hdr.split(None, 1)[1].strip()).decode("utf-8", "replace")
         except Exception:
-            return None, False
+            return None
         user, sep, pwd = raw.partition(":")
         if not sep:
-            return None, False
+            return None
         user = user.strip()
         if not user:
-            return None, False
-        if agent_hub.check_token(pwd):
-            mac = "".join(c for c in user.lower() if c in "0123456789abcdef")
-            return (mac, True) if len(mac) == 12 else (None, False)
-        sess_user = agent_hub.dav_session_user(pwd)
-        if sess_user and sess_user == user:
-            return user, False
-        return (user, False) if users_auth.check_login(user, pwd) else (None, False)
+            return None
+        return user if users_auth.check_login(user, pwd) else None
 
     def _dav_dispatch(self):
         """把 /dav/ 下的请求交给 webdav 模块。"""
@@ -2053,21 +1880,20 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if not parsed.path.startswith(webdav.MOUNT_PREFIX):
             self.send_error(404)
             return
-        user, readonly = self._dav_auth()
+        user = self._dav_auth()
         if not user:
             self.send_response(401)
             self.send_header("WWW-Authenticate", 'Basic realm="iSCSI Broker cloud"')
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if not readonly:
-            # 首次使用自动建网盘根目录（与网盘页面一致），否则客户机挂载会拿到 404
-            try:
-                os.makedirs(cloud_store.user_home(user), exist_ok=True)
-            except Exception:
-                pass
+        # 首次使用自动建网盘根目录（与网盘页面一致），否则 WebDAV 客户端会拿到 404
+        try:
+            os.makedirs(cloud_store.user_home(user), exist_ok=True)
+        except Exception:
+            pass
         rel = urllib.parse.unquote(parsed.path[len(webdav.MOUNT_PREFIX):]).strip("/")
-        webdav.handle(self, user, rel, readonly)
+        webdav.handle(self, user, rel)
 
     def do_OPTIONS(self):
         """任何 OPTIONS 都按 WebDAV 做能力应答。
@@ -2114,9 +1940,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        if path == "/vnc" or path.startswith("/vnc/"):
-            self._vnc_dispatch(path, urllib.parse.parse_qs(parsed.query))
-            return
         if path == "/dav" or path.startswith(webdav.MOUNT_PREFIX):
             self._dav_dispatch()
             return
@@ -2133,13 +1956,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             return
         if path == "/web/register":   # 公开注册页（无需会话）
             self._register_page()
-            return
-        # 客户机托盘「检查更新」：不走浏览器会话，靠 agent 接入令牌认证（见 _agent_version_info）
-        if path in ("/agent/version", "/agent/exe"):
-            if path == "/agent/version":
-                self._agent_version_info()
-            else:
-                self._agent_exe()
             return
         if not self._require_session():
             return
@@ -2162,8 +1978,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._do_download(s)
             return
         if path in ("/web/users", "/web/settings", "/web/common", "/web/create",
-                    "/web/password", "/web/common/download", "/web/netctrl", "/web/export",
-                    "/web/clients"):
+                    "/web/password", "/web/common/download", "/web/netctrl", "/web/export"):
             s = self._session()
             if not self._role_gate(s, "admin"):
                 return
@@ -2173,8 +1988,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 self._password_page(params.get("msg", [""])[0] or None)
             elif path == "/web/users":
                 self._users_page(params.get("msg", [""])[0] or None)
-            elif path == "/web/clients":
-                self._clients_page(params.get("msg", [""])[0] or None)
             elif path == "/web/settings":
                 self._settings_page(params.get("msg", [""])[0] or None)
             elif path == "/web/netctrl":
@@ -2191,28 +2004,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
     # ---------- POST ----------
     def do_POST(self):
         path = urllib.parse.urlparse(self.path).path
-        # 客户机 agent 通道：不走会话 Cookie，靠接入令牌认证（见 agent_hub）
-        if path == "/agent/poll":
-            self._agent_poll()
-            return
-        if path == "/agent/result":
-            self._agent_result()
-            return
-        # 客户机托盘的状态上报（挂了没挂 Z 盘、登录了谁），不影响指令队列
-        if path == "/agent/status":
-            self._agent_status()
-            return
-        # 客户机托盘「登录网盘」：账号密码换成短期会话令牌（客户机上不存密码）
-        if path == "/agent/login":
-            self._agent_login()
-            return
-        if path == "/agent/logout":
-            self._agent_logout()
-            return
-        # 客户机托盘「检查更新」：只把“请求更新”告诉服务器，由 SYSTEM 主进程执行替换
-        if path == "/agent/request-update":
-            self._agent_request_update()
-            return
         if path == "/web/login":
             self._do_login(self._form())
             return
@@ -2232,11 +2023,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                 return
             self._do_common_upload(s)
             return
-        if path == "/web/clients/upload":     # 客户端 exe 上传（multipart，自带 csrf 字段）
-            if not self._role_gate(s, "admin"):
-                return
-            self._do_client_upload(s)
-            return
         form = self._form()
         if form.get("csrf", [""])[0] != s["csrf"]:   # 简单 CSRF 校验
             self._redirect("/")
@@ -2254,13 +2040,13 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if path in ("/web/users/quota", "/web/settings", "/web/common/delete",
                     "/web/create", "/web/password",
                     "/web/netctrl/default", "/web/netctrl/mac",
-                    "/web/export", "/web/export/unmount", "/web/clients/cmd"):
+                    "/web/export", "/web/export/unmount", "/web/writeback/release"):
             if not self._role_gate(s, "admin"):
                 return
             if path == "/web/users/quota":
                 self._do_users_quota(form)
-            elif path == "/web/clients/cmd":
-                self._do_clients_cmd(form)
+            elif path == "/web/writeback/release":
+                self._do_writeback_release(form)
             elif path == "/web/settings":
                 self._do_settings(form)
             elif path == "/web/netctrl/default":
@@ -2627,573 +2413,20 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             _ok, msg = users_auth.set_user_quota(name, bytes_n)
         self._redirect("/web/users?msg=" + urllib.parse.quote(msg, safe=""))
 
-    # ---------- 管理员：客户机控制（agent 通道 / 关机重启 / 网盘挂载 / VNC） ----------
-    # 客户机里跑 agent（见 client/），它只主动向服务器心跳，不开放入站端口：
-    #   POST /agent/poll    心跳 + 取一条待执行指令
-    #   POST /agent/result  回报执行结果
-    # 两者都靠 agent_hub 的接入令牌认证，不走浏览器会话。
-    CMD_LABELS = {"shutdown": "关机", "reboot": "重启", "vnc_start": "启用 VNC",
-                  "vnc_stop": "停用 VNC", "mount": "挂载网盘", "unmount": "卸载网盘",
-                  "update": "更新客户端"}
+    # ---------- 管理员：回写占用手动解除 ----------
+    def _do_writeback_release(self, form):
+        """后台首页「回写模式占用」的手动解除：清掉登记，并把占用者残留的母盘直连 target 一并删除。
 
-    def _send_json(self, obj, code=200):
-        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def _json_body(self):
-        """读取并解析请求体 JSON（客户机 agent 用，体积很小）。非法返回 None。"""
-        try:
-            length = int(self.headers.get("Content-Length", 0) or 0)
-        except (TypeError, ValueError):
-            length = 0
-        length = min(max(length, 0), 64 * 1024)
-        raw = self.rfile.read(length) if length else b""
-        try:
-            data = json.loads(raw.decode("utf-8", "replace") or "{}")
-        except ValueError:
-            return None
-        return data if isinstance(data, dict) else None
-
-    def _dav_url(self):
-        """本机 WebDAV 根地址（按当前请求的 Host 拼，兼容 HTTPS/自定义端口）。"""
-        scheme = "https" if HTTPS_ENABLED else "http"
-        return "%s://%s/dav/" % (scheme, self.headers.get("Host", ""))
-
-    # ---------- 客户机客户端「检查更新」（托盘手动触发，不走浏览器会话） ----------
-    #   GET /agent/version?mac=&token=&cur=1.0   查有没有比 cur 新的发布
-    #   GET /agent/exe?ver=1.1&mac=&token=       下载该版本 exe（托盘校验 sha256 后自我替换）
-    # 两个都用 agent 接入令牌认证；exe 不额外加密（内网 + 令牌 + sha256 校验）。
-    def _agent_exe_rel(self, ver):
-        """某个版本的下载地址（相对路径，托盘按自己配的 url 拼）。"""
-        return "/agent/exe?ver=" + urllib.parse.quote(ver, safe="")
-
-    def _client_exe_row(self, ver, rec=None):
-        """托盘要的信息：版本元数据（不含服务器本地路径）。"""
-        return {"url": self._agent_exe_rel(ver),
-                "sha256": (rec or {}).get("sha256", ""),
-                "size": (rec or {}).get("size", 0),
-                "notes": (rec or {}).get("notes", "")}
-
-    def _agent_version_info(self):
-        """托盘「检查更新」：返回当前发布版本与是否有更新。"""
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        if not agent_hub.check_token((q.get("token") or [""])[0]):
-            self._send_json({"ok": False, "err": "bad token"}, 403)
-            return
-        cur = (q.get("cur") or [""])[0].strip()
-        avail, rec = client_release.available_for(cur)
-        if not avail:
-            self._send_json({"ok": True, "available": False,
-                             "ver": client_release.current() or cur})
-            return
-        out = {"ok": True, "available": True, "ver": rec["ver"]}
-        out.update(self._client_exe_row(rec["ver"], rec))
-        self._send_json(out)
-
-    def _agent_exe(self):
-        """下载指定版本的客户端 exe。"""
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-        if not agent_hub.check_token((q.get("token") or [""])[0]):
-            self._send_json({"ok": False, "err": "bad token"}, 403)
-            return
-        ver = (q.get("ver") or [""])[0].strip() or client_release.current()
-        rec = client_release.release_of(ver)
-        path = client_release.path_of(ver)
-        if not rec or not path:
-            self._send_json({"ok": False, "err": "no such version"}, 404)
-            return
-        try:
-            with open(path, "rb") as f:
-                blob = f.read()
-        except OSError as e:
-            self._send_json({"ok": False, "err": "read failed: %s" % e}, 500)
-            return
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(blob)))
-        self.send_header("X-Client-Version", rec["ver"])
-        self.send_header("X-Client-Sha256", rec.get("sha256", ""))
-        self.send_header("Content-Disposition",
-                         'attachment; filename="iscsi-broker-agent-%s.exe"' % rec["ver"])
-        self.end_headers()
-        self.wfile.write(blob)
-
-    def _agent_poll(self):
-        """客户机 agent 心跳：更新在线状态并下发一条待执行指令。"""
-        data = self._json_body()
-        if data is None:
-            self._send_json({"ok": False, "err": "bad json"}, 400)
-            return
-        if not agent_hub.check_token(data.get("token")):
-            self._send_json({"ok": False, "err": "bad token"}, 403)
-            return
-        info = data.get("info") if isinstance(data.get("info"), dict) else {}
-        mac, cmd = agent_hub.poll(data.get("mac"), ip=self.client_address[0], info=info)
-        if not mac:
-            self._send_json({"ok": False, "err": "bad mac"}, 400)
-            return
-        self._send_json({"ok": True, "mac": mac, "account": agent_hub.account_of(mac),
-                         "dav": self._dav_url(), "mount": agent_hub.mount_wanted(mac),
-                         "cmd": cmd})
-
-    def _agent_result(self):
-        """客户机 agent 回报指令执行结果。"""
-        data = self._json_body()
-        if data is None or not agent_hub.check_token(data.get("token")):
-            self._send_json({"ok": False, "err": "bad request"}, 400)
-            return
-        ok, err = agent_hub.result(data.get("mac"), data.get("id"),
-                                   data.get("ok", False), data.get("msg", ""))
-        self._send_json({"ok": ok, "err": err}, 200 if ok else 400)
-
-    def _agent_request_update(self):
-        """托盘「检查更新」请求：由服务器把 update 指令排进该 MAC 的队列。
-
-        为什么不让托盘自己下载替换：托盘是 SYSTEM 进程用 WTSQueryUserToken 在用户会话里
-        拉起来的**普通用户令牌**进程。它 taskkill 不掉 SYSTEM 的 agent 主进程（拒绝访问，
-        exe 一直锁着），也无权 schtasks /Run 一个 /RU SYSTEM /RL HIGHEST 的计划任务；
-        兜底 `start "" exe run` 更是把本应以 SYSTEM 运行的后台服务降权成桌面用户进程。
-        所以托盘只负责“请求”，真正的下载/校验/替换交给 SYSTEM 主进程在下一次心跳执行。
+        为什么必须连 target 一起删：见 release_writeback_lock 的说明；否则锁放开后原占用者
+        一重连就继续直写母盘，母盘可能已被别的机器叠加启动或后台挂载。
         """
-        data = self._json_body()
-        if data is None or not agent_hub.check_token(data.get("token")):
-            self._send_json({"ok": False, "err": "bad token"}, 403)
-            return
-        mac = norm_mac_param(data.get("mac"))
-        if not mac:
-            self._send_json({"ok": False, "err": "bad mac"}, 400)
-            return
-        force = bool(data.get("force"))
-        ver = client_release.current()
-        rec = client_release.release_of(ver) if ver else None
-        if not rec:
-            self._send_json({"ok": False, "err": "服务器上还没有发布客户端版本"})
-            return
-        args = {"ver": rec["ver"], "url": self._agent_exe_rel(rec["ver"]),
-                "sha256": rec.get("sha256", ""), "size": rec.get("size", 0)}
-        if force:
-            args["force"] = 1
-        # force_offline=True：这是客户机自己的托盘发来的请求，不需要“在线”兜底判断
-        ok, msg = agent_hub.enqueue(mac, "update", force_offline=True, **args)
-        if not ok:
-            self._send_json({"ok": False, "err": msg})
-            return
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] [INFO] Client {mac} tray requested client update to v{rec['ver']} (force={force})")
-        self._send_json({"ok": True, "ver": rec["ver"], "err": ""})
-
-    def _agent_status(self):
-        """客户机托盘上报自己的状态（Z 盘挂没挂、登录了谁）。
-
-        与 /agent/poll 分开：托盘上报不该拿走指令（指令由 SYSTEM 进程取），
-        顺带把服务器当前的“是否允许挂盘 / 默认用户名”带回去，托盘用来对状态。
-        """
-        data = self._json_body()
-        if data is None or not agent_hub.check_token(data.get("token")):
-            self._send_json({"ok": False, "err": "bad token"}, 403)
-            return
-        info = data.get("info") if isinstance(data.get("info"), dict) else {}
-        mac = agent_hub.touch(data.get("mac"), ip=self.client_address[0], info=info)
-        if not mac:
-            self._send_json({"ok": False, "err": "bad mac"}, 400)
-            return
-        self._send_json({"ok": True, "mac": mac, "mount": agent_hub.mount_wanted(mac),
-                         "account": agent_hub.account_of(mac), "dav": self._dav_url(),
-                         "avail_ver": client_release.current()})
-
-    def _agent_login(self):
-        """客户机托盘「登录网盘」：校验账号密码，换一个短期网盘会话令牌。
-
-        这样客户机上不保存网盘密码，WebDAV 只用令牌认证；令牌过期/注销即失效。
-        """
-        data = self._json_body()
-        if data is None or not agent_hub.check_token(data.get("token")):
-            self._send_json({"ok": False, "err": "bad token"}, 403)
-            return
-        ip = self.client_address[0]
-        if dav_login_ratelimited(ip):
-            self._send_json({"ok": False, "err": "密码错误次数太多，请稍后再试"}, 429)
-            return
-        user = (data.get("user") or "").strip()
-        pwd = data.get("pwd") or ""
-        role = users_auth.check_login(user, pwd)
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        if not role:
-            dav_login_failed(ip)
-            time.sleep(1)                       # 限速防暴力猜密码
-            print(f"[{now}] [ERROR] DAV login failed for {user!r} from {ip}")
-            self._send_json({"ok": False, "err": "用户名或密码错误"}, 403)
-            return
-        dav_login_reset(ip)
-        tok = agent_hub.dav_session_issue(user)
-        agent_hub.set_dav_user(data.get("mac"), user)
-        print(f"[{now}] [SUCCESS] DAV login: {user} ({role}) from {ip}")
-        self._send_json({"ok": True, "user": user, "role": role, "token": tok,
-                         "dav": self._dav_url(), "letter": data.get("letter") or ""})
-
-    def _agent_logout(self):
-        """客户机托盘「注销网盘」：让会话令牌立刻失效。"""
-        data = self._json_body()
-        if data is None or not agent_hub.check_token(data.get("token")):
-            self._send_json({"ok": False, "err": "bad token"}, 403)
-            return
-        agent_hub.dav_session_revoke(data.get("session"))
-        agent_hub.set_dav_user(data.get("mac"), "")
-        self._send_json({"ok": True})
-
-    def _cmd_form(self, mac, action, label, confirm=None):
-        """生成“下发指令”的内联表单。"""
-        onsubmit = ''
-        if confirm:
-            onsubmit = ' onsubmit="return confirm(\'' + confirm.replace("'", "") + '\')"'
-        return ('<form method="post" action="/web/clients/cmd" class="inline-form"' + onsubmit + '>'
-                + self._csrf_hidden()
-                + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
-                + '<input type="hidden" name="action" value="' + html.escape(action) + '">'
-                + '<input type="submit" value="' + html.escape(label) + '"></form>')
-
-    def _client_row(self, rec, ipxe=None):
-        """渲染客户机控制表的一行。rec 为 agent_hub 记录（或仅有 mac 的占位记录）。"""
-        mac = rec.get("mac", "")
-        online = bool(rec.get("online"))
-        if online:
-            st = '<span class="ok">在线</span>'
-        elif ipxe:
-            st = '<span class="err">未装 agent</span>'
-        else:
-            st = '离线'
-        sep = ' '
-        acts = []
-        if online:
-            acts.append(self._cmd_form(mac, "shutdown", "关机", "确定远程关机？客户机将立即关闭。"))
-            acts.append(self._cmd_form(mac, "reboot", "重启", "确定远程重启？客户机将立即重启。"))
-            if rec.get("vnc_running"):
-                acts.append(self._cmd_form(mac, "vnc_stop", "停用 VNC"))
-                acts.append('<a href="/vnc?mac=' + urllib.parse.quote(mac, safe="")
-                            + '" target="_blank">VNC 画面</a>')
-            else:
-                acts.append(self._cmd_form(mac, "vnc_start", "启用 VNC"))
-            if rec.get("want_mount"):
-                acts.append(self._cmd_form(mac, "unmount", "停用网盘",
-                                           "停用后该客户机的 Z 盘会被卸载，确定？"))
-            else:
-                acts.append(self._cmd_form(mac, "mount", "启用网盘"))
-            acts.append(self._upgrade_form(mac, rec))
-        else:
-            acts.append('—')
-        # 默认用户名设置表单（只用于预填客户机托盘的登录框，不保存密码；离线也能先设好）
-        acc_form = ('<form method="post" action="/web/clients/cmd" class="inline-form">'
-                    + self._csrf_hidden()
-                    + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
-                    + '<input type="hidden" name="action" value="set_account">'
-                    + '<input type="text" name="account" size="8" value="'
-                    + html.escape(rec.get("account") or "") + '">'
-                    + '<input type="submit" value="保存"></form>')
-        res = rec.get("results") or []
-        if res:
-            r = res[0]
-            cls = 'ok' if r.get("ok") else 'err'
-            when = datetime.datetime.fromtimestamp(r.get("ts") or 0).strftime("%m-%d %H:%M:%S")
-            res_html = ('<span class="' + cls + '">' + html.escape(self.CMD_LABELS.get(
-                r.get("type") or "", r.get("type") or "指令")) + (' 成功' if r.get("ok") else ' 失败')
-                + '</span> <span class="small">' + when + '</span>')
-            if r.get("msg"):
-                res_html += '<br><span class="small">' + html.escape(r["msg"]) + '</span>'
-        else:
-            res_html = '<span class="small">—</span>'
-        vnc = ('<span class="ok">运行中 :%s</span>' % (rec.get("vnc_port") or 5900)) \
-            if rec.get("vnc_running") else '<span class="small">未运行</span>'
-        if rec.get("drive"):
-            drive_txt = html.escape(rec["drive"])
-            if rec.get("dav_user"):
-                drive_txt += '<br><span class="ok">已登录 ' + html.escape(rec["dav_user"]) + '</span>'
-            else:
-                drive_txt += '<br><span class="small">未登录（只读通用文件）</span>'
-        elif rec.get("want_mount"):
-            drive_txt = '<span class="small">待挂载</span>'
-        else:
-            drive_txt = '<span class="small">已停用</span>'
-        ipxe_txt = ""
-        if ipxe:
-            ipxe_txt = '<br><span class="small">' + html.escape(
-                ("iPXE: %s %s" % (ipxe.get("img") or "-", ipxe.get("mode") or "")).strip()) + '</span>'
-        # 客户端版本列：服务器当前发布版 vs 这台机器心跳里报的版本
-        av = client_release.current()
-        cv = (rec.get("agent_ver") or "").strip()
-        if not cv:
-            ver_txt = '<span class="small">未知</span>'
-        elif av and cv != av:
-            ver_txt = ('<span class="err">' + html.escape(cv) + '</span><br><span class="small">可升 '
-                       + html.escape(av) + '</span>')
-        else:
-            ver_txt = '<span class="ok">' + html.escape(cv) + '</span>'
-        return ('<tr><td>' + html.escape(mac) + ipxe_txt + '</td><td>'
-                + html.escape(rec.get("hostname") or "—") + '</td><td>'
-                + html.escape(rec.get("ip") or "—") + '</td><td>' + st + '</td><td>'
-                + drive_txt + '</td><td>' + vnc + '</td><td>'
-                + sep.join(acts) + '</td><td>' + acc_form + '</td><td>' + ver_txt
-                + '</td><td>' + res_html + '</td></tr>')
-
-    def _upgrade_form(self, mac, rec=None):
-        """单个客户机的「升级客户端」按钮（同版本时是强制重装）。"""
-        av = client_release.current()
-        cv = ((rec or {}).get("agent_ver") or "").strip()
-        if not av:
-            return '<span class="small" title="服务器还没有发布客户端">升级客户端</span>'
-        if cv and cv == av:
-            label, force, confirm = "重装 v" + av, "1", "该机已是 v%s，强制重装客户端？" % av
-        else:
-            label, force = "升级到 v" + av, "0"
-            confirm = "把该客户机升级到 v%s？客户机会下载新版本并重启自己。" % av
-        return ('<form method="post" action="/web/clients/cmd" class="inline-form"'
-                + ' onsubmit="return confirm(\'' + confirm.replace("'", "") + '\')">'
-                + self._csrf_hidden()
-                + '<input type="hidden" name="mac" value="' + html.escape(mac) + '">'
-                + '<input type="hidden" name="action" value="upgrade_one">'
-                + '<input type="hidden" name="force" value="' + force + '">'
-                + '<input type="submit" value="' + html.escape(label) + '"></form>')
-
-    def _clients_page(self, msg=None):
-        records = agent_hub.snapshot()
-        seen = {r["mac"] for r in records}
-        rows = [self._client_row(r) for r in records]
-        ipxe_only = 0
-        for c in collect_client_info():          # iPXE 侧见过的机器（用于对照谁还没装 agent）
-            if c["mac"] in seen:
-                continue
-            ipxe_only += 1
-            rows.append(self._client_row({"mac": c["mac"], "online": False, "ip": c.get("ip") or "",
-                                          "hostname": "", "vnc_running": False, "vnc_port": 0,
-                                          "drive": "", "account": "", "results": [],
-                                          "agent_ver": ""}, ipxe=c))
-        table = ('<table><tr><th>MAC</th><th>主机名</th><th>IP</th><th>agent</th><th>Z 盘</th>'
-                 '<th>VNC</th><th>操作</th><th>默认用户名</th><th>客户端版本</th>'
-                 '<th>最近结果</th></tr>'
-                 + ("".join(rows) if rows else '<tr><td colspan="10">暂无客户机记录（客户机 agent 还没心跳过）</td></tr>')
-                 + '</table>')
-        msg_html = ''
-        if msg:
-            # 提示颜色：明确以“失败：”开头的（编译/上传/删除等）一定是错误，不要显示成绿色成功
-            cls = 'err' if (msg.startswith("失败") or "失败" in msg or "不在线" in msg
-                            or "不合法" in msg or "请先" in msg or "已满" in msg
-                            or "找不到" in msg) else 'ok'
-            msg_html = '<p class="' + cls + '">' + html.escape(msg) + '</p>'
-        tok = agent_hub.token()
-        body = (
-            '<div class="card"><h2>客户机 agent 接入令牌</h2>' + msg_html
-            + '<p class="small">把这个令牌和服务器地址填进客户机母盘的 <b>agent.ini</b>。'
-            + '令牌同时用于 agent 通道和网盘（WebDAV）认证，客户机上不需要存网盘密码。</p>'
-            + '<pre>' + html.escape(tok) + '</pre>'
-            + '<form method="post" action="/web/clients/cmd" class="inline-form" '
-            + 'onsubmit="return confirm(\'重置后所有客户机都要改 agent.ini，确定？\')">'
-            + self._csrf_hidden()
-            + '<input type="hidden" name="action" value="rotate_token">'
-            + '<input type="submit" value="重置令牌"></form></div>'
-            + self._release_card()
-            + '<div class="card"><h2>客户机控制</h2>' + table
-            + '<p class="small">“在线”= 最近 %d 秒内收到过 agent 心跳。指令随心跳下发，'
-            % agent_hub.ONLINE_WINDOW
-            + '关机/重启会立即执行；VNC 需要母盘里装好 VNC 服务端并在 agent.ini 里配好路径。</p>'
-            + self._upgrade_all_form()
-            + '<p class="small"><b>升级客户端</b>：客户机托盘「检查更新」可以自己拉新版；'
-            + '这里点「升级」是下发一条指令，客户机下次心跳时下载新 exe 并自我替换重启。'
-            + '无盘客户机重启后会回到母盘里的旧版本，需要重做母盘或再升一次。</p>'
-            + '<p class="small"><b>网盘（Z 盘）</b>：默认自动挂载，内容是服务器的“通用文件”（只读）；'
-            + '用户在客户机右下角托盘里<b>登录自己的网盘账号</b>后，Z 盘换成他自己的网盘（可写，'
-            + '里面仍能看到只读的“通用文件”）。「停用网盘」= 不给这台机器挂 Z 盘；'
-            + '“默认用户名”只是预填托盘的登录框，<b>不保存密码</b>，每次开机用户自己输一次。</p>'
-            + ('<p class="small">另有 %d 台机器只有 iPXE 记录、没有 agent 心跳（母盘里还没装客户端）。</p>'
-               % ipxe_only if ipxe_only else '')
-            + '</div>'
-            '<div class="card"><h2>客户机 agent 配置示例（母盘：agent.ini）</h2>'
-            + '<pre>' + html.escape(
-                "[server]\n"
-                "url=http://%s\n" % (self.headers.get("Host", "10.1.1.1:8080"))
-                + "token=" + tok + "\n"
-                "interval=3\n\n"
-                "[vnc]\nexe=C:\\Program Files\\TightVNC\\tvnserver.exe\nargs=-run\nport=5900\n\n"
-                "[dav]\nletter=Z\n") + '</pre>'
-            + '<p class="small">完整部署步骤见仓库 README「客户机客户端」一节。</p></div>'
-        )
-        self._send_html(_page_html("客户机控制", body, NAV_ADMIN))
-
-    def _upgrade_all_form(self):
-        """「全部升级」按钮（下发给所有客户机）。"""
-        av = client_release.current()
-        if not av:
-            return ''
-        return ('<form method="post" action="/web/clients/cmd" class="inline-form"'
-                ' onsubmit="return confirm(\'给所有客户机下发“升级到 v' + html.escape(av)
-                + '”指令？\')">' + self._csrf_hidden()
-                + '<input type="hidden" name="action" value="upgrade_all">'
-                + '<input type="submit" value="全部升级到 v' + html.escape(av) + '"></form>')
-
-    def _release_card(self):
-        """「客户端发布」卡片：当前发布版、历史版本、上传入口。"""
-        info = client_release.info()
-        cur = info["current"]
-        def short_sha(s):
-            return (s or "")[:12] + "…" if s else "—"
-        rows = []
-        for r in info["releases"]:
-            tag = '<span class="ok">当前</span>' if r["ver"] == cur else ''
-            drop = ''
-            if r["ver"] != cur:
-                drop = ('<form method="post" action="/web/clients/cmd" class="inline-form"'
-                        ' onsubmit="return confirm(\'删除已发布的 v' + html.escape(r["ver"])
-                        + '？\')">' + self._csrf_hidden()
-                        + '<input type="hidden" name="action" value="drop_release">'
-                        + '<input type="hidden" name="ver" value="' + html.escape(r["ver"]) + '">'
-                        + '<input type="submit" value="删除"></form>')
-            rows.append('<tr><td>' + html.escape(r["ver"]) + ' ' + tag + '</td><td class="small">'
-                        + html.escape(str(r.get("source") or "")) + '</td><td class="small">'
-                        + str(int(r.get("size") or 0) // 1024) + ' KB</td><td class="small">'
-                        + html.escape(short_sha(r.get("sha256"))) + '</td><td class="small">'
-                        + html.escape(r.get("built") or "") + '</td><td>' + drop + '</td></tr>')
-        table = ('<table><tr><th>版本</th><th>来源</th><th>大小</th><th>sha256</th><th>发布时间</th>'
-                 '<th></th></tr>'
-                 + ("".join(rows) if rows else '<tr><td colspan="6">还没有发布过客户端</td></tr>')
-                 + '</table>')
-        cur_txt = ('当前发布：<b>v' + html.escape(cur) + '</b>' if cur else
-                   '<span class="err">还没有发布任何客户端版本</span>')
-        upload_form = ('<form method="post" action="/web/clients/upload" '
-                       'enctype="multipart/form-data" class="inline-form">'
-                       + self._csrf_hidden()
-                       + 'exe：<input type="file" name="exe" accept=".exe"> '
-                       + '版本：<input type="text" name="ver" size="7" placeholder="如 1.1"> '
-                       + '<input type="submit" value="上传并发布"></form>')
-        return ('<div class="card"><h2>客户端发布</h2>'
-                + '<p class="small">发布库：<code>' + html.escape(info["dir"] or "") + '</code>，'
-                + '只保留最近 %d 个版本。</p>' % client_release.KEEP_RELEASES
-                + '<p>' + cur_txt + '</p>' + table
-                + '<p>上传 exe：' + upload_form + '</p>'
-                + '<p class="small">客户端是 .NET Framework + WinForms 的 Windows 程序，'
-                + '<b>只在 Windows 上编译</b>：在装有 Windows 的机器上跑 <code>client\\build.bat</code>，'
-                + '把 <code>client\\dist\\iscsi-broker-agent.exe</code> 传上来（版本号留空取源码里的 VERSION）。'
-                + '客户机端怎么更新见 client/README.md；无盘客户机重启会回到母盘里的版本，'
-                + '想让升级“永久生效”要重做母盘。</p>'
-                + '</div>')
-
-    def _do_clients_cmd(self, form):
-        """处理客户机控制页的下发按钮（关机/重启/VNC/挂载/账号/令牌/更新客户端）。"""
-        action = form.get("action", [""])[0]
-        if action == "rotate_token":
-            agent_hub.rotate_token()
-            self._redirect("/web/clients?msg=" + urllib.parse.quote("令牌已重置，请更新各客户机的 agent.ini", safe=""))
-            return
-        if action in ("upgrade_one", "upgrade_all"):
-            self._do_upgrade(action == "upgrade_all",
-                             form.get("mac", [""])[0], form.get("force", [""])[0] == "1")
-            return
-        if action == "release_writeback":
-            img = form.get("img", [""])[0].strip()
-            owner = release_writeback_lock(img, "管理员在后台手动解除")
-            msg = ("已解除 %s 的回写占用（原占用者 %s；其母盘直连 target 已一并删除，"
-                   "该客户机的 iSCSI 盘会立即断开，避免锁放开后它继续直写母盘）"
-                   % (img, owner)) if owner \
-                else ("%s 当前没有回写占用" % img)
-            self._redirect("/?msg=" + urllib.parse.quote(msg, safe=""))
-            return
-        if action == "drop_release":
-            try:
-                client_release.remove((form.get("ver", [""])[0] or "").strip())
-                ok, msg = True, "已删除该发布版本"
-            except client_release.ReleaseError as e:
-                ok, msg = False, str(e)
-            self._redirect("/web/clients?msg=" + urllib.parse.quote(("" if ok else "失败：") + msg, safe=""))
-            return
-        mac = form.get("mac", [""])[0]
-        if action == "set_account":
-            _ok, msg = agent_hub.set_account(mac, form.get("account", [""])[0])
-            self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
-            return
-        args = {}
-        if action == "mount":
-            args["url"] = self._dav_url()
-        # 注：enqueue 会把“是否挂网盘”的意图记在服务器上（默认挂载；无盘客户机重启后靠它对齐）
-        _ok, msg = agent_hub.enqueue(mac, action, **args)
-        if not _ok and action in ("mount", "unmount"):
-            msg = "已记下“%s”，客户机上线后会自动同步（现在：%s）" % (
-                "启用网盘" if action == "mount" else "停用网盘", msg)
-        self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
-
-    def _do_upgrade(self, all_machines, mac, force):
-        """后台「升级客户端」：把发布版作为 update 指令下发给客户机（客户机下次心跳执行）。"""
-        ver = client_release.current()
-        rec = client_release.release_of(ver) if ver else None
-        if not rec:
-            self._redirect("/web/clients?msg=" + urllib.parse.quote(
-                "服务器上还没有发布客户端：请在下面「客户端发布」里上传 Windows 上 "
-                "client\\build.bat 编好的 iscsi-broker-agent.exe", safe=""))
-            return
-        args = {"ver": rec["ver"], "url": self._agent_exe_rel(rec["ver"]),
-                "sha256": rec.get("sha256", ""), "size": rec.get("size", 0)}
-        if force:
-            args["force"] = 1
-        targets = [r["mac"] for r in agent_hub.snapshot()] if all_machines else [mac]
-        targets = [m for m in targets if m]
-        if not targets:
-            self._redirect("/web/clients?msg=" + urllib.parse.quote("没有可下发的客户机", safe=""))
-            return
-        ok_n, fail = 0, []
-        for m in targets:
-            ok, msg = agent_hub.enqueue(m, "update", **args)
-            if ok:
-                ok_n += 1
-            else:
-                fail.append("%s: %s" % (m, msg))
-        if ok_n and not fail:
-            msg = "已下发“更新客户端到 v%s”：%d 台（客户机下次心跳时执行）" % (rec["ver"], ok_n)
-        elif ok_n:
-            msg = "已下发 %d 台更新到 v%s；%d 台失败：%s" % (ok_n, rec["ver"], len(fail), "；".join(fail[:3]))
-        else:
-            msg = "下发失败：" + "；".join(fail[:3])
-        self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
-
-    def _do_client_upload(self, s):
-        """后台上传客户端 exe：POST /web/clients/upload（multipart/form-data）。"""
-        def back(msg):
-            self._redirect("/web/clients?msg=" + urllib.parse.quote(msg, safe=""))
-
-        ctype = self.headers.get("Content-Type", "") or ""
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        limit = client_release.MAX_UPLOAD + 1024
-        if "multipart/form-data" not in ctype.lower():
-            back("上传失败：不是表单上传")
-            return
-        if length <= 0 or length > limit:
-            back("上传失败：文件为空或超过 %d MB" % (client_release.MAX_UPLOAD // 1024 // 1024))
-            return
-        bound = _form_boundary(ctype)
-        if not bound:
-            back("上传失败：缺少 boundary")
-            return
-        # 直接读进内存（上限 32MB，够放 200KB 的 exe）
-        fields = _parse_multipart(self.rfile.read(length), bound)
-        if fields.get("csrf", [""])[0] != s.get("csrf"):
-            back("上传失败：会话已过期，请重新登录后再传")
-            return
-        blob = fields.get("exe", [b""])[0]
-        if isinstance(blob, str):
-            blob = blob.encode("utf-8", "replace")
-        ver = (fields.get("ver", [""])[0] or "").strip()
-        try:
-            if not ver:
-                # 版本号留空时取装的源码里的 VERSION（install.sh 会把 client/Agent.cs 装到程序目录）
-                ver = client_release.source_version(os.path.dirname(os.path.abspath(__file__)))
-            if not ver:
-                back("上传失败：没填版本号，也读不到 client/Agent.cs 里的 VERSION，请手填版本号（如 1.1）")
-                return
-            rec = client_release.import_bytes(blob, ver, notes="uploaded from web")
-            back("已发布客户端 v%s（%d 字节，sha256=%s…）" % (rec["ver"], rec["size"], rec["sha256"][:12]))
-        except client_release.ReleaseError as e:
-            back("上传失败：" + str(e))
-        except Exception as e:
-            back("上传失败：" + str(e))
+        img = form.get("img", [""])[0].strip()
+        owner = release_writeback_lock(img, "管理员在后台手动解除")
+        msg = ("已解除 %s 的回写占用（原占用者 %s；其母盘直连 target 已一并删除，"
+               "该客户机的 iSCSI 盘会立即断开，避免锁放开后它继续直写母盘）"
+               % (img, owner)) if owner \
+            else ("%s 当前没有回写占用" % img)
+        self._redirect("/?msg=" + urllib.parse.quote(msg, safe=""))
 
     # ---------- 管理员：默认配额 ----------
     def _settings_page(self, msg=None):
@@ -3397,40 +2630,6 @@ if __name__ == "__main__":
     users_auth.setup(OVERLAY_DIR, lambda pwd: verify_password(pwd, ADMIN_PW_STORED))
     cloud_store.setup(os.path.join(BASE_DIR, "cloud"))
     print(f"[{datetime.datetime.now()}] [START] Cloud drive: {os.path.join(BASE_DIR, 'cloud')}")
-
-    # 客户机 agent 控制通道（接入令牌 + 心跳状态 + 指令队列）：令牌落盘，重启不变
-    agent_hub.setup(OVERLAY_DIR)
-    print(f"[{datetime.datetime.now()}] [START] Client agent channel ready (token file: "
-          f"{os.path.join(OVERLAY_DIR, agent_hub.TOKEN_FILE_NAME)})")
-
-    # 客户机客户端发布库（托盘「检查更新」从这里拉新版 exe）。
-    # 注意：客户端只在 Windows 上用 client\build.bat 编译，服务器不编译，只负责存放与分发。
-    print(f"[{datetime.datetime.now()}] [START] Client release store: "
-          f"{client_release.setup(BASE_DIR, os.path.dirname(os.path.abspath(__file__)))}")
-
-    # 命令行维护入口（不启动服务）：
-    #   python3 iscsi_broker.py --publish-client <exe路径> --client-ver 1.1
-    if "--publish-client" in sys.argv:
-        def _arg_val(name):
-            if name in sys.argv:
-                i = sys.argv.index(name)
-                if i + 1 < len(sys.argv):
-                    return sys.argv[i + 1]
-            return ""
-
-        ver = (_arg_val("--client-ver") or "").strip()
-        src = _arg_val("--publish-client")
-        if not src or not ver:
-            print("用法：iscsi_broker.py --publish-client <Windows 上 build.bat 编出的 exe> "
-                  "--client-ver <版本号，如 1.1>")
-            raise SystemExit(2)
-        try:
-            rec = client_release.import_file(src, ver, notes="published from cli")
-            ok, msg = True, "已发布 v%s（%d 字节）" % (rec["ver"], rec["size"])
-        except (client_release.ReleaseError, OSError) as e:
-            ok, msg = False, str(e)
-        print(("[OK] " if ok else "[ERROR] ") + msg)
-        raise SystemExit(0 if ok else 1)
 
     # 联网控制：接管转发/NAT（按客户机 MAC 控制上网），并启动规则巡检线程
     if NETCTRL_ENABLED:

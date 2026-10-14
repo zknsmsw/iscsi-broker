@@ -46,7 +46,7 @@ LEGACY_BASE=""       # 从旧部署里探测到的数据目录
 LEGACY_SRC=""        # 旧部署的程序目录/源码位置
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROG_FILES=(iscsi_broker.py users_auth.py cloud_store.py netctrl.py agent_hub.py webdav.py wsbridge.py client_release.py)
+PROG_FILES=(iscsi_broker.py users_auth.py cloud_store.py netctrl.py webdav.py)
 
 c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_err=$'\033[31m'; c_info=$'\033[36m'; c_end=$'\033[0m'
 [[ -t 1 ]] || { c_ok=""; c_warn=""; c_err=""; c_info=""; c_end=""; }
@@ -398,22 +398,6 @@ install_files() {
   for f in "${PROG_FILES[@]}"; do
     install -m 0644 "$SRC_DIR/$f" "$INSTALL_DIR/$f"
   done
-  if [[ -d "$SRC_DIR/web" ]]; then
-    rm -rf "$INSTALL_DIR/web"
-    cp -a "$SRC_DIR/web" "$INSTALL_DIR/web"
-  else
-    warn "源码里没有 web/ 目录，VNC 控制页（noVNC）会不可用"
-  fi
-  # 客户机客户端源码：**不在服务器上编译**（客户端是 Windows 程序，只在 Windows 上用
-  # build.bat 编），装过去只是为了后台上传时能自动读出版本号（Agent.cs 里的 VERSION）。
-  if [[ -f "$SRC_DIR/client/Agent.cs" ]]; then
-    mkdir -p "$INSTALL_DIR/client"
-    install -m 0644 "$SRC_DIR/client/Agent.cs" "$INSTALL_DIR/client/Agent.cs"
-    [[ -f "$SRC_DIR/client/agent.ico" ]] && \
-      install -m 0644 "$SRC_DIR/client/agent.ico" "$INSTALL_DIR/client/agent.ico"
-  else
-    warn "源码里没有 client/Agent.cs：后台上传客户端时需要手填版本号"
-  fi
   if [[ -f "$SRC_DIR/README.md" ]]; then
     install -m 0644 "$SRC_DIR/README.md" "$INSTALL_DIR/README.md"
   fi
@@ -427,7 +411,7 @@ check_in_place_safety() {
   [[ -f "$SRC_DIR/iscsi_broker.py" ]] || die "--in-place 需要在有 iscsi_broker.py 的目录里运行"
   local owner unsafe
   owner="$(stat -c '%U' "$SRC_DIR" 2>/dev/null || echo '?')"
-  unsafe="$(find "$SRC_DIR" -maxdepth 1 \( -name '*.py' -o -name 'web' -o -name '.' \) -perm /022 -print 2>/dev/null | head -3 || true)"
+  unsafe="$(find "$SRC_DIR" -maxdepth 1 \( -name '*.py' -o -name '.' \) -perm /022 -print 2>/dev/null | head -3 || true)"
   if [[ "$owner" != "root" ]]; then
     warn "原地模式：$SRC_DIR 属主是 $owner（不是 root）。systemd 会以 root 执行这里的代码，"
     warn "任何能写这个目录的用户都等于能拿到 root。"
@@ -482,7 +466,7 @@ write_unit() {
   mkdir -p "$(dirname "$UNIT_FILE")"
   cat > "$UNIT_FILE" <<EOF
 [Unit]
-Description=iSCSI Broker (iPXE 无盘启动 + iSCSI 供给 + Web 管理后台 + 个人网盘/客户机控制)
+Description=iSCSI Broker (iPXE 无盘启动 + iSCSI 供给 + Web 管理后台 + 个人网盘)
 Documentation=file://$PROG_DIR/README.md
 After=network-online.target tgt.service
 Wants=network-online.target
@@ -601,7 +585,8 @@ print_summary() {
   echo " 还需要手动做的："
   echo "   1) 把母盘 .raw 放进 $BASE_DIR/images/（文件名如 win11.raw）"
   echo "   2) 配 dnsmasq 的 DHCP/TFTP，把 iPXE 引导器推给客户机（README 第五节 4）"
-  echo "   3) 客户机母盘里装客户端 agent，实现远程关机/VNC/网盘挂载（README 第五节 7、client/README.md）"
+  echo "   3) 客户机用网盘：浏览器打开 http://$ip:8080/dav/ ，或任意 WebDAV 客户端/映射网络驱动器"
+  echo "      （账号密码 = 自己的网盘账号；未登录客户机的 Z 盘自动挂载已移除，详见 README 第五节 7）"
   echo
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$UNIT_NAME"; then
     echo "${c_ok}服务正在运行${c_end}"

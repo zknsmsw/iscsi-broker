@@ -32,15 +32,15 @@
 - 注册账号拥有个人网盘；`admin` 拥有管理后台。
 - **保留用户名**：`admin` 与 `_common`（`users_auth.RESERVED_NAMES`）不可注册、不可登录。`_common`
   是全局「通用文件」目录名，普通用户的私有目录就是 `CLOUD_ROOT/<用户名>`，一旦允许注册该账号，
-  它就能读写/删除所有用户和所有未登录客户机看到的公共文件。
+  它就能读写/删除所有用户看到的公共文件。
 
 ### 3. 个人网盘（云盘）
-- 普通用户功能（**仅**）：上传文件、下载文件、创建文件夹。
+- 普通用户功能：网页端上传文件、下载文件、创建文件夹；WebDAV 里还可以改名/移动/删除（见第七节）。
 - 每个账号独立空间，受**配额**限制（默认 1 GiB，管理员可改）。
-- **通用文件**：管理员上传的文件出现在所有账号网盘的"通用文件"目录下，**只读**。
+- **通用文件**：管理员上传的文件出现在所有账号网盘的"通用文件"目录下，**只读**（网页端与 WebDAV 都只读）。
 
 ### 4. Web 管理后台（端口 8080，仅 admin）
-- 客户机名单（在线状态、回写占用）、创建空白盘、修改管理员密码。
+- 客户机名单（当前有 iSCSI 会话的机器 + 回写模式占用，可手动解除占用）、创建空白盘、修改管理员密码。
 - **iSCSI 挂载**：把任意一张“未在使用的镜像（母盘 .raw）”直接导出为 iSCSI target（**写直达母盘**，等同回写语义），页面**写出 IQN** 供任意 iSCSI 发起端（Windows 发起程序 / iscsiadm）手动连接，并支持一键卸载；挂载中的镜像不可再被 PXE 叠加启动或回写，反之亦然（同一镜像同一时刻仅一种使用方式）。
 - **用户与配额**：逐用户调整存储配额。
 - **默认配额**：修改新注册账号的默认空间大小。
@@ -59,17 +59,13 @@
 - 被禁机器仍可 PXE/iPXE 无盘启动并使用 iSCSI 盘（只禁外网，不碰服务器自身服务）；客户机互访不受影响；MAC 可被伪造（二层局域网通病）；
 - 规则改动前自动 `iptables-save` 快照备份到 `netctrl_backup/`（保留最近 20 份）。
 
-### 7. 客户机客户端（agent：远程控制 / 网盘 / 关机重启）
-- 客户机母盘里放一个常驻小程序（`client/`，C# 单 exe，Win10/11 自带运行时，免安装），
-  开机以 SYSTEM 身份自动运行；它**不开放任何入站端口**，只每隔几秒主动向服务器心跳。
-- Web 后台「客户机控制」页（`/web/clients`）可对每台机器：
-  - **远程关机 / 重启**（立即执行）；
-  - **VNC 控制**：一键拉起客户机上的 VNC 服务端，页内嵌 noVNC 直接看画面、发按键、粘贴板；
-  - **Z 盘**：默认自动挂载（未登录时是服务器的「通用文件」，只读）；客户机右下角托盘里
-    **登录自己的网盘账号**后，Z 盘变成他的个人网盘（可写，里面仍能看到只读的「通用文件」）。
-- 指令走心跳通道下发（客户机在 NAT/防火墙后面也能控制），接入令牌 + MAC 绑定；
-  是否允许挂 Z 盘、默认用户名等**每机设置全部按 MAC 存在服务器**，客户机里的 `agent.ini`
-  只放全机共用的内容，所以一份母盘能发给所有机器。
+### 7. 个人网盘的访问方式（浏览器 / 任意 WebDAV 客户端）
+- 网盘同时通过 **WebDAV** 暴露在 `/dav/`，认证方式是**网盘账号 + 密码**（HTTP Basic），
+  可以用浏览器打开 `http://<服务器IP>:8080/dav/`、用任意 WebDAV 客户端连接，
+  或在 Windows 资源管理器里「映射网络驱动器」到该地址；也可以从网页端登录后进「我的网盘」操作。
+- 服务器**不再提供客户机客户端 / 常驻 agent**：远程关机、重启、VNC 画面、以及
+  客户机开机自动挂载 Z 盘（未登录时挂只读「通用文件」）这些能力**已全部移除**，
+  客户机母盘里不需要再装任何程序，网盘请在客户机上用浏览器 / WebDAV 客户端手动访问。
 
 ---
 
@@ -77,17 +73,12 @@
 
 | 文件 | 用途 |
 |------|------|
-| `iscsi_broker.py` | **主程序**：两个 HTTP 服务（端口 5000 iPXE 供给脚本 / 端口 8080 Web 管理后台）+ iSCSI 供给、叠加盘、空闲清理、账号与网盘页面、客户机 agent 通道与 VNC 桥的路由。 |
+| `iscsi_broker.py` | **主程序**：两个 HTTP 服务（端口 5000 iPXE 供给脚本 / 端口 8080 Web 管理后台）+ iSCSI 供给、叠加盘、空闲清理、回写模式占用管理、账号与网盘页面、WebDAV 分发（`/dav/`）。 |
 | `users_auth.py` | **账号认证模块**：注册 / 登录校验 / 配额管理 / 默认配额，用户数据持久化到 `users.conf`、`cloud.conf`。 |
 | `cloud_store.py` | **网盘存储模块**：目录列表、上传（流式 multipart 解析）、下载、建文件夹、配额统计、通用文件管理，含路径穿越与符号链接防护。 |
 | `netctrl.py` | **联网控制模块**：`netctrl.conf` 状态读写、FORWARD/NAT 规则托管（iptables 按 MAC 过滤 + MASQUERADE）、开机/巡检规则对齐、改动前自动备份。 |
-| `agent_hub.py` | **客户机 agent 通道**：接入令牌、心跳与在线状态、指令队列（关机/重启/VNC/挂载/客户端升级）、MAC→网盘账号与挂载意图（`agent_token.conf`、`agents.conf`）。 |
-| `client_release.py` | **客户端发布库**：`iscsi-broker-agent.exe` 的版本化保存（`client_dist/` + `index.json`，含 sha256/大小），可选调用 mono `mcs`/`csc` 从源码编译，供客户机托盘「检查更新」拉取。 |
-| `webdav.py` | **网盘 WebDAV 端点**：把 `cloud_store` 的个人网盘暴露成 WebDAV，供 Windows 客户机映射盘符（PROPFIND/GET/PUT/MKCOL/DELETE/MOVE/LOCK 等，复用云盘的路径安全与配额）。 |
-| `wsbridge.py` | **VNC 的 WebSocket 桥**：浏览器 --ws--> 服务器 --tcp 5900--> 客户机（纯标准库实现 RFC6455）。 |
-| `client/` | **客户机客户端**：`Agent.cs`（源码）+ `build.bat`（用系统自带 csc 编译）+ `agent.ini.example` + `README.md`（部署说明）。 |
+| `webdav.py` | **网盘 WebDAV 端点**：把 `cloud_store` 的个人网盘暴露成 WebDAV，供浏览器 / 任意 WebDAV 客户端（含 Windows 映射网络驱动器）访问（PROPFIND/GET/PUT/MKCOL/DELETE/MOVE/LOCK 等，复用云盘的路径安全与配额）。 |
 | `install.sh` | **服务端一键安装**：识别发行版装依赖、装到 `/opt/iscsi-broker`、建数据目录、注册并启动 `iscsi-broker.service`（含 `--uninstall`）。 |
-| `web/vnc/` | 内置的 **noVNC** 静态资源（`core/`、`vendor/pako/`，MPL-2.0，见同目录 `LICENSE.txt`）+ 管理页 `viewer.html`；只有管理员会话能访问。 |
 
 ---
 
@@ -101,8 +92,6 @@
 ├── cloud.conf                       ← 默认配额（一行 default_quota=<字节>）
 ├── netctrl.conf                     ← 联网控制配置（一行 default=allow|deny + 每 MAC 一行 <mac>=allow|deny）
 ├── netctrl_backup/                  ← iptables-save 快照（接管/改动前自动备份，保留最近 20 份）
-├── agent_token.conf                 ← 客户机 agent 接入令牌（一行 token=<值>，后台可重置）
-├── agents.conf                      ← 每台客户机一行 <mac>$<网盘账号>$<挂载意图 0|1>
 ├── cloud/                           ← 网盘数据根
 │   ├── <用户名>/                    ← 每个用户的私有目录
 │   ├── _common/                     ← 通用文件（对所有账号只读展示为"通用文件"）
@@ -134,18 +123,9 @@
 | XFS/btrfs 文件系统 | 路线 A reflink 直出（不支持自动回退路线 B） |
 
 ### Python 依赖
-**纯标准库**（无第三方包）：`http.server`、`urllib.parse`、`subprocess`、`os`、`datetime`、`hashlib`、`threading`、`glob`、`time`、`re`、`secrets`、`html`、`ssl`、`tempfile`、`json`、`socket`、`base64`、`struct`、`uuid`。
+**纯标准库**（无第三方包）：`http.server`、`urllib.parse`、`subprocess`、`os`、`datetime`、`hashlib`、`threading`、`glob`、`time`、`re`、`secrets`、`html`、`ssl`、`base64`、`tempfile`、`uuid`、`inspect`、`shutil`。
 
 > 注意：Windows 上可编译、可 import，但完整运行（tgt/qemu-nbd/modprobe）仅限 Linux。
-
-### 客户机侧依赖（客户端 agent，可选功能）
-| 依赖 | 用途 |
-|------|------|
-| Windows 10/11 | 编译用系统自带 `csc.exe`（免装 SDK）；运行用系统自带 .NET Framework 4.x（免装运行时） |
-| VNC 服务端（TightVNC / UltraVNC 等，可选） | 要用「VNC 控制」才需要，推荐装成 Windows 服务（可看登录界面） |
-| 浏览器（Chrome/Edge/Firefox） | 管理员看 VNC 画面用；普通用户的网盘页面仍是 IE11 兼容 |
-
-> `web/vnc/` 下的 noVNC 是唯一的前端第三方资源（MPL-2.0，随附 `LICENSE.txt`），只在管理员页加载。
 
 ---
 
@@ -173,8 +153,8 @@
 - **客户机的默认网关必须指向服务器 LAN 口 IP**（由 dnsmasq 下发 `option:router`）。这样客户机出外网的流量才会经过服务器的 FORWARD + MASQUERADE，按 MAC 的联网控制（NETCTRL）才有意义；网关留空则客户机不能上网，但无盘启动照常。
 - **服务器**：WAN 口接外网 / 上级路由（默认路由所在的网卡）；LAN 口接交换机，配静态 IP（示例 `10.1.1.1/24`）。脚本会自动探测网卡（带默认路由的=外网卡，另一张有 IPv4 且 UP 的=内网卡），多网卡或探测不准时用 `NETCTRL_LAN_IF` / `NETCTRL_WAN_IF` 显式指定。
 - 脚本启动时会开启 `net.ipv4.ip_forward=1`、关闭 IPv6 转发（客户机不分配 IPv6，防止绕过联网控制），并按配置清空 / 重建 FORWARD、POSTROUTING 规则。
-- 用到的端口：`67/udp` DHCP、`69/udp` TFTP（均由 dnsmasq 提供，只开在 LAN 口）、`5000/tcp` iPXE 供给、`8080/tcp` Web 后台（同时承载客户机 agent 通道 `/agent/*`、网盘 WebDAV `/dav/` 与 VNC 的 WebSocket 桥 `/vnc/ws`）、`3260/tcp` iSCSI。若服务器开了 ufw / firewalld，需在 LAN 口放行这些端口。
-- 客户机 agent 与 VNC 都是**服务器主动连客户机**（VNC 桥连客户机 5900），所以客户机侧不需要放开任何入站端口给外网，只需允许来自服务器的连接。
+- 用到的端口：`67/udp` DHCP、`69/udp` TFTP（均由 dnsmasq 提供，只开在 LAN 口）、`5000/tcp` iPXE 供给、`8080/tcp` Web 后台（同时承载网盘 WebDAV `/dav/` 与 `/web/` 各页面）、`3260/tcp` iSCSI。若服务器开了 ufw / firewalld，需在 LAN 口放行这些端口。
+- 客户机侧不需要向服务器开放任何入站端口：客户机只做 iPXE 供给请求、连 `3260` 的 iSCSI 盘，网盘则由客户机主动用浏览器 / WebDAV 客户端访问服务器的 `8080`。
 
 ### 2. 服务器准备与启动
 
@@ -224,8 +204,8 @@ sudo bash install.sh --uninstall                   # 停止并卸载服务（数
 一起删掉（脚本会检查并告警）。母盘 `.raw` 和网盘数据很占地方，建议用 `--base-dir` 指到单独的大盘
 （脚本也会在可用空间不足 20G 时提醒）。
 
-装完还需要手动做三件事：把母盘 `.raw` 放进 `<数据目录>/images/`、配 dnsmasq 的 DHCP/TFTP
-（见本节第 4 小节）、给客户机母盘装客户端 agent（见第 7 小节和 `client/README.md`）。
+装完还需要手动做两件事：把母盘 `.raw` 放进 `<数据目录>/images/`、配 dnsmasq 的 DHCP/TFTP
+（见本节第 4 小节）。
 
 常用命令：
 
@@ -283,11 +263,10 @@ mkdir -p /opt/iscsi-broker-data/images
 #    a. 环境变量：export ISCSI_BROKER_BASE_DIR=/opt/iscsi-broker-data
 #    b. 写 /etc/iscsi-broker/iscsi-broker.env 一行 ISCSI_BROKER_BASE_DIR=/opt/iscsi-broker-data
 #    （都不做则用源码默认值 /opt/iscsi-broker-data，不用改源码）
-# 4) 程序目录里要有 web/（VNC 控制页用内置 noVNC），即仓库原样放好即可
-# 5) 给 LAN 口配静态 IP（示例，网卡名按实际改）
+# 4) 给 LAN 口配静态 IP（示例，网卡名按实际改）
 ip addr add 10.1.1.1/24 dev enp3s0
 ip link set enp3s0 up
-# 6) 启动（需 root）
+# 5) 启动（需 root）
 sudo python3 iscsi_broker.py
 ```
 
@@ -518,69 +497,85 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
 
 ### 5. Web 使用流程
 浏览器访问 `http://<服务器IP>:8080/`：
-- **管理员**：用户名 `admin` + 密码（默认 `admin123`，**部署前务必修改**）→ 管理后台（客户机名单 / 客户机控制 / 创建空白盘 / iSCSI 挂载 / 修改密码 / 用户与配额 / 默认配额 / 通用文件 / 联网控制）。
+- **管理员**：用户名 `admin` + 密码（默认 `admin123`，**部署前务必修改**）→ 管理后台（客户机名单 / 创建空白盘 / iSCSI 挂载 / 修改密码 / 用户与配额 / 默认配额 / 通用文件 / 联网控制）。
+  - **客户机名单**（首页）：当前有 iSCSI 会话的客户机（MAC / 镜像 / 叠加或回写 / IP），以及「回写模式占用」卡片（可手动解除占用）。
   - **iSCSI 挂载**页：选一张“空闲”的母盘点挂载 → 页面返回 IQN → 在任意机器上用 iSCSI 发起端连接该 IQN（服务器 IP:3260）即得到一块写直达母盘的可写盘；用完回后台点“卸载”。
-  - **客户机控制**页：远程关机 / 重启、启用停用 VNC（页内看画面）、给客户机指定网盘账号并挂载/卸载网盘（详见第七节）。
 - **普通用户**：先"注册账号"（用户名 + 密码）→ 登录 → 我的网盘：
   - 上传文件（单文件，受配额限制）、下载文件、新建文件夹；
   - 根目录可见"通用文件"文件夹（只读，内容由管理员维护）。
+  - 同一份网盘也可以用浏览器直接访问 `http://<服务器IP>:8080/dav/`，或用任意 WebDAV 客户端 / 映射网络驱动器（见本节第 7 小节）。
 
-> 普通用户的页面（登录 / 注册 / 我的网盘）继续兼容 IE11（零 JS / 仅 ES5、表格布局、无 flex/grid）；
-> 管理员的「VNC 控制」页用内置 noVNC，需要现代浏览器（Chrome/Edge/Firefox）。
+> 普通用户的页面（登录 / 注册 / 我的网盘）继续兼容 IE11（零 JS / 仅 ES5、表格布局、无 flex/grid）。
 
 ### 6. iPXE 使用流程
 1. 客户机从网络引导进入启动菜单，选择镜像 → 服务器生成叠加盘并返回 `sanboot iscsi:...` 指令 → 连盘启动。
 2. 菜单中选 **Admin Mode** → 提示输入用户名（必须是 `admin`）与密码 → 选择镜像以**回写模式**启动（直接写母盘）。
 3. 供给失败时（镜像被后台挂载 / 被别的客户机回写 / 母盘不存在 / 服务器空间不足等）会在屏幕上打印原因，稍候自动回到启动菜单，换一个镜像或去后台处理后可重试；回菜单后不会自动超时选默认镜像，需要手动选择。
 
-### 7. 客户机客户端（agent）
-客户机是无盘的，客户端要**做进母盘**（Admin 回写模式启动一次装好，之后所有普通模式启动的机器都自带）：
+### 7. 客户机网盘：浏览器 / 任意 WebDAV 客户端
+服务器**不再提供客户机客户端、也不再有常驻 agent**：远程关机 / 重启、VNC 画面控制、
+以及客户机开机自动挂载 Z 盘（未登录时挂只读「通用文件」公共盘）这些能力已经**全部移除**，
+客户机母盘里不需要再装任何程序。网盘改成手动访问，三种方式任选：
 
-1. 服务器后台「客户机控制」页拿**接入令牌**；
-2. 母盘里解出 `client/dist/iscsi-broker-agent.exe` + `agent.ini`（怎么编译见 `client/README.md`），
-   填 `url=http://<服务器IP>:8080` 与 `token=<接入令牌>`；要用 VNC 就在 `[vnc]` 里填 VNC 服务端的 exe 或服务名；
-3. 客户机里管理员执行 `iscsi-broker-agent.exe test` 确认配置，再 `iscsi-broker-agent.exe install`
-   （装成“开机以 SYSTEM 运行”的计划任务）；
-4. 之后在后台「客户机控制」页就能对该机 关机 / 重启 / 启用 VNC（页内看画面）/ 挂载网盘。
+1. **浏览器**：打开 `http://<服务器IP>:8080/dav/`，输入**网盘账号 + 密码**（HTTP Basic），
+   即可浏览目录、下载文件；也可以在网页端登录后进「我的网盘」用上传 / 新建文件夹 / 删除。
+2. **任意 WebDAV 客户端**（Windows 资源管理器、Cyberduck、WinSCP、`davfs2` 等）：
+   地址 `http://<服务器IP>:8080/dav/`，用户名 / 密码同上。
+3. **Windows 映射网络驱动器**：资源管理器 →「映射网络驱动器」→ 填
+   `http://<服务器IP>:8080/dav/`（或命令行 `net use Z: http://<服务器IP>:8080/dav/ /user:<账号>`），
+   走的是系统自带的 WebDAV 重定向器（WebClient 服务）。
 
 要点：
-- agent **只主动外连**（每几秒一次心跳），不开放入站端口，指令随心跳下发、执行完回报；
-  **一个 exe 两种身份**：SYSTEM 身份（开机自启）管心跳/关机重启/VNC，并在用户登录后于用户
-  会话里拉起**托盘进程**（右下角图标，右键菜单：登录网盘/注销/打开 Z 盘/重挂）；
-- **Z 盘（网盘）**：服务器把网盘用 **WebDAV** 暴露在 `/dav/`。未登录的客户机用「MAC + 接入
-  令牌」认证，挂到的是**只读的「通用文件」**；用户在托盘里登录自己的账号后，服务器换个
-  12 小时会话令牌，Z 盘换成他自己的网盘（可写，里面仍能看到只读的「通用文件」）。
-  登录状态**不保存**，无盘机器每次开机重新登录一次；账号密码不落客户机；
-- 接入令牌是**所有客户机共用的一把钥匙**（母盘共用，放不下每机不同的秘密），
-  它只决定"这台机器是不是被许可"；用户网盘空间由各自的账号密码决定。
-  令牌等于控制权（能关机/重启/开 VNC），只在内网用；怀疑泄漏可在后台一键重置。
-- 每机差异（是否挂 Z 盘、默认用户名、在线/VNC/Z 盘状态、指令）全部按 MAC 存在服务器，
-  `agent.ini` 里只有全机共用的配置。
-- **Z 盘挂不上、日志报 `net use 失败(rc=2)：系统错误 67 找不到网络名`**：这不是服务器宕机，
-  而是 Windows 的 WebDAV 重定向器（WebClient）没把服务器认成 WebDAV——它连 `/dav/` 之前会先发
-  一条 `OPTIONS *` 做能力探测，服务器必须在这条上回 `DAV: 1, 2`（`WebAdminHandler.do_OPTIONS`
-  已支持）。排查顺序、以及 agent 启动时那次「WebDAV 探测」怎么读，见 `client/README.md` 第 5 节。
-- **客户端怎么升级**：服务器把 `iscsi-broker-agent.exe` 按版本存在发布库
-  （`<BASE_DIR>/client_dist/`，接口 `GET /agent/version`、`GET /agent/exe`）；客户机托盘右键
-  「检查更新」只向服务器 `POST /agent/request-update` **请求**升级（托盘跑在登录用户会话里、是普通用户
-  令牌，杀不掉 SYSTEM 进程也改不了被占用的 exe），由 SYSTEM 身份的 agent 进程在下一次心跳执行
-  下载/校验/替换；后台「客户机控制」页也能对单台/全部客户机下发升级指令。
-  **发布库有双重防线**：后台上传发布时校验 PE 完整性 + CLR 头 + CLR 元数据（截断的、原生 exe、
-  非 `build.bat` 工具链的产物一律拒收）；客户机下载校验 sha256 后还会用 `test` 空跑一遍新 exe，
-  跑不起来就放弃更新、保留当前版本——无盘客户机换掉的 exe 自己没法回滚，这两道闸门都不省。
-  **发布版本号必须等于 `client/Agent.cs` 里的 `VERSION`**：客户机正是拿它跟本机 `VERSION`
-  比大小来判断“要不要更新 / 更新成功没有”。**改了客户端代码就必须把 `VERSION` 加一**，
-  `build.bat` 跑完会把版本号打印出来，后台上传时填同一个号。后台会**拒绝**不一致的发布
-  （例如源码是 1.2、却按 89.64 发布）——那种发布换上去之后客户机仍报 1.2，服务器会永远认为
-  它有新版，形成无限循环更新（每轮都杀托盘、重启后台进程）。客户机侧也加了同样的护栏：
-  刚更新过同一版本且本机版本没变时，两小时内不再重复更新，并把原因回报到后台。
-  另外“后台上传并发布”的那个版本会直接成为**当前版本**（`current`），客户机一律升到它，
-  不会再被库里残留的、号更大的错误记录劫持。
-  发布新版：**只能在 Windows 上编译**（`client\build.bat`），把产物通过后台「客户端发布 → 上传并发布」
-  传上去（或命令行 `python3 iscsi_broker.py --publish-client <exe> --client-ver 1.1`）；
-  服务器只负责存放与分发，不做 Linux 交叉编译。
-  注意无盘客户机重启会回到母盘里的版本，永久生效仍需更新母盘（详见 `client/README.md`）。
-- 详细部署、`agent.ini` 字段、托盘用法、排错命令见 `client/README.md`。
+- 认证只有一种身份：**网盘账号 + 密码**。此前「客户机 MAC + 接入令牌」那条未登录身份、
+  以及它换来的 12 小时会话令牌（托盘「登录网盘」用）已随客户端能力一起移除。
+- 因此**未登录用户没有网盘入口**，「通用文件」只对**已登录用户**在根目录下只读可见；
+  需要看公共文件就先用自己的账号登录。
+- 登录状态**不保存**：无盘客户机每次开机都是新的叠加盘，映射的盘符/登录信息每次开机后要重新做一次。
+- 服务器不做任何客户机侧的自动化：不会替客户机改注册表、不会自动重连盘符。
+- **`net use` 报 `系统错误 67 找不到网络名`**：这不是服务器宕机，而是 Windows 的 WebDAV 重定向器
+  （WebClient）没把服务器认成 WebDAV——它连 `/dav/` 之前会先发一条 `OPTIONS *` 做能力探测，
+  服务器必须在这条上回 `DAV: 1, 2`（`WebAdminHandler.do_OPTIONS` 已支持）。
+  先确认地址端口可达（浏览器直接打开 `http://<服务器IP>:8080/dav/` 应弹出登录框）；
+  再确认客户机的 WebClient 服务已启动（`sc query WebClient`，停止时 `sc start WebClient`）。
+- WebDAV 只暴露用户自己的私有目录（`<BASE_DIR>/cloud/<用户名>/`，根目录里另有只读的「通用文件」），
+  「通用文件」在 WebDAV 里同样是只读的（写入返回 403）。
+- 网页端与 WebDAV 共用同一套账号、配额与路径安全（路径穿越、符号链接防护）。
+
+### 8. HTTP 接口一览
+
+iPXE 供给服务（端口 5000，客户机无会话，靠 MAC / 一次性令牌）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/boot.ipxe` | 返回 iPXE 启动菜单脚本（镜像列表来自 `images/*.raw`） |
+| GET | `/prov?mac=<mac>&img=<镜像>` | 生成叠加盘并返回 `sanboot iscsi:...` 供给脚本 |
+| GET | `/admin?mac=<mac>` | 管理员模式登录页（iPXE 菜单里选 Admin Mode） |
+| GET | `/admin/verify?mac=&user=&pwd=` | 校验 admin 密码，签发一次性短时令牌 |
+| GET | `/admin/wb?mac=&tok=` | 用令牌进入回写选盘菜单 |
+| GET | `/admin/wb_prov?mac=&tok=&img=` | 回写模式供给（母盘直连导出，写直达母盘） |
+
+Web 管理后台 + 网盘（端口 8080）：
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/`、`/web`、`/web/` | 公开/会话 | 登录页；已登录管理员进后台首页（客户机名单 + 回写占用） |
+| GET/POST | `/web/register` | 公开 | 注册普通账号 |
+| POST | `/web/login` | 公开 | 登录（`admin` 进后台，普通用户进网盘） |
+| GET | `/web/logout` | 会话 | 退出登录 |
+| GET | `/web/drive`、`/web/download` | 用户 | 我的网盘（列表 / 下载） |
+| POST | `/web/upload`、`/web/mkdir`、`/web/delete` | 用户 | 上传（流式）/ 新建文件夹 / 删除 |
+| GET/POST | `/web/password` | 管理员 | 修改管理员密码 |
+| GET/POST | `/web/create` | 管理员 | 创建空白母盘 |
+| GET/POST | `/web/export`、`POST /web/export/unmount` | 管理员 | 手动 iSCSI 挂载 / 卸载（写直达母盘） |
+| GET/POST | `/web/users`、`/web/users/quota` | 管理员 | 用户列表 / 调整配额 |
+| GET/POST | `/web/settings` | 管理员 | 默认配额 |
+| GET/POST | `/web/common`、`/web/common/upload`、`/web/common/delete`、`/web/common/download` | 管理员 | 通用文件管理 |
+| GET/POST | `/web/netctrl`、`/web/netctrl/default`、`/web/netctrl/mac` | 管理员 | 联网控制：默认行为 / 逐机开关 / 规则只读展示 |
+| POST | `/web/writeback/release` | 管理员 | 手动解除某母盘的回写占用（同时删除占用者残留 target） |
+| OPTIONS / PROPFIND / HEAD / GET / PUT / MKCOL / DELETE / MOVE / LOCK / UNLOCK | `/dav/...` | 网盘账号 | WebDAV：浏览器 / 任意 WebDAV 客户端访问个人网盘（`/dav/` 不带凭据时返回 401 Basic 挑战） |
+
+> 客户机 agent 通道（`/agent/*`）与 VNC 的 WebSocket 桥（`/vnc/*`）已随客户端能力一并移除。
+
 
 ---
 
