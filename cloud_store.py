@@ -33,6 +33,7 @@ TMP_DIR_NAME = ".tmp"         # 上传临时目录名
 VIRTUAL_COMMON = "通用文件"   # 通用文件的虚拟文件夹名（rel 前缀）
 _CHUNK = 64 * 1024            # 流式读取分块大小
 _MAX_HEADER = 64 * 1024       # 单个 multipart part 头最大字节数（防滥用）
+_DRAIN_AFTER_REJECT = 256 * 1024 * 1024   # 已回过错误响应后，最多再丢弃这么多请求体
 
 # rmtree 的“不跟随符号链接”参数随 Python 版本变化：
 #   3.3–3.11：symlinks=False（默认即不跟随）
@@ -58,8 +59,14 @@ def _require_setup():
             "cloud_store.setup() 尚未调用（主程序启动时应先 setup(os.path.join(BASE_DIR,'cloud'))）")
 
 
-def _drain(rfile, length):
-    """从 rfile 读走并丢弃 length 字节（保持 HTTP 连接可复用）。"""
+def _drain(rfile, length, limit=None):
+    """从 rfile 读走并丢弃 length 字节（保持 HTTP 连接可复用）。
+
+    limit 非空时最多丢弃 limit 字节后放弃：这是给“已经回过错误响应”的路径兜底的，
+    避免恶意客户端靠不停发数据把服务端线程钉死；此时调用方应关闭连接。
+    """
+    if limit is not None and length > limit:
+        length = limit
     while length > 0:
         data = rfile.read(min(_CHUNK, length))
         if not data:
@@ -78,12 +85,19 @@ def setup(cloud_root: str) -> None:
 
 
 def user_home(user: str) -> str:
-    """用户私有目录 CLOUD_ROOT/<user>/。用户名非法（含路径成分）抛 ValueError。"""
+    """用户私有目录 CLOUD_ROOT/<user>/。用户名非法（含路径成分）抛 ValueError。
+
+    额外拒绝保留目录名（_common / .tmp）：否则同名用户的主目录会与全局通用文件
+    目录（或上传临时目录）重合，等于把公共区当私人网盘用。正常登录流程不会走到
+    这里（users_auth 已把保留名挡在门外），此处是第二道防线。
+    """
     _require_setup()
     user = (user or "").strip()
     if (not user or "/" in user or "\\" in user
             or user in (".", "..") or "\x00" in user):
         raise ValueError("invalid username: %r" % user)
+    if user in (COMMON_DIR_NAME, TMP_DIR_NAME):
+        raise ValueError("reserved username: %r" % user)
     return os.path.join(_CLOUD_ROOT, user)
 
 
@@ -423,12 +437,17 @@ def _clean_filename(raw):
     return fn
 
 
-def _parse_multipart(rfile, content_length, boundary, on_headers, on_body):
+def _parse_multipart(rfile, content_length, boundary, on_headers, on_body,
+                     on_reject=None):
     """流式解析 multipart/form-data（替代已移除的 cgi 模块）。
 
     rfile：可读二进制流；content_length：请求体总字节数；boundary：边界字节。
     on_headers(headers_bytes) -> bool：返回 True 的 part 为活动 part，
        其 body 分块经 on_body(chunk) 回传（其余 part 的 body 直接跳过）。
+    on_reject()：（可选）配额超限、请求体还没读完时，先让调用方把 HTTP 响应写出去。
+       顺序很重要：浏览器收到响应后会主动中止上传，剩下的请求体很快就能排空，
+       连接可以正常关闭；否则服务端带着满接收缓冲直接 close，内核会发 TCP RST，
+       浏览器只显示 ERR_CONNECTION_RESET，看不到“超出配额”的提示页。
     约定恰好消费 content_length 字节；格式非法抛 ValueError。
     注意：part body 结尾的 CRLF 属于分隔符终止序列，不包含在回传数据内。
     """
@@ -517,7 +536,20 @@ def _parse_multipart(rfile, content_length, boundary, on_headers, on_body):
                 buf += data
                 remaining -= len(data)
     except _QuotaExceeded:
-        raise  # 配额超限：立即中止，不再排空剩余请求体
+        if on_reject is not None:
+            # 配额超限、请求体还没读完：先让调用方把错误响应发出去（浏览器收到后会
+            # 中止上传），再排空剩余请求体，最后正常关闭连接 —— 这样浏览器能显示提示，
+            # 而不是收到 TCP RST 后报 ERR_CONNECTION_RESET。
+            # 没有 on_reject 的调用方（例如通用文件上传）保持原语义：立刻中止、不排空。
+            try:
+                on_reject()
+            except Exception:
+                pass
+            try:
+                _drain(rfile, remaining, limit=_DRAIN_AFTER_REJECT)
+            except Exception:
+                pass          # 客户端已经断开（读会抛异常）：响应早已发出，忽略
+        raise
     except Exception:
         _drain(rfile, remaining)  # 格式错误：排空剩余请求体，保持连接可用
         raise
@@ -525,12 +557,15 @@ def _parse_multipart(rfile, content_length, boundary, on_headers, on_body):
 
 
 # ---------- 上传/下载/删除 ----------
-def _receive(rfile, content_length, boundary, target_dir, limit, user_root=False):
+def _receive(rfile, content_length, boundary, target_dir, limit, user_root=False,
+             on_quota_exceeded=None):
     """流式接收一个 multipart 请求并保存第一个文件 part。
 
     返回 (True, "上传成功") 或 (False, 中文原因)；任何失败路径都清理临时文件。
     user_root=True 表示目标为用户私有目录根（rel=""），此时拒绝与虚拟
     "通用文件" 目录同名的文件（该文件将无法通过 resolve 下载，造成死文件）。
+    on_quota_exceeded：配额超限时先回调（调用方用来把错误响应发出去，避免浏览器
+    只看到 TCP RST）。
     """
     tmp_dir = os.path.join(_CLOUD_ROOT, TMP_DIR_NAME)
     os.makedirs(tmp_dir, exist_ok=True)
@@ -559,7 +594,8 @@ def _receive(rfile, content_length, boundary, target_dir, limit, user_root=False
                 written[0] += len(chunk)
                 out.write(chunk)
 
-            _parse_multipart(rfile, content_length, boundary, on_headers, on_body)
+            _parse_multipart(rfile, content_length, boundary, on_headers, on_body,
+                             on_reject=on_quota_exceeded)
 
         if state["name_err"]:
             return False, state["name_err"]
@@ -586,13 +622,15 @@ def _receive(rfile, content_length, boundary, target_dir, limit, user_root=False
 
 
 def save_upload(user: str, rel: str, rfile, content_length: int, content_type: str,
-                quota_remaining: int) -> (bool, str):
+                quota_remaining: int, on_quota_exceeded=None) -> (bool, str):
     """保存用户个人网盘上传（multipart/form-data，流式解析）。
 
     目标目录 = resolve(user, rel)（须为目录）；最终 os.replace 到目标，覆盖同名文件。
     rel 在 "通用文件" 内 -> (False, "通用文件为只读，仅管理员可写")；
     无文件 part -> (False, "未收到文件")；累计字节超过 quota_remaining ->
     立即中止并清理临时文件，返回 (False, "超出配额")。
+    on_quota_exceeded：配额超限、请求体还没读完时先回调（调用方把错误响应发出去），
+    避免服务端带未读数据关闭连接被内核回 RST、浏览器只显示 ERR_CONNECTION_RESET。
     """
     _require_setup()
     if rel and (rel == VIRTUAL_COMMON or rel.startswith(VIRTUAL_COMMON + "/")):
@@ -615,13 +653,14 @@ def save_upload(user: str, rel: str, rfile, content_length: int, content_type: s
             or quota_remaining < 0):
         return False, "配额参数不合法"
     return _receive(rfile, content_length, boundary, target_dir, quota_remaining,
-                    user_root=rel in ("", ".", None))
+                    user_root=rel in ("", ".", None),
+                    on_quota_exceeded=on_quota_exceeded)
 
 
 def save_common_upload(rfile, content_length: int, content_type: str,
-                       max_bytes: int) -> (bool, str):
+                       max_bytes: int, on_quota_exceeded=None) -> (bool, str):
     """保存通用文件上传（仅管理员可调用）。逻辑同 save_upload，目标为 _common/，
-    限额用 max_bytes（主程序传硬上限）。"""
+    限额用 max_bytes（主程序传硬上限）。on_quota_exceeded 语义同 save_upload。"""
     _require_setup()
     boundary = _extract_boundary(content_type)
     if boundary is None:
@@ -629,7 +668,8 @@ def save_common_upload(rfile, content_length: int, content_type: str,
     if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
             or max_bytes < 0):
         return False, "容量参数不合法"
-    return _receive(rfile, content_length, boundary, common_dir(), max_bytes)
+    return _receive(rfile, content_length, boundary, common_dir(), max_bytes,
+                    on_quota_exceeded=on_quota_exceeded)
 
 
 def common_list() -> list[dict]:

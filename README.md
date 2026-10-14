@@ -17,13 +17,22 @@
   **回写占用只在客户机有 iSCSI 会话（I_T nexus）期间有效**：客户机关机/重启/拔电导致会话断开后约 45 秒
   （`WRITEBACK_LOCK_GRACE`）自动解除，母盘随即可以被别的机器回写或后台挂载；发起端临时掉线会在这 45 秒内
   重连，占用不会被误放。客户机拔电、跨 VLAN 探测不到、或状态卡住时，后台首页的「回写模式占用」
-  卡片会显示“已断开”，并提供**手动解除占用**按钮兜底。
+  卡片会显示“已断开”，并提供**手动解除占用**按钮兜底。解除占用时该客户机直连母盘的 target 会一并删除
+  （否则锁放开后它一重连就继续直写母盘）。
+  **qcow2 路线（路线 B）下，只要还有客户机在用这张母盘做叠加盘，回写会被直接拒绝**：那些叠加盘以母盘为
+  backing file，改写母盘会破坏它们的块映射。reflink 路线（路线 A）不受影响——叠加盘是文件系统级 CoW 克隆，
+  之后写母盘只会触发重新分配，旧叠加盘保留自己的快照。
+- **同一母盘的“准备中”互斥**：建叠加盘（`cp --reflink` / `qemu-img create`）或建回写 target 期间，母盘会被
+  占住，此时 `/prov`、后台「iSCSI 挂载」与回写都会被拒绝，避免拷贝还没结束就被当成空闲盘改写。
 
 ### 2. 账号系统
 - **Web 登录**：必须使用账号 `admin`（用户名 + 密码）。
 - **iPXE 后台登录**：同样只接受账号 `admin`。
 - **开放注册**：Web 端 `/web/register` 注册，仅需用户名 + 密码（无重复确认）。
 - 注册账号拥有个人网盘；`admin` 拥有管理后台。
+- **保留用户名**：`admin` 与 `_common`（`users_auth.RESERVED_NAMES`）不可注册、不可登录。`_common`
+  是全局「通用文件」目录名，普通用户的私有目录就是 `CLOUD_ROOT/<用户名>`，一旦允许注册该账号，
+  它就能读写/删除所有用户和所有未登录客户机看到的公共文件。
 
 ### 3. 个人网盘（云盘）
 - 普通用户功能（**仅**）：上传文件、下载文件、创建文件夹。
@@ -553,7 +562,9 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
   已支持）。排查顺序、以及 agent 启动时那次「WebDAV 探测」怎么读，见 `client/README.md` 第 5 节。
 - **客户端怎么升级**：服务器把 `iscsi-broker-agent.exe` 按版本存在发布库
   （`<BASE_DIR>/client_dist/`，接口 `GET /agent/version`、`GET /agent/exe`）；客户机托盘右键
-  「检查更新」自己拉新版并自我替换，后台「客户机控制」页也能对单台/全部客户机下发升级指令。
+  「检查更新」只向服务器 `POST /agent/request-update` **请求**升级（托盘跑在登录用户会话里、是普通用户
+  令牌，杀不掉 SYSTEM 进程也改不了被占用的 exe），由 SYSTEM 身份的 agent 进程在下一次心跳执行
+  下载/校验/替换；后台「客户机控制」页也能对单台/全部客户机下发升级指令。
   发布新版：**只能在 Windows 上编译**（`client\build.bat`），把产物通过后台「客户端发布 → 上传并发布」
   传上去（或命令行 `python3 iscsi_broker.py --publish-client <exe> --client-ver 1.1`）；
   服务器只负责存放与分发，不做 Linux 交叉编译。
@@ -577,9 +588,9 @@ dig @10.1.1.1 www.baidu.com +short   # 客户机 DNS 走服务器，这里能解
 | `HTTPS_ENABLED` / `HTTPS_CERT` / `HTTPS_KEY` | `False` | 可选 HTTPS |
 | `NETCTRL_ENABLED` | `True` | 是否启用联网控制 |
 | `NETCTRL_LAN_IF` / `NETCTRL_WAN_IF` | 自动探测 | 内网卡（接交换机）/ 外网卡（接外网）；留空自动探测 |
-| `NETCTRL_FULL_TAKEOVER` | `True` | `True`=启动时清空并重建 FORWARD/POSTROUTING（旧转发/NAT 手工规则被替换）；`False`=只管理自己的链，与现有规则共存 |
+| `NETCTRL_FULL_TAKEOVER` | `True` | `True`=启动时清空并重建 FORWARD/POSTROUTING（旧转发/NAT 手工规则被替换）；`False`=只管理自己的链，与现有规则共存。两种模式下都会补齐「回程 RELATED,ESTABLISHED 放行 + 出外网 MASQUERADE」（已存在则跳过） |
 | `NETCTRL_REJECT` | `True` | `True`=REJECT（客户机立即报“无法连接”）；`False`=DROP（静默丢弃，卡到超时） |
 | `NETCTRL_RECONCILE_INTERVAL` | `30` | 规则巡检间隔（秒） |
 | 默认配额 | 1 GiB | 新注册账号配额，管理员可在后台修改 |
 
-**账号规则**：用户名 3-32 位 `[A-Za-z0-9_-]`（保留 `admin`）；密码 6-32 位同字符集；配额 1 字节 ~ 8 TiB。
+**账号规则**：用户名 3-32 位 `[A-Za-z0-9_-]`（保留 `admin`、`_common`）；密码 6-32 位同字符集；配额 1 字节 ~ 8 TiB。

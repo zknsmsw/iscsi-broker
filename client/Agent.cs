@@ -7,12 +7,15 @@
 //      WebDAV 重定向器需要的注册表与 WebClient 服务，并把 net use 跑在交互用户
 //      会话里，这样“我的电脑”里能看到盘）；登录会话变化后自动重新挂载；
 //   3) VNC：按 agent.ini 拉起 / 停止 VNC 服务端（推荐装成服务，可看登录界面）；
-//   4) 客户端自更新：托盘右键「检查更新」（同版本可「强制重装客户端」）向服务器
-//      GET /agent/version 问最新版本，版本号按数字段比较；有新版本就下载到
+//   4) 客户端自更新：托盘右键「检查更新」（同版本可「强制重装客户端」）只向服务器
+//      GET /agent/version 问最新版本（版本号按数字段比较），用户确认后 POST
+//      /agent/request-update 请服务器为本机排队一条更新指令 —— 托盘跑在登录用户
+//      会话里、是普通用户令牌，杀不掉 SYSTEM 身份的客户端进程、也改不了被占用的
+//      exe，所以它自己绝不做替换；真正的下载+替换由 SYSTEM 进程负责：
+//      SYSTEM 进程在 /agent/poll 里收到 {"type":"update",...} 后下载到
 //      %TEMP%\iscsi-broker-agent-<ver>.new，校验 sha256 与大小后写一个
 //      %TEMP%\agent-swap-<pid>.cmd，由它等本进程退出→改名替换 exe→重开任务
-//      （失败自动回滚），全过程记到 <exe 目录>\agent-update.log；
-//      服务器 /agent/poll 下发 {"type":"update",...} 时走同一条流程。
+//      （失败自动回滚），全过程记到 <exe 目录>\agent-update.log。
 //
 // 编译：client\build.bat（用系统自带 csc.exe，不需要装 SDK；产物是单个小 exe，
 //       目标机不需要装 .NET 运行时——Win10/11 自带 .NET Framework 4.x）。
@@ -101,6 +104,7 @@ namespace IscsiBrokerAgent
         private static string _url = "";
         private static string _token = "";
         private static string _mac = "";
+        private static bool _macFromIni;              // MAC 是 ini 里写死的（写死了就不再重探）
         private static string _letter = "Z";
         private static string _vncExe = "";
         private static string _vncArgs = "";
@@ -120,6 +124,10 @@ namespace IscsiBrokerAgent
         private static ToolStripMenuItem _trayStatus;
         private static ToolStripMenuItem _trayLogin;
         private static ToolStripMenuItem _trayLogout;
+        // 托盘所有耗时活（net use / HTTP）都扔后台线程，UI 线程只跑消息循环；
+        // _ui 是 UI 线程上创建的隐藏控件，后台线程靠它 BeginInvoke 回 UI 线程。
+        private static System.Windows.Forms.Control _ui;
+        private static readonly HashSet<string> _bgRunning = new HashSet<string>();
         private static readonly object _logLock = new object();
 
         // ---------------- 入口 ----------------
@@ -198,7 +206,8 @@ namespace IscsiBrokerAgent
             _vncService = _ini.Get("vnc", "service", "");
             _vncPort = ParseInt(_ini.Get("vnc", "port", "5900"), 5900);
             string macOverride = _ini.Get("server", "mac", "");
-            _mac = macOverride.Length > 0 ? NormalizeMac(macOverride) : DetectMac();
+            _macFromIni = macOverride.Length > 0;
+            _mac = _macFromIni ? NormalizeMac(macOverride) : DetectMac();
             LoadState();
         }
 
@@ -267,7 +276,10 @@ namespace IscsiBrokerAgent
                 lock (_logLock)
                 {
                     if (File.Exists(_logPath) && new FileInfo(_logPath).Length > 1024 * 1024)
+                    {
                         File.Delete(_logPath + ".old");   // 保留一份旧日志
+                        File.Move(_logPath, _logPath + ".old");
+                    }
                     File.AppendAllText(_logPath, line + "\r\n", Encoding.UTF8);
                 }
             }
@@ -357,6 +369,17 @@ namespace IscsiBrokerAgent
         // ---------------- 心跳主循环 ----------------
         private static void PollOnce()
         {
+            // ONSTART 计划任务可能比网卡就绪早：MAC 不是 ini 里指定的就再探一次，
+            // 不然一次探不到就永远卡在「配置不完整」
+            if (_mac.Length != 12 && !_macFromIni)
+            {
+                string m = DetectMac();
+                if (m.Length == 12)
+                {
+                    _mac = m;
+                    Log("网卡就绪，探测到 MAC=" + m);
+                }
+            }
             if (_url.Length == 0 || _token.Length == 0 || _mac.Length != 12)
             {
                 Log("配置不完整（[server] url/token 必须填，MAC 必须能探测到），10 秒后重试");
@@ -661,20 +684,40 @@ namespace IscsiBrokerAgent
         {
             try
             {
+                bool changed = false;
                 using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(
                     @"SYSTEM\CurrentControlSet\Services\WebClient\Parameters", true))
                 {
                     if (k != null)
                     {
-                        k.SetValue("BasicAuthLevel", 2, Microsoft.Win32.RegistryValueKind.DWord);
-                        k.SetValue("FileSizeLimitInBytes", unchecked((int)0xFFFFFFFF),
-                                   Microsoft.Win32.RegistryValueKind.DWord);
+                        if (SetRegValueIfChanged(k, "BasicAuthLevel", 2,
+                                                 Microsoft.Win32.RegistryValueKind.DWord)) changed = true;
+                        if (SetRegValueIfChanged(k, "FileSizeLimitInBytes", unchecked((int)0xFFFFFFFF),
+                                                 Microsoft.Win32.RegistryValueKind.DWord)) changed = true;
                         string host = _url;
                         int i = host.IndexOf("://");
                         if (i > 0) host = host.Substring(i + 3);
+                        // WebClient 的 AuthForwardServerList 匹配的是主机名/IP，写成 "1.2.3.4:8080"
+                        // 反而匹配不上（凭据就不会转发，net use 报“找不到网络名”）——把端口去掉。
+                        // 带方括号的 IPv6（[::1]:8080）保留到 "]"；普通 host:port 在唯一的冒号处截断；
+                        // 不带方括号的 IPv6（本来就有多个冒号）原样保留，免得把地址截坏。
+                        int colon = host.IndexOf(':');
+                        if (colon >= 0 && host[0] == '[')
+                        {
+                            int rb = host.IndexOf(']');
+                            if (rb > colon) host = host.Substring(0, rb + 1);
+                        }
+                        else if (colon > 0 && host.IndexOf(':', colon + 1) < 0)
+                        {
+                            host = host.Substring(0, colon);
+                        }
                         // 只放行本服务器（不要用 "*"：那等于让重定向器把凭据发给任何服务器）
-                        k.SetValue("AuthForwardServerList", new string[] { host },
-                                   Microsoft.Win32.RegistryValueKind.MultiString);
+                        if (SetRegValueIfChanged(k, "AuthForwardServerList", new string[] { host },
+                                                 Microsoft.Win32.RegistryValueKind.MultiString))
+                        {
+                            changed = true;
+                            Log("WebClient: AuthForwardServerList -> " + host);
+                        }
                     }
                 }
                 string outp;
@@ -683,7 +726,19 @@ namespace IscsiBrokerAgent
                 int rc1 = RunShell("sc config WebClient start= auto", 10000, out outp);
                 Log("WebClient: sc config start=auto rc=" + rc1 + " " + outp.Replace("\r\n", " "));
                 string state;
-                if (WebClientRunning(out state))
+                if (changed && WebClientRunning(out state))
+                {
+                    // WebClient 只在服务启动时读这些注册表参数：刚改过就得重启一次，
+                    // 否则本次开机（到下次重启前）新参数都不生效。
+                    int rc2 = RunShell("net stop WebClient", 30000, out outp);
+                    Log("WebClient: 参数有变，net stop rc=" + rc2 + " " + outp.Replace("\r\n", " "));
+                    int rc3 = RunShell("net start WebClient", 20000, out outp);
+                    Log("WebClient: net start rc=" + rc3 + " " + outp.Replace("\r\n", " "));
+                    if (!WebClientRunning(out state))
+                        Log("WebClient: 重启后服务仍不是 RUNNING —— Z 盘会挂不上（net use 报“找不到网络名”）。"
+                            + "请以管理员在客户机上执行 net start WebClient 排查：" + state.Replace("\r\n", " "));
+                }
+                else if (WebClientRunning(out state))
                 {
                     Log("WebClient: 服务在运行，WebDAV 盘可以挂载");
                 }
@@ -702,6 +757,36 @@ namespace IscsiBrokerAgent
                 Log("→ 这一般是因为进程不是 SYSTEM 身份（手动双击运行就是这样）："
                     + "写 HKLM 和拉起用户会话托盘都需要 SYSTEM，请用 install 装的计划任务启动。");
             }
+        }
+
+        /// <summary>
+        /// 值真的变了才写注册表（返回 true = 写了）。WebClient 的参数只在服务启动时读一次，
+        /// 调用方据此决定要不要重启服务，所以必须能区分“写了”和“本来就一样”。
+        /// </summary>
+        private static bool SetRegValueIfChanged(Microsoft.Win32.RegistryKey k, string name,
+                                                 object value, Microsoft.Win32.RegistryValueKind kind)
+        {
+            object cur = k.GetValue(name);
+            bool same;
+            if (value is string[])
+            {
+                string[] want = (string[])value;
+                string[] have = cur as string[];
+                same = have != null && have.Length == want.Length;
+                if (same)
+                {
+                    for (int i = 0; i < want.Length; i++)
+                        if (!string.Equals(have[i], want[i], StringComparison.Ordinal)) { same = false; break; }
+                }
+            }
+            else
+            {
+                same = cur != null && cur.GetType() == value.GetType()
+                       && Equals(Convert.ToString(cur), Convert.ToString(value));
+            }
+            if (same) return false;
+            k.SetValue(name, value, kind);
+            return true;
         }
 
         /// <summary>Windows 的 WebDAV 重定向器（WebClient 服务）是否在运行。</summary>
@@ -861,6 +946,43 @@ namespace IscsiBrokerAgent
         // ---------------- 托盘进程（跑在用户会话里：右下角图标 + 右键菜单 + 登录 + 挂 Z 盘） ----------------
         // 为什么必须是独立进程：盘符映射是“每个登录会话一份”，SYSTEM 会话里映射用户看不到；
         // 而且 SYSTEM 服务的桌面不是用户桌面，画不出托盘图标。SYSTEM 进程负责把它拉起来。
+
+        /// <summary>
+        /// 把耗时活（net use 要 20-50 秒、HTTP 要 10-15 秒）扔到后台线程，别冻住托盘菜单。
+        /// 同一个 key 只允许一个在跑：用户连点「重新挂载」不会叠出好几个 net use。
+        /// </summary>
+        private static void RunBackground(string key, Action work)
+        {
+            lock (_bgRunning)
+            {
+                if (_bgRunning.Contains(key)) return;
+                _bgRunning.Add(key);
+            }
+            Thread t = new Thread(delegate ()
+            {
+                try { work(); }
+                catch (Exception e) { Log("后台任务 " + key + " 异常：" + e.Message); }
+                finally
+                {
+                    lock (_bgRunning) { _bgRunning.Remove(key); }
+                }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        /// <summary>后台线程要动界面时回 UI 线程执行（_ui 没建好/已失效就直接跑，别把活吞掉）。</summary>
+        private static void UiPost(Action a)
+        {
+            try
+            {
+                if (_ui != null && _ui.IsHandleCreated) { _ui.BeginInvoke(a); return; }
+            }
+            catch (Exception e) { Log("切回 UI 线程失败（改为直接执行）：" + e.Message); }
+            try { a(); }
+            catch (Exception e) { Log("UI 操作失败：" + e.Message); }
+        }
+
         private static int TrayMain()
         {
             bool created;
@@ -870,6 +992,9 @@ namespace IscsiBrokerAgent
                 try { FreeConsole(); } catch { }         // 从控制台/命令行启动时收掉黑窗口
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
+                // UI 线程上建一个隐藏控件：后台线程（挂盘/上报）靠它 BeginInvoke 回 UI 线程
+                _ui = new System.Windows.Forms.Control();
+                _ui.CreateControl();
 
                 ContextMenuStrip menu = new ContextMenuStrip();
                 _trayStatus = new ToolStripMenuItem("未登录（Z 盘只读通用文件）");
@@ -877,14 +1002,14 @@ namespace IscsiBrokerAgent
                 menu.Items.Add(_trayStatus);
                 menu.Items.Add(new ToolStripSeparator());
                 _trayLogin = new ToolStripMenuItem("登录网盘…", null, delegate { ShowLoginDialog(); });
-                _trayLogout = new ToolStripMenuItem("注销网盘", null, delegate { DoLogout(); });
+                _trayLogout = new ToolStripMenuItem("注销网盘", null, delegate { RunBackground("logout", DoLogout); });
                 menu.Items.Add(_trayLogin);
                 menu.Items.Add(_trayLogout);
                 menu.Items.Add(new ToolStripMenuItem("打开 Z 盘", null, delegate { OpenDrive(); }));
-                menu.Items.Add(new ToolStripMenuItem("重新挂载", null, delegate { Remount(); }));
+                menu.Items.Add(new ToolStripMenuItem("重新挂载", null, delegate { RunBackground("remount", Remount); }));
                 menu.Items.Add(new ToolStripMenuItem("查看日志", null, delegate { OpenLog(); }));
-                menu.Items.Add(new ToolStripMenuItem("检查更新", null, delegate { CheckUpdate(false); }));
-                menu.Items.Add(new ToolStripMenuItem("强制重装客户端", null, delegate { CheckUpdate(true); }));
+                menu.Items.Add(new ToolStripMenuItem("检查更新", null, delegate { RunBackground("update", delegate { CheckUpdate(false); }); }));
+                menu.Items.Add(new ToolStripMenuItem("强制重装客户端", null, delegate { RunBackground("update", delegate { CheckUpdate(true); }); }));
                 menu.Items.Add(new ToolStripSeparator());
                 menu.Items.Add(new ToolStripMenuItem("退出托盘", null, delegate { ExitTray(); }));
                 menu.Opening += delegate { UpdateTrayMenu(); };
@@ -898,17 +1023,16 @@ namespace IscsiBrokerAgent
 
                 Log("托盘启动：mac=" + _mac + " letter=" + _letter + " icon=" + DescribeIcon());
                 UpdateTrayMenu();
-                Remount();                                // 开机先挂只读公共盘
-                PostStatus();
+                RunBackground("remount", delegate { Remount(); PostStatus(); });   // 开机先挂只读公共盘（后台，不冻菜单）
                 int tick = 0;
                 System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
                 timer.Interval = 20000;
                 timer.Tick += delegate
                 {
-                    PostStatus();
+                    RunBackground("status", PostStatus);
                     tick++;
                     // 挂载失败过（WebClient 还没起来、网络还没通等）就每分钟自动重试一次
-                    if (!_mountOk && (tick % 3) == 0) Remount();
+                    if (!_mountOk && (tick % 3) == 0) RunBackground("remount", Remount);
                 };
                 timer.Start();
                 Application.Run();                        // 跑消息循环，直到“退出托盘”
@@ -1002,6 +1126,17 @@ namespace IscsiBrokerAgent
 
         private static void Remount()
         {
+            // 托盘可能比网卡就绪早（开机就拉起来了）：趁每次重试再探一次 MAC，
+            // 不然没有 ini 指定 MAC 的机器会一直拿空 MAC 去挂盘
+            if (_mac.Length != 12 && !_macFromIni)
+            {
+                string m = DetectMac();
+                if (m.Length == 12)
+                {
+                    _mac = m;
+                    Log("网卡就绪，探测到 MAC=" + m);
+                }
+            }
             string msg;
             if (_davUser.Length > 0 && _davSession.Length > 0)
             {
@@ -1013,7 +1148,7 @@ namespace IscsiBrokerAgent
                 if (!MapDrive(_mac, _token, out msg))
                     NotifyTipOnce("mount-fail", "只读公共盘挂载失败：" + msg, 900);
             }
-            UpdateTrayMenu();
+            UiPost(UpdateTrayMenu);      // 本函数跑在后台线程，改菜单必须回 UI 线程
         }
 
         private static void ShowLoginDialog()
@@ -1037,7 +1172,8 @@ namespace IscsiBrokerAgent
             f.CancelButton = cancel;
             if (f.ShowDialog() != DialogResult.OK) return;
             if (tu.Text.Trim().Length == 0) { NotifyTip("用户名不能为空"); return; }
-            DoLogin(tu.Text.Trim(), tp.Text);
+            string user = tu.Text.Trim(), pwd = tp.Text;
+            RunBackground("login", delegate { DoLogin(user, pwd); });   // 登录+挂盘全在后台，别冻住托盘
         }
 
         private static void DoLogin(string user, string pwd)
@@ -1068,7 +1204,7 @@ namespace IscsiBrokerAgent
             {
                 NotifyTip("登录失败：" + e.Message);
             }
-            UpdateTrayMenu();
+            UiPost(UpdateTrayMenu);      // 本函数跑在后台线程（RunBackground "login"）
             PostStatus();
         }
 
@@ -1088,7 +1224,7 @@ namespace IscsiBrokerAgent
             string msg;
             if (!MapDrive(_mac, _token, out msg)) NotifyTip("已注销，但只读公共盘没挂上：" + msg);
             else NotifyTip("已注销，Z 盘恢复为只读通用文件");
-            UpdateTrayMenu();
+            UiPost(UpdateTrayMenu);      // 本函数跑在后台线程（RunBackground "logout"）
             PostStatus();
         }
 
@@ -1112,7 +1248,7 @@ namespace IscsiBrokerAgent
                     NotifyTip("管理员已停用本机网盘，托盘退出");
                     string outp;
                     RunShell("net use " + _letter + ": /delete /y", 15000, out outp);
-                    ExitTray();
+                    UiPost(ExitTray);        // 本函数跑在后台线程，退出必须回 UI 线程
                     return;
                 }
                 _lastAccount = GetString(resp, "account");    // 默认用户名：登录框预填
@@ -1643,26 +1779,33 @@ namespace IscsiBrokerAgent
             if (dr != DialogResult.Yes) return;
             if (_dryRun)
             {
-                Log("[dry-run] 本应下载 " + AbsUrl(url) + " 到 " + NewFilePath(ver) + " 并替换 " + ExePath());
-                NotifyTip("[dry-run] 只打印不落盘：本应更新到 v" + ver);
+                Log("[dry-run] 本应向服务器请求更新到 v" + ver + "（force=" + (force ? "true" : "false")
+                    + "，服务器会下发 update 指令给 SYSTEM 进程 " + ExePath() + "，不落盘不替换）");
+                NotifyTip("[dry-run] 只打印不请求：本应请求更新到 v" + ver);
                 return;
             }
-            string msg;
-            UpdatePlan plan = DownloadUpdate(ver, url, sha, size, out msg);
-            if (plan == null)
+            // 托盘是登录用户的普通令牌：杀不掉 SYSTEM 进程、也改不了被占用的 exe，
+            // 真正的下载+校验+替换必须让 SYSTEM 身份的客户端进程做 —— 它下一次心跳
+            // （/agent/poll）就会收到服务器为本机排队的 update 指令。
+            try
             {
-                NotifyTip("更新失败：" + msg);
-                return;
+                Dictionary<string, object> req = new Dictionary<string, object>();
+                req["mac"] = _mac;
+                req["token"] = _token;
+                req["force"] = force;
+                Dictionary<string, object> resp = PostJson("/agent/request-update", req);
+                if (GetString(resp, "ok") != "True")
+                {
+                    NotifyTip("请求更新失败：" + GetString(resp, "err"));
+                    return;
+                }
             }
-            string smsg;
-            if (!LaunchSwap(plan, out smsg))
+            catch (Exception e)
             {
-                NotifyTip("替换客户端失败：" + smsg);
+                NotifyTip("请求更新失败：" + e.Message);
                 return;
             }
-            NotifyTip("已下载并校验 v" + plan.Ver + "，正在替换并重启客户端…");
-            Thread.Sleep(500);
-            ExitTray();                      // 本体退出，剩下交给 agent-swap-<pid>.cmd
+            NotifyTip("已请求更新到 v" + ver + "，后台客户端进程将在几秒内自动替换并重启");
         }
 
         /// <summary>写 %TEMP%\agent-swap-&lt;pid&gt;.cmd（ASC 内容）并以独立进程启动它。</summary>

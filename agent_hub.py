@@ -109,13 +109,20 @@ def _load_clients():
 
 
 def _save_clients_locked():
-    """整体重写 agents.conf（调用方必须已持有 _lock）。"""
+    """整体重写 agents.conf（调用方必须已持有 _lock）。
+
+    写盘条件：账号非空 **或** 明确要求不挂载（want_mount=False）。
+    默认状态是“无账号 + 要求挂载”，这种行没必要落盘；但反过来“无账号 + 停用挂载”
+    必须落盘，否则管理员点了「停用网盘」后服务一重启，_ensure() 又把 want_mount
+    初始化回 True，设置就丢了。
+    """
     rows = []
     for mac in sorted(_clients):
         rec = _clients[mac]
         acc = rec.get("account") or ""
-        want = "1" if rec.get("want_mount") else "0"
-        if acc or rec.get("want_mount"):
+        want_mount = bool(rec.get("want_mount"))
+        want = "1" if want_mount else "0"
+        if acc or not want_mount:
             rows.append("%s$%s$%s\n" % (mac, acc, want))
     try:
         _atomic_write(os.path.join(_base_dir, CLIENTS_FILE_NAME), "".join(rows))
@@ -252,11 +259,15 @@ def _drop_expired_locked(rec):
     rec["queue"] = [c for c in rec["queue"] if c["created"] >= cut]
 
 
-def enqueue(mac, ctype, **args):
+def enqueue(mac, ctype, force_offline=False, **args):
     """给某台机器排一条指令。返回 (True, 说明) 或 (False, 原因)。
 
     ctype 取值：shutdown / reboot / vnc_start / vnc_stop / mount / unmount / update
     （update 的参数：ver / url / sha256 / size / force，客户机下载新 exe 自我替换）
+
+    force_offline=True：跳过“是否在线”检查。只有请求方**自己就是这台机器上的进程**
+    （托盘通过服务器请求自我更新）时才用——托盘刚上报过状态，但 ONLINE_WINDOW 只有
+    15 秒而托盘状态上报间隔是 20 秒，用在线检查会把这种自我请求误判成“客户机不在线”。
     """
     global _seq
     mac = _norm_mac(mac)
@@ -272,7 +283,7 @@ def enqueue(mac, ctype, **args):
         if ctype in ("mount", "unmount"):
             rec["want_mount"] = (ctype == "mount")
             _save_clients_locked()
-        if not is_online(rec):
+        if not force_offline and not is_online(rec):
             return False, "客户机不在线（没有收到 agent 心跳）"
         _drop_expired_locked(rec)
         if len(rec["queue"]) >= MAX_QUEUE:

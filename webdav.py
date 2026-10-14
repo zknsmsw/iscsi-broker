@@ -22,6 +22,7 @@ cloud_store 的个人网盘用 WebDAV 暴露出来即可（客户机 agent 负�
 
 import datetime
 import os
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -37,7 +38,8 @@ ALLOW = "OPTIONS, GET, HEAD, POST, PUT, DELETE, PROPFIND, MKCOL, MOVE, LOCK, UNL
 MAX_PUT_BYTES = 1 << 40          # 单次 PUT 上限（1 TiB，兜底防止恶意 Content-Length）
 _XML_HEADER = '<?xml version="1.0" encoding="utf-8"?>\n'
 
-# 锁表：rel -> {"token":..., "exp":...}（仅用于让 Windows 拿到锁令牌，不做强制互斥）
+# 锁表： (user, rel) -> {"token":..., "exp":...}（仅用于让 Windows 拿到锁令牌，不做强制互斥）
+# 键必须带 user：不同用户的同名路径是不同文件，只用 rel 做键会让 A 用户拿到 B 用户的锁令牌。
 _lock = threading.Lock()
 _locks = {}
 LOCK_TTL = 3600
@@ -314,12 +316,22 @@ def _do_put(handler, user, rel, readonly=False):
     if os.path.isdir(target):
         _send_dav_error(handler, 405, "目标是目录")
         return
-    try:
-        length = int(handler.headers.get("Content-Length", 0) or 0)
-    except (TypeError, ValueError):
-        length = 0
-    if length <= 0:
+    # Content-Length 必须区分“头缺失”和“值为 0”：
+    # Windows 自带的 WebDAV 重定向器（WebClient）在资源管理器里新建/复制文件时，
+    # 第一步固定是先发一个 Content-Length: 0 的 PUT 建 0 字节空文件，之后才 LOCK +
+    # PUT 写真实数据。老代码把 <=0 一律当成“缺少 Content-Length”回 411，
+    # 结果资源管理器往 Z 盘新建文件、复制文件、上传空文件全部失败。
+    raw_len = handler.headers.get("Content-Length")
+    if raw_len is None:
         _send_dav_error(handler, 411, "缺少 Content-Length")
+        return
+    try:
+        length = int(str(raw_len).strip())
+    except (TypeError, ValueError):
+        _send_dav_error(handler, 400, "Content-Length 不合法")
+        return
+    if length < 0:
+        _send_dav_error(handler, 400, "Content-Length 不合法")
         return
     if length > MAX_PUT_BYTES:
         _send_dav_error(handler, 413, "文件过大")
@@ -332,10 +344,15 @@ def _do_put(handler, user, rel, readonly=False):
             _send_dav_error(handler, 507, "配额不足")
             return
     existed = os.path.isfile(target)
-    tmp = target + ".davtmp"
+    # 临时文件必须是唯一名：老代码用固定名 target + ".davtmp"，并发写同一路径会互相
+    # 覆盖，失败残留在用户目录里还会被列表/配额统计到。tempfile.mkstemp 在目标目录内
+    # 建唯一文件（与 target 同目录，保证 os.replace 是同一文件系统内的原子改名）。
+    tmp = None
     remaining = length
     try:
-        with open(tmp, "wb") as f:
+        fd, tmp = tempfile.mkstemp(prefix=".davtmp-", suffix=".part",
+                                   dir=os.path.dirname(target) or ".")
+        with os.fdopen(fd, "wb") as f:
             while remaining > 0:
                 chunk = handler.rfile.read(min(256 * 1024, remaining))
                 if not chunk:
@@ -343,6 +360,7 @@ def _do_put(handler, user, rel, readonly=False):
                 f.write(chunk)
                 remaining -= len(chunk)
         os.replace(tmp, target)
+        tmp = None                      # 已经改名成功，不需要清理
     except _Abort as e:
         _cleanup(tmp)
         _send_dav_error(handler, e.code, e.msg)
@@ -472,15 +490,16 @@ def _do_lock(handler, user, rel, readonly=False):
         _send_dav_error(handler, 403, "路径不合法")
         return
     token = "opaquelocktoken:" + str(uuid.uuid4())
+    key = (user, rel)                             # 不同用户同名路径必须隔离
     with _lock:
         now = time.time()
         if len(_locks) > 4096:                    # 顺手清掉过期锁，避免长期运行后无限增长
             for k in [k for k, v in _locks.items() if v["exp"] < now]:
                 _locks.pop(k, None)
-        old = _locks.get(rel)
+        old = _locks.get(key)
         if old and handler.headers.get("If"):
             token = old["token"]                 # 刷新已有锁
-        _locks[rel] = {"token": token, "exp": now + LOCK_TTL}
+        _locks[key] = {"token": token, "exp": now + LOCK_TTL}
     body = (_XML_HEADER + '<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>'
             '<D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope>'
             '<D:depth>infinity</D:depth><D:timeout>Second-%d</D:timeout>'
@@ -491,7 +510,7 @@ def _do_lock(handler, user, rel, readonly=False):
 
 def _do_unlock(handler, user, rel, readonly=False):
     with _lock:
-        _locks.pop(rel, None)
+        _locks.pop((user, rel), None)
     _resp(handler, 204, b"")
 
 

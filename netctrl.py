@@ -33,6 +33,10 @@ _backup_dir = None
 _last_fp = None                             # 最近应用过的规则指纹；未变化则跳过重建
 _BOOT_TTL = 600                             # 开机缓存保留时长（秒）
 _MAC_RE = re.compile(r"^[0-9a-f]{12}$")
+# 虚拟/容器/VPN 网卡前缀：_detect_ifs 自动选内网卡时要跳过，避免把 docker0 / virbr0
+# 之类的接口当成接客户机的那张网卡。
+_VIRTUAL_IF_RE = re.compile(
+    r"^(docker|veth|virbr|br-|vmnet|vboxnet|vnet|tun|tap|dummy|wg|zt|tailscale|podman|cni|flannel|kube)")
 
 
 def _now():
@@ -162,13 +166,23 @@ def _detect_ifs():
         if not lan:
             out = _out(["ip", "-o", "-4", "addr", "show", "up"])
             cands = []
+            seen = set()
             for line in out.splitlines():
                 parts = line.split()
                 if len(parts) < 4 or parts[2] != "inet":
                     continue
                 ifname = parts[1]
+                # 同一网卡配了多个 IPv4 时 ip -o addr 会重复输出这一行，必须按网卡名去重，
+                # 否则 cands 里出现重复项，日志/取首项都不稳定。
+                if ifname in seen:
+                    continue
                 if ifname == "lo" or "@" in ifname or ifname == wan:
                     continue
+                # 过滤 docker/libvirt/容器/VPN 等虚拟网卡：它们通常也有 IPv4 且是 UP，
+                # 很容易被当成分内网卡 lan，导致 NETCTRL 挂在错误网卡上。
+                if _VIRTUAL_IF_RE.match(ifname):
+                    continue
+                seen.add(ifname)
                 cands.append(ifname)
             if cands:
                 lan = cands[0]
@@ -244,17 +258,25 @@ def _neigh_macs():
 
 
 def _desired_rules():
-    """返回 ([ (mac, verdict), ... ], fallback)。规则集 = 手动设置 ∪ 开机缓存 ∪ 邻居表在线机器。"""
+    """返回 ([ (mac, verdict), ... ], fallback)。
+
+    只给“生效策略 ≠ 默认策略”的机器生成规则。链尾本来就有一条 fallback 规则，
+    对生效策略等于默认策略的机器再逐条加一条同动作规则纯属冗余；而老代码把 ARP
+    邻居表里所有在线 MAC 都这样加了一遍，客户机 ARP 状态在 REACHABLE 与 STALE 之间
+    正常切换时，规则指纹每 30 秒就变一次，于是 `iptables -F NETCTRL` + 逐条重建反复
+    执行，重建窗口期内流量会短暂漏过或中断。
+    因此这里只看手动设置与开机缓存（开机缓存用于“已离线但仍需保留规则”的场景），
+    不再查询邻居表 —— 未列出的 MAC 天然由 fallback 规则覆盖。
+    """
     now = time.time()
-    macs = set(_cfg["macs"])
     for m, ts in list(_recent_boots.items()):
         if now - ts > _BOOT_TTL:
             _recent_boots.pop(m, None)
-        else:
-            macs.add(m)
-    macs |= _neigh_macs()
-    rules = sorted((m, _effective_locked(m)) for m in macs if _is_unicast(m))
-    return rules, _cfg["default"]
+    macs = set(_cfg["macs"]) | set(_recent_boots)
+    default = _cfg["default"]
+    rules = sorted((m, _effective_locked(m)) for m in macs
+                   if _is_unicast(m) and _effective_locked(m) != default)
+    return rules, default
 
 
 def _sync_locked():
@@ -283,11 +305,28 @@ def _sync_locked():
         print(f"[{_now()}] [ERROR] netctrl 规则同步失败: {e}")
 
 
-def _build_base_rules(lan, wan):
-    """NAT 回程放行 + 出外网 MASQUERADE（完全接管模式下，按用户要求重建）。"""
-    _sh(["iptables", "-A", "FORWARD", "-i", wan, "-o", lan,
-         "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
-    _sh(["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", wan, "-j", "MASQUERADE"])
+def _ensure_base_rules(lan, wan):
+    """补齐 NAT 回程放行 + 出外网 MASQUERADE（幂等，已存在则跳过）。
+
+    这两条规则和“完全接管”无关：不管有没有清空过 FORWARD/POSTROUTING，客户机出去
+    都必须能回来、并且要做源地址转换。老代码把它们放在 `if _full_takeover:` 分支里，
+    NETCTRL_FULL_TAKEOVER=False 时永远不补，回程包直接被丢。
+    """
+    checks = (
+        (["iptables", "-C", "FORWARD", "-i", wan, "-o", lan,
+          "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+         ["iptables", "-A", "FORWARD", "-i", wan, "-o", lan,
+          "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"]),
+        (["iptables", "-t", "nat", "-C", "POSTROUTING", "-o", wan, "-j", "MASQUERADE"],
+         ["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", wan, "-j", "MASQUERADE"]),
+    )
+    for check, add in checks:
+        try:
+            _sh(check)
+            continue          # 已存在
+        except RuntimeError:
+            pass
+        _sh(add)
 
 
 def init():
@@ -318,7 +357,8 @@ def init():
                 # 完全接管：清空旧的手工转发/NAT 规则（按用户要求“现有的完全删除”）
                 _sh(["iptables", "-F", "FORWARD"])
                 _sh(["iptables", "-t", "nat", "-F", "POSTROUTING"])
-                _build_base_rules(lan, wan)   # NAT 回程 + MASQUERADE
+            # 非接管模式同样要补齐回程放行与 MASQUERADE（幂等）
+            _ensure_base_rules(lan, wan)
             _last_fp = None
             _sync_locked()
             _ready = True

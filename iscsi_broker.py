@@ -134,6 +134,10 @@ SYSCTL_KV = {
 mac_locks = {}
 mac_state = {}  # mac -> {"nbd_dev":..., "overlay":...} 记录每个 mac 当前占用的资源，供重连清理和空闲巡检使用
 writeback_active = {}  # img_name -> mac：正以“回写模式”直接使用该母盘的客户机。同一母盘同一时刻只允许一台回写，防止互相覆盖写坏母盘
+image_claims = {}      # img_name -> mac：该母盘正被“准备中”（为客户机建叠加盘：cp --reflink /
+                       # qemu-img create 期间，或回写模式建 target 期间）。准备过程不是原子的，
+                       # 必须把母盘占住，否则同一时刻可能被 /admin/wb_prov 判定为空闲而直接进入
+                       # 回写模式，写坏正在生成的叠加盘快照。由 global_lock 保护。
 global_lock = threading.Lock()
 
 # =================== 后台手动 iSCSI 挂载（母盘直出，写直达母盘） ===================
@@ -160,8 +164,9 @@ MIN_FREE_GB = 5   # OVERLAY_DIR 剩余空间低于该值(GB)时拒绝新 provisi
 
 # ---- 无流量检测：识别"客户机不主动断开 iSCSI"的关机/断电（纯服务端，Windows/Linux 通用）----
 # iSCSI 协议自带保活：Linux open-iscsi 默认每 5 秒发一次 NOP-Out，Windows 也会周期性发包。
-# 因此"长时间没收到客户端任何包"≈客户端失联。用 ss -tni 的 lastrcv（内核级，距最后收包秒数）
-# 观测，再用 arping 做 L2 层二次确认（活着必答、防火墙拦不住 ARP），防止误删"空闲但活着"的机器。
+# 因此"长时间没收到客户端任何包"≈客户端失联。用 ss -tni 的 lastrcv（内核级）观测——
+# 注意 lastrcv 的单位是**毫秒**，parse_3260_lastrcv() 会换算成秒后再交给下面这些阈值；
+# 再用 arping 做 L2 层二次确认（活着必答、防火墙拦不住 ARP），防止误删"空闲但活着"的机器。
 IDLE_NO_TRAFFIC_SECONDS = 300   # 距客户端最后一个包超过该秒数 → 进入可疑
 IDLE_NO_TRAFFIC_CONFIRM = 2     # 连续 N 次巡检仍可疑才处理（防抖动）
 IDLE_NO_TRAFFIC_HARD = 1800     # arping 不可用时，无包超过该秒数才允许删除（保守兜底）
@@ -403,23 +408,50 @@ def stable_tid(mac: str) -> int:
     digest = hashlib.blake2s(mac.encode()).hexdigest()
     return TID_BASE + (int(digest[:8], 16) % TID_SPACE)
 
+# ---------------------------------------------------------------- MAC 参数校验
+# mac 会参与三件危险的事：拼成叠加盘文件名、拼进 IQN、拼进返回给 iPXE 的脚本。
+# 只做 replace(":", "") 是不够的：
+#   1) /prov 里 os.path.join(OVERLAY_DIR, f"overlay_{mac}_{img}.raw") 遇到
+#      mac="x/../../../../etc/xxx" 会越出 OVERLAY_DIR，随后的 os.remove / cp --reflink
+#      （root 身份）能删改系统任意文件；
+#   2) 带空格/引号/${} 的 mac 会把 iPXE 脚本与 IQN 注入成别的脚本。
+# 因此所有来自 URL/表单的 mac 必须先经过本函数：只接受 12 位十六进制（允许用
+# ":" / "-" 分隔的常见 MAC 写法），其余一律返回 ""，由调用方拒绝请求。
+_MAC_PARAM_RE = re.compile(r"^[0-9a-f]{12}$")
+
+def norm_mac_param(raw) -> str:
+    """把 URL/表单里的 mac 归一化成 12 位小写十六进制；非法返回 ""。"""
+    if raw is None:
+        return ""
+    s = str(raw).strip().lower().replace(":", "").replace("-", "")
+    return s if _MAC_PARAM_RE.match(s) else ""
+
 nbd_alloc_lock = threading.Lock()
 nbd_in_use = set()
 
 def find_free_nbd():
-    """在锁内分配空闲 NBD 设备，避免两台客户机并发抢到同一个 /dev/nbdX。"""
+    """在锁内分配空闲 NBD 设备，避免两台客户机并发抢到同一个 /dev/nbdX。
+
+    /proc/mounts 必须按“第一列设备路径”精确比较：老代码用 `dev in mounts` 子串判断，
+    /dev/nbd10 被挂载时 "/dev/nbd1" 也命中，导致 nbd1..nbd9 被连续误判为占用。
+    同时要求字符设备节点真实存在（否则 qemu-nbd 连上去才失败，报错更晚更难查）。
+    """
     with nbd_alloc_lock:
+        mounted = set()
         try:
             with open("/proc/mounts") as f:
-                mounts = f.read()
+                for line in f:
+                    parts = line.split()
+                    if parts:
+                        mounted.add(parts[0])
         except Exception:
-            mounts = ""
+            mounted = set()
         for i in range(NBD_MAX):
             dev = f"/dev/nbd{i}"
             try:
-                if dev in nbd_in_use:
+                if dev in nbd_in_use or dev in mounted:
                     continue
-                if dev in mounts:
+                if not os.path.exists(dev):
                     continue
                 size_path = f"/sys/block/nbd{i}/size"
                 if os.path.exists(size_path):
@@ -588,10 +620,38 @@ def get_client_ips():
         pass
     return conn
 
+def _ss_peer_host(field):
+    """解析 ss 的连接端字段（Peer Address:Port）-> 主机字符串；无法识别返回 ""。
+
+    兼容三种写法：10.1.1.5:52341、[::ffff:10.1.1.5]:52341、[fe80::1]:52341。
+    tgtd 监听 IPv6 双栈时，IPv4 客户机会显示成 [::ffff:10.1.1.5]，
+    与 get_client_ips() 给出的纯 IPv4 字符串对不上，必须还原成纯 IPv4 才能匹配。
+    """
+    s = (field or "").strip()
+    if not s:
+        return ""
+    if s.startswith("["):
+        end = s.find("]")
+        host = s[1:end] if end > 0 else s[1:]
+    elif ":" in s:
+        host = s.rsplit(":", 1)[0]
+    else:
+        host = s
+    if host.startswith("::ffff:") and "." in host:
+        host = host[len("::ffff:"):]
+    return host
+
 def parse_3260_lastrcv():
     """解析 ss -tni 对 3260 端口所有连接的最后收包时间，返回 {client_ip: 距最后收包秒数}。
-    lastrcv 是内核维护的"距该 socket 最后收到数据包的秒数"；活着的 iSCSI 客户端
-    （NOP-Out 保活/ACK/IO）会持续刷新它，失联的客户端只会一直增长。"""
+
+    单位：`ss -tni` 输出的 lastrcv（内核 tcp_info.tcpi_last_data_recv）是**毫秒**，
+    不是秒。老代码把它当秒用，于是「0.3 秒没收到包」就被判定成「超过 300 秒无流量」，
+    1.8 秒没收到包就会触发 IDLE_NO_TRAFFIC_HARD 强行删除正在运行的客户机 target
+    （客户机瞬间掉盘/蓝屏）。这里统一换算成秒后再交给调用方。
+
+    同一 IP 可能存在多条 3260 连接（残留半开连接 + 新连接），取最小值：
+    只要有一条连接在持续收包，这台机器就是活的，不能被别的死连接“投毒”判死。
+    """
     res = {}
     try:
         out = subprocess.run(["ss", "-tni", "( sport = :3260 )"],
@@ -603,11 +663,13 @@ def parse_3260_lastrcv():
         if line.startswith("ESTAB"):
             parts = line.split()
             if len(parts) >= 5:  # ESTAB Recv-Q Send-Q Local:Port Peer:Port
-                cur_ip = parts[4].rsplit(":", 1)[0]
+                cur_ip = _ss_peer_host(parts[4])
                 continue
         m = re.search(r"lastrcv:(\d+)", line)
         if m and cur_ip:
-            res[cur_ip] = int(m.group(1))
+            seconds = int(m.group(1)) / 1000.0     # lastrcv 单位是毫秒
+            prev = res.get(cur_ip)
+            res[cur_ip] = seconds if prev is None else min(prev, seconds)
             cur_ip = None
     return res
 
@@ -657,17 +719,36 @@ def force_cleanup_mac(mac, reason):
         print(f"[{now}] [CLEANUP] {reason} for {mac} (tid={tid})")
 
 def release_writeback_lock(img_name, reason):
-    """只解除某母盘的“回写占用”登记（不动 target/叠加盘/nbd）。返回原占用者 mac 或 ""。
+    """解除某母盘的“回写占用”登记，并把占用者残留的母盘直连 target 一起清掉。
 
-    给三类场景用：① 客户机已没有 I_T nexus（会话结束）宽限期到；② 后台手动解除；
-    ③ 检测到登记与 tgtadm 实际状态不一致。
+    返回原占用者 mac 或 ""。给三类场景用：① 客户机已没有 I_T nexus（会话结束）宽限期到；
+    ② 后台手动解除；③ 检测到登记与 tgtadm 实际状态不一致。
+
+    为什么必须连 target 一起删：老代码只从 writeback_active 里移除登记，占用者的
+    target 仍直连母盘、要等 IDLE_TIMEOUT_SECONDS(300s) 才被回收。在“宽限期 45s 到
+    target 回收 300s”这段时间里，只要原客户机网络恢复重连，它就会继续直写母盘，
+    而此时母盘锁已经放开——别的客户机可能已经建了叠加盘去做 backing file，或者管理
+    员已经在后台挂载这张母盘，结果是母盘被并发写坏。所以解除占用时必须同时删掉 target
+    并清掉 mac_state，让“锁”和“谁能碰母盘”始终一致。
     """
     with global_lock:
         owner = writeback_active.pop(img_name, None)
-    if owner:
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] [CLEANUP] write-back lock released for {img_name} (owner={owner}): {reason}")
-    return owner or ""
+    if not owner:
+        return ""
+    # 先拿 mac 锁再删 target，保证与 /prov、/admin/wb_prov、force_cleanup_mac 串行
+    lock = get_mac_lock(owner)
+    with lock:
+        with global_lock:
+            st = mac_state.get(owner)
+            stale = bool(st) and st.get("writeback_img") == img_name
+            if stale:
+                mac_state.pop(owner, None)
+        if stale:
+            _tgt_force_delete(stable_tid(owner))
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{now}] [CLEANUP] write-back lock released for {img_name} (owner={owner}): {reason}; "
+          f"target tid={stable_tid(owner)} removed so the client cannot reconnect to the base image")
+    return owner
 
 def writeback_lock_stale(img_name, owner, no_nexus_since):
     """回写占用是否已过期可解除。返回 (可解除, 原因)。
@@ -682,6 +763,9 @@ def writeback_lock_stale(img_name, owner, no_nexus_since):
     """
     if not owner or not no_nexus_since:
         return False, ""
+    with global_lock:
+        if image_claims.get(img_name):
+            return False, ""      # 母盘正在准备中（建 target），绝不能在这期间放开占用
     age = time.time() - no_nexus_since
     if age < WRITEBACK_LOCK_GRACE:
         return False, ""
@@ -690,8 +774,14 @@ def writeback_lock_stale(img_name, owner, no_nexus_since):
     return True, f"{owner} 已无 I_T nexus 持续 {int(age)}s（会话已结束）"
 
 def idle_cleanup_worker():
-    idle_since = {}        # tid -> 首次被判定为 nexus 空闲的时间戳
-    no_traffic_since = {}  # mac -> 首次被判定为"无流量可疑"的时间戳
+    # 两个通道必须用**各自独立的**计时字典：
+    # 通道 0 记的是“回写 target 什么时候开始没有 nexus”，通道 1 记的是“空闲 target 的起点”。
+    # 老代码共用 idle_since，通道 0 在第 0 轮写入 tid 后，通道 1 立刻因为该 tid 不在
+    # parse_idle_tids()（target 已不存在）里而把它 pop 掉，于是 writeback_lock_stale
+    # 永远拿不到 no_nexus_since，专门处理“幽灵占用”的分支形同虚设。
+    wb_no_nexus_since = {}  # tid -> 首次观测到“回写 target 没有 I_T nexus”的时间戳
+    idle_since = {}         # tid -> 首次被判定为 nexus 空闲的时间戳
+    no_traffic_since = {}   # mac -> 首次被判定为"无流量可疑"的时间戳
     while True:
         time.sleep(IDLE_CHECK_INTERVAL)
         try:
@@ -707,14 +797,21 @@ def idle_cleanup_worker():
                 tid = str(stable_tid(owner))          # 与 parse_*_tids 的键类型一致（都是字符串）
                 has_nexus = tid in active
                 if has_nexus:
-                    idle_since.pop(tid, None)
+                    wb_no_nexus_since.pop(tid, None)
                     continue
-                if tid not in idle_since:
-                    idle_since[tid] = now_ts          # 与本通道原语义一致：target 无 nexus 的起点
+                if tid not in wb_no_nexus_since:
+                    wb_no_nexus_since[tid] = now_ts    # 本通道语义：target 无 nexus 的起点
                     continue
-                ok, why = writeback_lock_stale(img_name, owner, idle_since.get(tid))
+                ok, why = writeback_lock_stale(img_name, owner, wb_no_nexus_since.get(tid))
                 if ok:
                     release_writeback_lock(img_name, why)
+                    wb_no_nexus_since.pop(tid, None)
+            # 回写登记已经解除的 tid 不再需要计时
+            with global_lock:
+                live_wb_tids = {str(stable_tid(m)) for m in writeback_active.values()}
+            for tid in list(wb_no_nexus_since.keys()):
+                if tid not in live_wb_tids:
+                    wb_no_nexus_since.pop(tid, None)
 
             # ---- 通道 1：正常 logout（nexus 消失）后的空闲清理 ----
             idle_now = parse_idle_tids()
@@ -1016,6 +1113,9 @@ def _image_busy_reason_unlocked(img_name):
     wb = writeback_active.get(img_name)
     if wb:
         return f"镜像正被客户机 {wb} 以回写模式使用"
+    claim = image_claims.get(img_name)
+    if claim:
+        return f"镜像正在为客户机 {claim} 准备中（叠加盘拷贝或回写 target 建立未完成）"
     overlay_users = [m for m, s in mac_state.items()
                      if s.get("overlay") and _overlay_img(m, s["overlay"]) == img_name]
     if overlay_users:
@@ -1138,9 +1238,11 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/prov":
             host = self.headers['Host']
-            mac = params.get("mac", ["unknown"])[0].replace(":", "").strip().lower()
-            if mac == "unknown":
-                self._fail_to_menu(host, "Client MAC missing in request.")
+            # mac 只接受 12 位十六进制：它会拼进叠加盘文件名、IQN 和下面返回的 iPXE 脚本，
+            # 光去掉 ":" 挡不住 "x/../../../../etc/xxx" 这类路径穿越与脚本注入。
+            mac = norm_mac_param(params.get("mac", [""])[0])
+            if not mac:
+                self._fail_to_menu(host, "Client MAC missing or invalid in request.")
                 return
 
             # 联网控制：客户机开机（PXE 请求供给）即确保/覆写其转发规则
@@ -1171,27 +1273,36 @@ class Handler(BaseHTTPRequestHandler):
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{now}] [INFO] Client {mac} requesting target (image={img_name}, mode={'reflink' if USE_REFLINK else 'qcow2'})...")
 
-                # 回写占用检查：母盘正被管理员回写时禁止新建叠加盘（cp --reflink 非原子，
-                # 并发写入会产生新旧混杂的快照）
+                # 回写占用 / 手动挂载 / 正在建叠加盘：三者互斥，全部在 global_lock 内判定，
+                # 然后**立刻**登记 image_claims 把母盘占住，直到 target 建好为止。
+                # 少了这一步，/admin/wb_prov 会在 cp --reflink / qemu-img create 还没结束时
+                # 认为母盘空闲，直接进入回写模式改写母盘 —— qcow2 路线下所有在线客户机的
+                # 叠加盘都以它为 backing file，母盘一变块映射就全乱。
                 with global_lock:
                     wb_owner = writeback_active.get(img_name)
+                    exported_iqn = web_exported.get(img_name, {}).get("iqn")
+                    claim_owner = image_claims.get(img_name)
+                    if not wb_owner and not exported_iqn and not claim_owner:
+                        image_claims[img_name] = mac
                 if wb_owner:
                     print(f"[{now}] [ERROR] {mac}: image {img_name} is in write-back use by {wb_owner}, refuse")
                     self._fail_to_menu(host, f"Image {img_name} is in write-back use by {wb_owner}. Please try again later.")
                     return
-
-                # 后台手动挂载互斥：母盘正被后台导出（外部 iSCSI 发起端在写盘）时，
-                # 禁止再对它建叠加盘，避免快照与并发写入混杂出脏数据
-                with global_lock:
-                    exported_iqn = web_exported.get(img_name, {}).get("iqn")
                 if exported_iqn:
                     print(f"[{now}] [ERROR] {mac}: image {img_name} is manually exported ({exported_iqn}), refuse")
                     self._fail_to_menu(host, f"Image {img_name} is manually exported via web ({exported_iqn}). Unmount it in web admin first.")
+                    return
+                if claim_owner:
+                    print(f"[{now}] [ERROR] {mac}: image {img_name} is being provisioned by {claim_owner}, refuse")
+                    self._fail_to_menu(host, f"Image {img_name} is being prepared for {claim_owner}. Please retry in a moment.")
                     return
 
                 try:
                     ensure_overlay_space()
                 except Exception as e:
+                    with global_lock:
+                        if image_claims.get(img_name) == mac:
+                            image_claims.pop(img_name, None)
                     print(f"[{now}] [ERROR] {mac}: {e}")
                     self._fail_to_menu(host, str(e))
                     return
@@ -1209,7 +1320,10 @@ class Handler(BaseHTTPRequestHandler):
                             release_nbd(prev["nbd_dev"])
                         if prev.get("writeback_img"):
                             with global_lock:
-                                writeback_active.pop(prev["writeback_img"], None)
+                                # 只清自己名下的占用：这张母盘可能已经被别的机器接管，
+                                # 无条件 pop 会把别人的回写锁误删（母盘随即被别人写坏）。
+                                if writeback_active.get(prev["writeback_img"]) == mac:
+                                    writeback_active.pop(prev["writeback_img"], None)
                     if os.path.exists(overlay):
                         os.remove(overlay)
 
@@ -1282,6 +1396,11 @@ class Handler(BaseHTTPRequestHandler):
                                     "--force", "--tid", str(tid)],
                                    stderr=subprocess.DEVNULL, timeout=3)
                     self._fail_to_menu(host, f"Boot failed: {e}")
+                finally:
+                    # 无论成功、失败还是中途 return，都要放开母盘占位
+                    with global_lock:
+                        if image_claims.get(img_name) == mac:
+                            image_claims.pop(img_name, None)
             return
 
         # ================== 管理员模式 ==================
@@ -1305,9 +1424,13 @@ class Handler(BaseHTTPRequestHandler):
             # 密码验证通过后签发一次性短时令牌（绑定 MAC），后续 wb/wb_prov 全部用令牌，
             # 密码不再进入后续 URL/日志。iPXE 登录仅允许账号 admin。
             host = self.headers['Host']
-            mac = params.get("mac", [""])[0].replace(":", "").strip().lower()
+            # mac 会被拼进 IQN 与 iPXE 脚本，必须严格校验（见 norm_mac_param）
+            mac = norm_mac_param(params.get("mac", [""])[0])
             user = params.get("user", [""])[0]
             pwd = params.get("pwd", [""])[0]
+            if not mac:
+                self._fail_to_menu(host, "Client MAC missing or invalid!")
+                return
             if user != "admin":
                 self._fail_to_menu(host, "Admin account required!")
                 return
@@ -1326,9 +1449,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/wb":
             # 兼容入口：用一次性令牌进入选盘菜单
             host = self.headers['Host']
-            mac = params.get("mac", [""])[0].replace(":", "").strip().lower()
+            mac = norm_mac_param(params.get("mac", [""])[0])
             tok = params.get("tok", [""])[0]
-            if not admin_token_ok(mac, tok):
+            if not mac or not admin_token_ok(mac, tok):
                 self._fail_to_menu(host, "Invalid or expired admin token!")
                 return
             self._admin_wb_menu(host, mac, tok)
@@ -1337,28 +1460,42 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/admin/wb_prov":
             # 回写模式：直接把母盘 .raw 文件导出成 iSCSI LUN（不建叠加盘），
             # 客户机的一切写入都会直接落到母盘上
-            mac = params.get("mac", [""])[0].replace(":", "").strip().lower()
+            mac = norm_mac_param(params.get("mac", [""])[0])
             tok = params.get("tok", [""])[0]
             img_name = os.path.basename(params.get("img", [""])[0])
-            # 联网控制：回写模式开机同样触发规则对齐
-            try:
-                netctrl.on_client_boot(mac)
-            except Exception:
-                pass
             host = self.headers['Host']
             if not mac or not admin_token_ok(mac, tok):
                 now_dbg = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{now_dbg}] [ERROR] wb_prov denied: mac={mac!r} tok_len={len(tok)} img={img_name!r}")
                 self._fail_to_menu(host, "Invalid or expired admin token!")
                 return
+            # 联网控制：回写模式开机同样触发规则对齐
+            try:
+                netctrl.on_client_boot(mac)
+            except Exception:
+                pass
             base_img = os.path.join(IMAGES_DIR, f"{img_name}.raw")
             if not img_name or not os.path.isfile(base_img):
                 self._fail_to_menu(host, f"Image not found: {img_name}")
                 return
             lock = get_mac_lock(mac)
             with lock:
+                # 占用判定与“占住母盘”必须尽量贴近：先在一次 global_lock 里判定，
+                # 判定通过就立刻登记 image_claims，直到 target 建好为止。
                 with global_lock:
                     owner = writeback_active.get(img_name)
+                    exported_iqn = web_exported.get(img_name, {}).get("iqn")
+                    claim_owner = image_claims.get(img_name)
+                    overlay_users = [m for m, s in mac_state.items()
+                                     if m != mac and s.get("overlay")
+                                     and _overlay_img(m, s["overlay"]) == img_name]
+                if claim_owner:
+                    self._fail_to_menu(host, f"Image {img_name} is being prepared for {claim_owner}"
+                                             ". Please retry in a moment.")
+                    return
+                if exported_iqn:
+                    self._fail_to_menu(host, f"Image {img_name} is manually exported via web ({exported_iqn}). Unmount it in web admin first.")
+                    return
                 if owner not in (None, mac):
                     # 占用者若已经没有 iSCSI 会话（关机/拔电/掉线没重连），把它当过期占用夺过来，
                     # 否则一台关机的机器能把这个母盘锁很久。判据（都必须成立）：
@@ -1379,30 +1516,40 @@ class Handler(BaseHTTPRequestHandler):
                     if stale:
                         print(f"[{datetime.datetime.now()}] [CLEANUP] write-back lock taken over from "
                               f"{owner} (no active iSCSI session) by {mac} for {img_name}")
-                        subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "delete",
-                                        "--force", "--tid", str(stable_tid(owner))],
-                                       stderr=subprocess.DEVNULL, timeout=3)
+                        _tgt_force_delete(stable_tid(owner))
                         with global_lock:
-                            writeback_active.pop(img_name, None)
-                            writeback_active[img_name] = mac
-                        mac_state.pop(owner, None)
+                            if writeback_active.get(img_name) == owner:
+                                writeback_active.pop(img_name, None)
+                            mac_state.pop(owner, None)
                     else:
                         self._fail_to_menu(host, f"Image {img_name} is in write-back use by {owner}"
                                                  ". Please try again later.")
                         return
-                # 后台手动挂载互斥：该母盘正被后台导出（外部发起端写盘）时禁止回写
-                with global_lock:
-                    exported_iqn = web_exported.get(img_name, {}).get("iqn")
-                if exported_iqn:
-                    self._fail_to_menu(host, f"Image {img_name} is manually exported via web ({exported_iqn}). Unmount it in web admin first.")
+                # ★ 关键安全闸门：qcow2 路线（USE_REFLINK=False）下，所有在线客户机的叠加盘
+                #   都以 base_img 作为 backing file。此时直接改写母盘会毁掉它们的块映射，
+                #   导致大面积文件系统损坏，必须硬拒绝（老代码只 print 一条 WARN 就放行）。
+                #   reflink 路线不受影响：叠加盘是文件系统级 CoW 克隆，之后写母盘只会触发
+                #   重新分配，旧叠加盘保持自己的快照。
+                if overlay_users and not USE_REFLINK:
+                    print(f"[{datetime.datetime.now()}] [ERROR] {mac} write-back of {img_name} refused: "
+                          f"qcow2 overlays still in use by {overlay_users}")
+                    self._fail_to_menu(host, f"Image {img_name} is used as backing file by "
+                                             f"{len(overlay_users)} running client(s) "
+                                             f"({overlay_users[0]}). Write-back would corrupt them; "
+                                             "stop those clients first.")
                     return
-                # 提示性告警：其他客户机仍持有该母盘的叠加盘时回写，旧叠加盘将保持快照状态
-                with global_lock:
-                    overlay_users = [m for m, s in mac_state.items()
-                                     if m != mac and s.get("overlay")
-                                     and _overlay_img(m, s["overlay"]) == img_name]
                 if overlay_users:
-                    print(f"[{datetime.datetime.now()}] [WARN] {mac} write-back of {img_name} while overlays active: {overlay_users}")
+                    print(f"[{datetime.datetime.now()}] [WARN] {mac} write-back of {img_name} while "
+                          f"reflink overlays active: {overlay_users} (CoW clones keep their own snapshot)")
+                # 占住母盘：从这一刻起到 target 建好，/prov 与后台挂载都不会再碰它，
+                # 巡检也不会把它当成“已释放的回写锁”而放行别的客户机。
+                with global_lock:
+                    cur = writeback_active.get(img_name)
+                    if cur not in (None, mac) or image_claims.get(img_name):
+                        self._fail_to_menu(host, f"Image {img_name} is in use by another client."
+                                                 " Please try again later.")
+                        return
+                    image_claims[img_name] = mac
                 tid = stable_tid(mac)
                 iqn = f"iqn.2026-07.storage:{mac}"
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1410,6 +1557,9 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     ensure_overlay_space()
                 except Exception as e:
+                    with global_lock:
+                        if image_claims.get(img_name) == mac:
+                            image_claims.pop(img_name, None)
                     print(f"[{now}] [ERROR] {mac}: {e}")
                     self._fail_to_menu(host, f"Server disk space low: {e}")
                     return
@@ -1429,13 +1579,18 @@ class Handler(BaseHTTPRequestHandler):
                             except Exception: pass
                         if prev.get("writeback_img"):
                             with global_lock:
-                                writeback_active.pop(prev["writeback_img"], None)
+                                if writeback_active.get(prev["writeback_img"]) == mac:
+                                    writeback_active.pop(prev["writeback_img"], None)
                     tgt_new_target(tid, iqn)
                     tgt_new_lun(tid, base_img, None)  # 文件后端默认缓冲 I/O，直接读写母盘文件
                     tgt_bind_target(tid)
-                    mac_state[mac] = {"nbd_dev": None, "overlay": None, "writeback_img": img_name}
+                    # 登记 mac_state、回写占用、释放占位：一个原子步骤，避免出现
+                    # “占位已放开但 writeback_active 还没写上”的空窗被别的机器钻空子
                     with global_lock:
+                        mac_state[mac] = {"nbd_dev": None, "overlay": None, "writeback_img": img_name}
                         writeback_active[img_name] = mac
+                        if image_claims.get(img_name) == mac:
+                            image_claims.pop(img_name, None)
                     server_ip = self.headers.get('Host', '').split(':')[0]
                     self._send_sanboot(server_ip, iqn)
                     print(f"[{now}] [SUCCESS] WRITE-BACK target {iqn} -> {base_img}")
@@ -1444,9 +1599,12 @@ class Handler(BaseHTTPRequestHandler):
                     subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "delete",
                                     "--force", "--tid", str(tid)],
                                    stderr=subprocess.DEVNULL, timeout=3)
-                    mac_state.pop(mac, None)
                     with global_lock:
-                        writeback_active.pop(img_name, None)
+                        mac_state.pop(mac, None)
+                        if writeback_active.get(img_name) == mac:
+                            writeback_active.pop(img_name, None)
+                        if image_claims.get(img_name) == mac:
+                            image_claims.pop(img_name, None)
                     self._fail_to_menu(host, f"Write-back boot failed: {e}")
             return
 
@@ -2051,6 +2209,10 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if path == "/agent/logout":
             self._agent_logout()
             return
+        # 客户机托盘「检查更新」：只把“请求更新”告诉服务器，由 SYSTEM 主进程执行替换
+        if path == "/agent/request-update":
+            self._agent_request_update()
+            return
         if path == "/web/login":
             self._do_login(self._form())
             return
@@ -2314,15 +2476,39 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         quota_remaining = users_auth.quota_of(s["user"]) - cloud_store.quota_used(s["user"])
         if quota_remaining < 0:
             quota_remaining = 0
+        back = "/web/drive" + (("?p=" + urllib.parse.quote(rel, safe="")) if rel else "")
+
+        def _back_with(msg):
+            return back + (("&" if "?" in back else "?") + urllib.parse.quote(msg, safe=""))
+
+        replied = [False]
+
+        def on_quota_exceeded():
+            """配额超限、请求体还没读完时先把 302 发出去。
+
+            老行为是直接 302 然后关闭连接，但接收缓冲里还有没读完的上传数据，
+            内核会向浏览器发 TCP RST，浏览器只显示 ERR_CONNECTION_RESET，
+            看不到“超出配额”的提示页。先回响应后，浏览器会主动中止上传，
+            剩下的请求体很快被 cloud_store 排空，连接就能正常关闭。
+            """
+            replied[0] = True
+            self.close_connection = True
+            try:
+                self._redirect(_back_with("上传失败：超出配额，已取消本次上传"))
+                self.wfile.flush()
+            except Exception:
+                pass
+
         try:
             _ok, msg = cloud_store.save_upload(s["user"], rel, self.rfile, content_length,
                                                self.headers.get("Content-Type", ""),
-                                               quota_remaining)
+                                               quota_remaining,
+                                               on_quota_exceeded=on_quota_exceeded)
         except Exception as e:
             msg = "上传失败：%s" % e
-        back = "/web/drive" + (("?p=" + urllib.parse.quote(rel, safe="")) if rel else "")
-        self._redirect(back + (("&" if "?" in back else "?") + "msg="
-                               + urllib.parse.quote(msg, safe="")))
+        if replied[0]:
+            return          # 响应已在 on_quota_exceeded 里发过，不能再发第二次
+        self._redirect(_back_with(msg))
 
     def _do_mkdir(self, form, s):
         name = form.get("name", [""])[0].strip()
@@ -2563,6 +2749,42 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         ok, err = agent_hub.result(data.get("mac"), data.get("id"),
                                    data.get("ok", False), data.get("msg", ""))
         self._send_json({"ok": ok, "err": err}, 200 if ok else 400)
+
+    def _agent_request_update(self):
+        """托盘「检查更新」请求：由服务器把 update 指令排进该 MAC 的队列。
+
+        为什么不让托盘自己下载替换：托盘是 SYSTEM 进程用 WTSQueryUserToken 在用户会话里
+        拉起来的**普通用户令牌**进程。它 taskkill 不掉 SYSTEM 的 agent 主进程（拒绝访问，
+        exe 一直锁着），也无权 schtasks /Run 一个 /RU SYSTEM /RL HIGHEST 的计划任务；
+        兜底 `start "" exe run` 更是把本应以 SYSTEM 运行的后台服务降权成桌面用户进程。
+        所以托盘只负责“请求”，真正的下载/校验/替换交给 SYSTEM 主进程在下一次心跳执行。
+        """
+        data = self._json_body()
+        if data is None or not agent_hub.check_token(data.get("token")):
+            self._send_json({"ok": False, "err": "bad token"}, 403)
+            return
+        mac = norm_mac_param(data.get("mac"))
+        if not mac:
+            self._send_json({"ok": False, "err": "bad mac"}, 400)
+            return
+        force = bool(data.get("force"))
+        ver = client_release.current()
+        rec = client_release.release_of(ver) if ver else None
+        if not rec:
+            self._send_json({"ok": False, "err": "服务器上还没有发布客户端版本"})
+            return
+        args = {"ver": rec["ver"], "url": self._agent_exe_rel(rec["ver"]),
+                "sha256": rec.get("sha256", ""), "size": rec.get("size", 0)}
+        if force:
+            args["force"] = 1
+        # force_offline=True：这是客户机自己的托盘发来的请求，不需要“在线”兜底判断
+        ok, msg = agent_hub.enqueue(mac, "update", force_offline=True, **args)
+        if not ok:
+            self._send_json({"ok": False, "err": msg})
+            return
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{now}] [INFO] Client {mac} tray requested client update to v{rec['ver']} (force={force})")
+        self._send_json({"ok": True, "ver": rec["ver"], "err": ""})
 
     def _agent_status(self):
         """客户机托盘上报自己的状态（Z 盘挂没挂、登录了谁）。
@@ -2870,7 +3092,9 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         if action == "release_writeback":
             img = form.get("img", [""])[0].strip()
             owner = release_writeback_lock(img, "管理员在后台手动解除")
-            msg = ("已解除 %s 的回写占用（原占用者 %s）" % (img, owner)) if owner \
+            msg = ("已解除 %s 的回写占用（原占用者 %s；其母盘直连 target 已一并删除，"
+                   "该客户机的 iSCSI 盘会立即断开，避免锁放开后它继续直写母盘）"
+                   % (img, owner)) if owner \
                 else ("%s 当前没有回写占用" % img)
             self._redirect("/?msg=" + urllib.parse.quote(msg, safe=""))
             return
@@ -3120,12 +3344,28 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             content_length = int(self.headers.get("Content-Length", 0) or 0)
         except (TypeError, ValueError):
             content_length = 0
+        replied = [False]
+
+        def on_quota_exceeded():
+            # 同 _do_upload：先回响应再让 cloud_store 排空剩余请求体，避免浏览器只见 RST
+            replied[0] = True
+            self.close_connection = True
+            try:
+                self._redirect("/web/common?msg="
+                               + urllib.parse.quote("上传失败：超出容量上限，已取消本次上传", safe=""))
+                self.wfile.flush()
+            except Exception:
+                pass
+
         try:
             _ok, msg = cloud_store.save_common_upload(self.rfile, content_length,
                                                       self.headers.get("Content-Type", ""),
-                                                      8 << 40)
+                                                      8 << 40,
+                                                      on_quota_exceeded=on_quota_exceeded)
         except Exception as e:
             msg = "上传失败：%s" % e
+        if replied[0]:
+            return
         self._redirect("/web/common?msg=" + urllib.parse.quote(msg, safe=""))
 
     def _do_common_delete(self, form):

@@ -103,8 +103,8 @@ letter=Z                    ; 网盘映射到哪个盘符
 | 注销网盘 | Z 盘恢复成只读的「通用文件」 |
 | 打开 Z 盘 | 打开资源管理器 |
 | 重新挂载 | 盘符掉了（比如休眠唤醒后）点一下重挂 |
-| 检查更新 | 问服务器有没有新版客户端，有就下载校验后替换自身并重启（见第 5 节排错） |
-| 强制重装客户端 | 当前版本坏了/被杀软改坏时，重新拉一遍服务器上的同版本 exe 覆盖自己 |
+| 检查更新 | 问服务器有没有新版客户端；确认后请服务器给本机排一条升级指令，由 SYSTEM 进程完成下载替换（见第 5 节排错） |
+| 强制重装客户端 | 当前版本坏了/被杀软改坏时，请服务器下发一次同版本重装指令（`force`），同样由 SYSTEM 进程执行 |
 | 查看日志 | 打开 agent.log |
 | 退出托盘 | 只关托盘进程，SYSTEM 那个还在跑（下次心跳会再拉起来）；要彻底停用请卸载开机任务 |
 
@@ -137,9 +137,12 @@ letter=Z                    ; 网盘映射到哪个盘符
 - **VNC 密码**：由 VNC 服务端自己管（agent 不改它），在网页里按提示输入即可。
 - **网盘是明文 http 的 WebDAV**：Windows 默认禁止在 http 上用 Basic 认证、且限制单文件
   50MB；SYSTEM 进程启动时会自动改好注册表（`BasicAuthLevel=2`、`FileSizeLimitInBytes`、
-  `AuthForwardServerList` 只放行本服务器）并拉起 WebClient 服务——所以**首次装好后重启一次**
-  最保险。
-- **日志**：`C:\iscsi-broker-agent\agent.log`（托盘与 SYSTEM 进程写同一个文件）。
+  `AuthForwardServerList` 只放行本服务器，不带端口）并拉起 WebClient 服务；参数有变化时会
+  顺手重启一次 WebClient（服务只在启动时读这些参数）——所以**首次装好后重启一次**最保险。
+- **日志**：`C:\iscsi-broker-agent\agent.log`（托盘与 SYSTEM 进程写同一个文件）；
+  超过 1 MiB 自动轮转为 `agent.log.old`（只保留一份旧日志）。
+- **托盘不会因为网络慢而卡死**：挂盘（`net use`）、状态上报（HTTP）和登录都在后台线程执行，
+  界面操作（菜单文字、气泡、退出）统一回到 UI 线程；同类任务同一时刻只跑一个，连点不会叠加。
 - **排错命令**：
 
   ```cmd
@@ -153,16 +156,26 @@ letter=Z                    ; 网盘映射到哪个盘符
   iscsi-broker-agent.exe uninstall         :: 删掉开机任务
   ```
 
+- **开机后客户机一直不上线**：计划任务在 `ONSTART` 启动时网卡可能还没就绪。agent 不是只在
+  启动时探一次 MAC：只要 `agent.ini` 里没有写死 `[server] mac`，主循环与托盘的每次重试都会
+  重新探测，网卡一就绪就会自动补上（日志里出现「网卡就绪，探测到 MAC=…」）。
 - **托盘图标不见了**：确认有用户登录（SYSTEM 会话里画不出托盘）；`agent.log` 里找
   「已在会话 N 启动托盘」；手动 `iscsi-broker-agent.exe tray` 试一下。
 - **Z 盘是空的 / 打不开**：先看托盘右键菜单里的状态；未登录时 Z 盘是只读的「通用文件」，
   管理员要在后台「通用文件」页先传点东西；登录后才能看到自己的网盘。
 - **Z 盘登录后还是只读**：检查是否真的登录成功（托盘状态显示"已登录：xxx"），以及
   WebClient 服务是否在跑（`sc query WebClient`）。
-- **客户端怎么更新（手动）**：托盘右键菜单里有「检查更新」——agent 向服务器
-  `GET /agent/version` 问最新发布版本，有新版就下载到 `%TEMP%`、校验 sha256、然后
-  改名旧 exe（`.old`）→ 写入新 exe → `schtasks /Run` 把自己拉起来，全过程写在
-  `<exe目录>\agent-update.log`。同版本也可以「强制重装」（修坏掉的 exe）。
+- **客户端怎么更新（手动）**：托盘右键菜单里有「检查更新」——托盘向服务器
+  `GET /agent/version` 问最新发布版本；用户确认后 `POST /agent/request-update` 请服务器
+  为本机排一条升级指令，SYSTEM 身份的 agent 进程在下一次心跳（`/agent/poll`）取到这条
+  `{"type":"update",...}` 指令后执行：下载到 `%TEMP%`、校验 sha256、改名旧 exe（`.old`）→
+  写入新 exe → `schtasks /Run` 把自己拉起来，全过程写在 `<exe目录>\agent-update.log`。
+  同版本也可以「强制重装」（`force`，修坏掉的 exe）。
+  > **为什么托盘不自己替换**：托盘是 SYSTEM 进程用 `WTSQueryUserToken` 在登录用户会话里
+  > 拉起来的普通用户令牌进程。它 `taskkill` 不掉 SYSTEM 的 agent 主进程（拒绝访问，exe 一直
+  > 锁着），也无权 `schtasks /Run` 一个 `/RU SYSTEM /RL HIGHEST` 的计划任务，兜底
+  > `start "" exe run` 还会把本应以 SYSTEM 运行的后台服务降权成桌面用户进程。所以托盘只
+  > 负责“请求”，下载与替换一律交给 SYSTEM 进程。
   服务端发布新版（后台「客户机控制」页 →「客户端发布」卡片）：
   - **只在 Windows 上编译**：在装有 Windows 的机器上跑 `client\build.bat`，
     把 `dist\iscsi-broker-agent.exe` 通过后台「上传并发布」传上去（版本号可留空，
@@ -186,8 +199,10 @@ letter=Z                    ; 网盘映射到哪个盘符
   1. **服务器**：是不是包含该修复的版本（老版本必现）；
   2. **客户机 WebClient**：`sc query WebClient` 要是 RUNNING（否则管理员 `net start WebClient`）；
   3. **客户机注册表**：`HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters` 里
-     `BasicAuthLevel=2`、`AuthForwardServerList` 含本服务器（以 SYSTEM 身份运行时 agent
-     会自动配好，所以要装成计划任务而不是手动双击）；
+     `BasicAuthLevel=2`、`AuthForwardServerList` 含本服务器（**只写主机名/IP，不要带端口**：
+     WebClient 按不带端口的主机名匹配，写成 `10.1.1.1:8080` 反而匹配不上）。以 SYSTEM 身份
+     运行时 agent 会自动配好（所以要装成计划任务而不是手动双击）；参数真的发生变化时
+     agent 会顺手重启一次 WebClient 服务（服务只在启动时读这些参数，不重启本次开机不生效）；
   4. **看 `agent.log` 里的「WebDAV 探测」那一行**：agent 启动时会自己发一次
      `PROPFIND /dav/`（Depth: 0），把“服务器/网络的问题”和“客户机重定向器的问题”分开：
 

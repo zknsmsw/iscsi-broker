@@ -613,6 +613,14 @@ print_summary() {
 # ---------------- 主流程 ----------------
 detect_distro
 if [[ $DO_UNINSTALL -eq 1 ]]; then
+  # do_uninstall 会打印“程序目录”和“数据目录未改动”，这两处用到的变量必须在它之前算好：
+  # 老代码直接调用 do_uninstall，此时 PROG_DIR 还没赋值（卸载信息里程序目录是空的），
+  # BASE_DIR 也仍是默认值，而不是 /etc/iscsi-broker/*.env 里记录的自定义数据目录。
+  if [[ $IN_PLACE -eq 1 ]]; then PROG_DIR="$SRC_DIR"; else PROG_DIR="$INSTALL_DIR"; fi
+  _uninstall_base="$(env_file_base_dir)"
+  if [[ $BASE_DIR_GIVEN -eq 0 && -n "$_uninstall_base" ]]; then
+    BASE_DIR="$_uninstall_base"
+  fi
   do_uninstall
 fi
 echo "${c_info}== iSCSI Broker 安装/升级 ==${c_end}  源码目录：$SRC_DIR"

@@ -28,6 +28,18 @@ PW_RE = re.compile(r"^[A-Za-z0-9_\-]{6,32}$")
 DEFAULT_QUOTA_BYTES = 1 << 30    # 默认配额 1 GiB
 QUOTA_MAX_BYTES = 8 << 40        # 配额上限 8 TiB
 
+# 保留用户名（一律不可注册、不可登录、不可改配额；比较时统一转小写）。
+# 为什么必须保留：普通用户的私有目录就是 CLOUD_ROOT/<用户名>，而 "_common" 正是
+# cloud_store 的全局“通用文件”目录。若允许注册 _common，任何人在公开注册页拿到这个
+# 账号后，其网盘根目录就等于通用文件目录，可以任意覆盖/删除管理员上传的公共文件
+# （所有未登录客户机的 Z 盘、所有用户的“通用文件”都受影响）。
+RESERVED_NAMES = frozenset({"admin", "_common"})
+
+
+def is_reserved(name) -> bool:
+    """用户名是否被保留（admin / _common）。"""
+    return (name or "").strip().lower() in RESERVED_NAMES
+
 # ---------- 模块级状态（由 _LOCK 保护） ----------
 _LOCK = threading.Lock()
 _OVERLAY_DIR = None      # 配置文件目录（setup 时由主程序注入）
@@ -80,6 +92,8 @@ def _load_users_unlocked():
         name, algo, salt, digest, quota_s = parts
         if algo != "sha256" or not USERNAME_RE.match(name):
             continue
+        if is_reserved(name):
+            continue          # 保留名（admin / _common）即使残留在文件里也一律不生效
         try:
             quota = int(quota_s)
         except ValueError:
@@ -168,8 +182,8 @@ def register_user(name, pwd):
     name = (name or "").strip()
     if not USERNAME_RE.match(name):
         return False, "用户名需为 3-32 位字母/数字/下划线/短横线"
-    if name.lower() == "admin":
-        return False, "保留用户名 admin 不可注册"
+    if is_reserved(name):
+        return False, "保留用户名 %s 不可注册" % name
     if not PW_RE.match(pwd or ""):
         return False, "密码需为 6-32 位字母/数字/下划线/短横线"
     with _LOCK:
@@ -199,6 +213,8 @@ def check_login(user, pwd):
             return None
     if not USERNAME_RE.match(user):
         return None
+    if is_reserved(user):
+        return None      # _common 等保留名即使残留在 users.conf 里也不得登录
     with _LOCK:
         rec = _load_users_unlocked().get(user)
     if rec is None:
@@ -207,10 +223,10 @@ def check_login(user, pwd):
 
 
 def user_exists(name) -> bool:
-    """用户名是否已占用（含保留名 admin）。"""
+    """用户名是否已占用（含保留名 admin / _common）。"""
     _require_setup()
     name = (name or "").strip()
-    if name.lower() == "admin":
+    if is_reserved(name):
         return True
     if not USERNAME_RE.match(name):
         return False
@@ -219,12 +235,12 @@ def user_exists(name) -> bool:
 
 
 def quota_of(name) -> int:
-    """用户配额字节数；admin 恒为 0；用户不存在返回 0。"""
+    """用户配额字节数；admin 恒为 0；保留名/用户不存在返回 0。"""
     _require_setup()
     name = (name or "").strip()
     if name == "admin":
         return 0
-    if not USERNAME_RE.match(name):
+    if not USERNAME_RE.match(name) or is_reserved(name):
         return 0
     with _LOCK:
         rec = _load_users_unlocked().get(name)
@@ -248,8 +264,8 @@ def set_user_quota(name, quota_bytes: int):
     """修改指定普通用户的配额。返回 (True, "配额已更新") 或 (False, 中文原因)。"""
     _require_setup()
     name = (name or "").strip()
-    if name.lower() == "admin":
-        return False, "admin 为内置账号（无配额限制），不可修改"
+    if is_reserved(name):
+        return False, "%s 为内置保留名，不可修改" % name
     if not USERNAME_RE.match(name):
         return False, "用户名不合法"
     if (isinstance(quota_bytes, bool) or not isinstance(quota_bytes, int)
