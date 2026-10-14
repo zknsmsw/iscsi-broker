@@ -137,10 +137,15 @@ letter=Z                    ; 网盘映射到哪个盘符
 - **VNC 密码**：由 VNC 服务端自己管（agent 不改它），在网页里按提示输入即可。
 - **网盘是明文 http 的 WebDAV**：Windows 默认禁止在 http 上用 Basic 认证、且限制单文件
   50MB；SYSTEM 进程启动时会自动改好注册表（`BasicAuthLevel=2`、`FileSizeLimitInBytes`、
-  `AuthForwardServerList` 只放行本服务器，不带端口）并拉起 WebClient 服务；参数有变化时会
-  顺手重启一次 WebClient（服务只在启动时读这些参数）——所以**首次装好后重启一次**最保险。
+  `AuthForwardServerList` 只放行本服务器，不带端口）并拉起 WebClient 服务。
+  **参数有变化时不会主动重启 WebClient**：服务已经是 `start=auto`，新参数在下次开机
+  （服务启动）后自然生效。为什么不立刻重启：无盘客户机的用户临时目录/配置常常就在 WebDAV
+  映射盘上，重启服务会把映射断掉，之后连新进程都起不来（弹
+  `This application could not be started.`）。所以**首次装好后重启一次客户机**最保险。
 - **日志**：`C:\iscsi-broker-agent\agent.log`（托盘与 SYSTEM 进程写同一个文件）；
-  超过 1 MiB 自动轮转为 `agent.log.old`（只保留一份旧日志）。
+  超过 1 MiB 自动轮转为 `agent.log.old`（只保留一份旧日志）。SYSTEM 进程每次拉起托盘前会记一条
+  `托盘将继承的环境：TEMP=… USERPROFILE=…`（限流 5 分钟一次），用来判断托盘继承的环境是否指向
+  已断开的映射盘。
 - **托盘不会因为网络慢而卡死**：挂盘（`net use`）、状态上报（HTTP）和登录都在后台线程执行，
   界面操作（菜单文字、气泡、退出）统一回到 UI 线程；同类任务同一时刻只跑一个，连点不会叠加。
 - **排错命令**：
@@ -184,7 +189,9 @@ letter=Z                    ; 网盘映射到哪个盘符
   - **没有这行** → 进程在 .NET 运行时初始化阶段就失败了，属于 exe 本身或运行环境问题；
     在客户机用户会话里手动跑一次 `C:\iscsi-broker-agent\iscsi-broker-agent.exe tray`
     并点弹窗的「是」，能看到 .NET 给出的具体原因；
-  - **有这行但紧跟着 `本会话已有托盘在跑，本进程退出`** → 同会话里已经有一个托盘，属于正常去重；
+  - **有这行但紧跟着 `本会话已有托盘在跑，本进程退出`** → 同会话里已经有一个托盘；
+    SYSTEM 进程在拉起托盘前会先清掉该会话里残留的 agent 进程（`清理会话 1 里残留的 agent 进程…`），
+    正常情况下不会再出现这种冲突；
   - **有这行但之后进程消失** → 托盘自身崩了，把 `agent.log` 末尾发来即可定位。
 - **托盘图标不见了**：确认有用户登录（SYSTEM 会话里画不出托盘）；`agent.log` 里找
   「已在会话 N 启动托盘」；手动 `iscsi-broker-agent.exe tray` 试一下。

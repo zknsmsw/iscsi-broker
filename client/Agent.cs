@@ -595,6 +595,12 @@ namespace IscsiBrokerAgent
             }
             if (_trayPid != 0)
                 TryKill(_trayPid);                   // 会话切换：干掉旧会话里的托盘
+            // 关键：先把该会话里残留的 agent 进程清掉再拉起托盘。
+            // 托盘用 "iscsi-broker-agent-tray" 互斥体保证同会话只有一个实例，而 agent 重启后
+            // （比如刚更新完）新进程并不知道旧托盘还在跑：旧托盘占着互斥体，新托盘一起来就
+            // “本会话已有托盘在跑”直接退出 —— 表现为日志里只有「已在会话 1 启动托盘 pid=…」，
+            // 之后什么都没有，Z 盘再也挂不上。
+            KillStaleTrays(sid);
             string err;
             int pid = LaunchInSession(sid, Process.GetCurrentProcess().MainModule.FileName, "tray", out err);
             if (pid > 0)
@@ -611,6 +617,32 @@ namespace IscsiBrokerAgent
             else
             {
                 LogOnce("tray-launch-fail", "启动托盘失败：" + err, 300);
+            }
+        }
+
+        private static DateTime _lastTraySweep = DateTime.MinValue;
+
+        /// <summary>
+        /// 清掉目标会话里残留的 agent 进程（正常只有“上一轮没被回收的托盘”）。
+        /// 为什么必须做：SYSTEM 会话里的主进程不受影响，但同一个用户会话里只要还有一个
+        /// 旧托盘活着，新的托盘进程就会在互斥体检查那里静默退出，Z 盘永远挂不上。
+        /// 限流 60 秒一次，避免托盘反复起不来时每轮心跳都去 taskkill。
+        /// </summary>
+        private static void KillStaleTrays(uint sid)
+        {
+            if ((DateTime.Now - _lastTraySweep).TotalSeconds < 60) return;
+            _lastTraySweep = DateTime.Now;
+            try
+            {
+                string outp;
+                int rc = RunShell("taskkill /FI \"SESSION eq " + sid
+                                  + "\" /IM iscsi-broker-agent.exe /F", 15000, out outp);
+                Log("清理会话 " + sid + " 里残留的 agent 进程：rc=" + rc + " "
+                    + outp.Replace("\r\n", " ").Trim());
+            }
+            catch (Exception e)
+            {
+                Log("清理残留 agent 进程失败（忽略）：" + e.Message);
             }
         }
 
@@ -660,6 +692,27 @@ namespace IscsiBrokerAgent
             catch { /* 已经不在了 */ }
         }
 
+        /// <summary>从 CreateEnvironmentBlock 的环境块里取一个变量值（取不到返回空串）。</summary>
+        private static string EnvValueOf(IntPtr block, string key)
+        {
+            if (block == IntPtr.Zero || key.Length == 0) return "";
+            try
+            {
+                long p = block.ToInt64();
+                while (true)
+                {
+                    string s = Marshal.PtrToStringUni(new IntPtr(p));
+                    if (string.IsNullOrEmpty(s)) break;
+                    int eq = s.IndexOf('=');
+                    if (eq > 0 && s.Substring(0, eq).Equals(key, StringComparison.OrdinalIgnoreCase))
+                        return s.Substring(eq + 1);
+                    p += (s.Length + 1) * 2;
+                }
+            }
+            catch { }
+            return "";
+        }
+
         /// <summary>在指定会话的登录用户身份下启动一个进程（不等待），返回 pid。</summary>
         private static int LaunchInSession(uint sessionId, string exe, string arguments, out string err)
         {
@@ -687,6 +740,15 @@ namespace IscsiBrokerAgent
                 // 托盘里 net use / explorer / 临时文件都会踩坑
                 IntPtr env = IntPtr.Zero;
                 bool haveEnv = CreateEnvironmentBlock(out env, hDup, false);
+                // 诊断：把托盘将要继承的关键环境变量记下来。无盘客户机常把用户的
+                // 临时目录/配置放到映射盘（WebDAV/Z:）上，一旦那个盘不可用，新进程连
+                // .NET 运行时都初始化不了 —— 现象就是托盘弹 “This application could not
+                // be started.” 而 SYSTEM 身份的后台进程一切正常。有这条日志就能一眼判断。
+                LogOnce("tray-env", "托盘将继承的环境：TEMP=" + EnvValueOf(env, "TEMP")
+                                    + " TMP=" + EnvValueOf(env, "TMP")
+                                    + " USERPROFILE=" + EnvValueOf(env, "USERPROFILE")
+                                    + " SystemRoot=" + EnvValueOf(env, "SystemRoot")
+                                    + (haveEnv ? "" : "（CreateEnvironmentBlock 失败，将继承 SYSTEM 的环境）"), 300);
                 try
                 {
                     if (!CreateProcessAsUser(hDup, null, cmd, IntPtr.Zero, IntPtr.Zero, false,
@@ -768,19 +830,17 @@ namespace IscsiBrokerAgent
                 int rc1 = RunShell("sc config WebClient start= auto", 10000, out outp);
                 Log("WebClient: sc config start=auto rc=" + rc1 + " " + outp.Replace("\r\n", " "));
                 string state;
-                if (changed && WebClientRunning(out state))
+                if (changed)
                 {
-                    // WebClient 只在服务启动时读这些注册表参数：刚改过就得重启一次，
-                    // 否则本次开机（到下次重启前）新参数都不生效。
-                    int rc2 = RunShell("net stop WebClient", 30000, out outp);
-                    Log("WebClient: 参数有变，net stop rc=" + rc2 + " " + outp.Replace("\r\n", " "));
-                    int rc3 = RunShell("net start WebClient", 20000, out outp);
-                    Log("WebClient: net start rc=" + rc3 + " " + outp.Replace("\r\n", " "));
-                    if (!WebClientRunning(out state))
-                        Log("WebClient: 重启后服务仍不是 RUNNING —— Z 盘会挂不上（net use 报“找不到网络名”）。"
-                            + "请以管理员在客户机上执行 net start WebClient 排查：" + state.Replace("\r\n", " "));
+                    // WebClient 只在服务启动时读这些注册表参数，所以要等服务重启才生效。
+                    // 这里**故意不主动 net stop/start**：无盘客户机上用户的临时目录/配置文件
+                    // 往往就在 WebDAV 映射盘上，一旦重启服务，映射就断了，之后连新进程都拉不起来
+                    // （表现为 agent/托盘启动失败，弹 “This application could not be started.”）。
+                    // 服务已经是 start=auto，参数在下次开机自然生效；首次装好后本次挂盘失败就重启一次。
+                    Log("WebClient: 注册表参数有变，将于下次 WebClient 服务启动（通常是下次开机）后生效；"
+                        + "本次不主动重启服务，避免断掉已有的 WebDAV 映射");
                 }
-                else if (WebClientRunning(out state))
+                if (WebClientRunning(out state))
                 {
                     Log("WebClient: 服务在运行，WebDAV 盘可以挂载");
                 }
@@ -1016,6 +1076,7 @@ namespace IscsiBrokerAgent
         /// <summary>后台线程要动界面时回 UI 线程执行（_ui 没建好/已失效就直接跑，别把活吞掉）。</summary>
         private static void UiPost(Action a)
         {
+            EnsureUiMarshaller();
             try
             {
                 if (_ui != null && _ui.IsHandleCreated) { _ui.BeginInvoke(a); return; }
@@ -1023,6 +1084,27 @@ namespace IscsiBrokerAgent
             catch (Exception e) { Log("切回 UI 线程失败（改为直接执行）：" + e.Message); }
             try { a(); }
             catch (Exception e) { Log("UI 操作失败：" + e.Message); }
+        }
+
+        /// <summary>
+        /// 延迟创建用于回 UI 线程的隐藏控件。放在这里（而不是托盘启动流程最前面）有两个原因：
+        /// ① 托盘启动阶段越少碰窗口句柄越好，出问题时也更容易定位；
+        /// ② 万一创建句柄失败（桌面/窗口站异常等），只是退化成“界面操作直接在后台线程做”，
+        ///    不会把整个托盘进程带走。
+        /// </summary>
+        private static void EnsureUiMarshaller()
+        {
+            if (_ui != null) return;
+            try
+            {
+                _ui = new System.Windows.Forms.Control();
+                _ui.CreateControl();
+            }
+            catch (Exception e)
+            {
+                _ui = null;
+                Log("创建 UI 调度控件失败（界面操作将直接在后台线程执行）：" + e.Message);
+            }
         }
 
         private static int TrayMain()
@@ -1042,9 +1124,8 @@ namespace IscsiBrokerAgent
                 try { FreeConsole(); } catch { }         // 从控制台/命令行启动时收掉黑窗口
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                // UI 线程上建一个隐藏控件：后台线程（挂盘/上报）靠它 BeginInvoke 回 UI 线程
-                _ui = new System.Windows.Forms.Control();
-                _ui.CreateControl();
+                // 注：用于回 UI 线程的隐藏控件改为延迟创建（见 EnsureUiMarshaller），
+                // 不在这里碰窗口句柄 —— 托盘启动阶段越干净，出问题越好定位。
 
                 ContextMenuStrip menu = new ContextMenuStrip();
                 _trayStatus = new ToolStripMenuItem("未登录（Z 盘只读通用文件）");
