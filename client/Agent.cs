@@ -87,7 +87,13 @@ namespace IscsiBrokerAgent
 
     internal static class Program
     {
-        private const string VERSION = "1.1";
+        // ⚠ 每次改动本文件（客户端行为有任何变化）都必须把这个版本号加一！
+        //    客户机就是拿它和服务器发布的版本号比大小来判断“要不要更新 / 更新成功没有”：
+        //    改了代码却没改版本号，更新换上去之后客户机仍报旧版本，服务器会永远认为它有新版，
+        //    于是无限循环更新（每轮都杀托盘、重启后台进程）。
+        //    build.bat 编完会执行 `iscsi-broker-agent.exe version` 打印这个号，后台上传时填同一个号；
+        //    服务端也会校验，不一致直接拒收。
+        internal const string VERSION = "1.2";
         private const string TASK_NAME = "iSCSI-Broker-Agent";
         private const uint INVALID_SESSION = 0xFFFFFFFF;
         private const int MAXIMUM_ALLOWED = 0x02000000;
@@ -150,11 +156,15 @@ namespace IscsiBrokerAgent
                 string low = a.Trim().ToLowerInvariant();
                 if (low == "--dry-run" || low == "dry-run" || low == "dryrun") _dryRun = true;
                 else if (low == "install" || low == "uninstall" || low == "run" || low == "tray"
-                         || low == "once" || low == "test" || low == "selftest") action = low;
+                         || low == "once" || low == "test" || low == "version"
+                         || low == "selftest") action = low;
             }
 
             if (action == "install") return Install();
             if (action == "uninstall") return Uninstall();
+            // 只打印编译进 exe 的版本号：build.bat 编完会调它，后台上传时照抄即可，
+            // 免得手填一个跟 exe 不一致的号（那会导致客户机无限循环更新）。
+            if (action == "version") { Console.WriteLine(VERSION); return 0; }
             if (action == "selftest") return SelfTest(args);
 
             LoadConfig();

@@ -320,9 +320,10 @@ def _adopt_locked(ver, tmp_path, source, notes=""):
     rec = _record(ver, dst, source, notes)
     _index["releases"] = [r for r in _index["releases"] if r["ver"] != ver] + [rec]
     _prune_locked()
-    # current 只前进不后退（同版本覆盖写入时保持 current 不变）
-    if not _index["current"] or newer(ver, _index["current"]) or _index["current"] == ver:
-        _index["current"] = ver
+    # 管理员这次“上传并发布”就是要在客户机上生效的版本，直接设为 current。
+    # 不再要求“版本号只能前进”：库里万一残留了一个号更大的错误记录（例如误发布的 100.0），
+    # 小的版本号永远当不上 current，客户机也永远升不到它 —— 那种坑比“允许显式降级”更麻烦。
+    _index["current"] = ver
     _write_index_locked()
     return rec
 
@@ -363,19 +364,25 @@ def path_of(ver):
 def available_for(cur):
     """当前版本 cur 有没有可用的更新？返回 (bool, 记录)。
 
-    只要发布库里存在比 cur 新的版本就返回那个“最新且比 cur 新”的；cur 非法/为空时
-    返回最新的发布（让老客户机也能被拉齐）。
+    以发布库里管理员指定的 **current** 为“应该升到哪一版”：
+      - current 不存在 -> 没有发布；
+      - cur 非法/为空 -> 直接把 current 给它（让老客户机拉齐）；
+      - current 比 cur 新 -> 返回 current。
+    为什么不是“取库里号最大的那一版”：库里可能残留号更大但内容不对的旧记录
+    （例如误发布的 100.0），那样会把客户机永远推向那个坏版本，管理员后来指定的
+    current（比如 1.2）反而永远升不上去。
     """
     with _lock:
-        if not _index["current"]:
-            return False, None
-        cur_ok = ver_ok(cur)
-        best = None
+        rec = None
         for r in _index["releases"]:
-            if not cur_ok or newer(r["ver"], cur):
-                if best is None or newer(r["ver"], best["ver"]):
-                    best = r
-        return (best is not None), (dict(best) if best else None)
+            if r["ver"] == _index["current"]:
+                rec = r
+                break
+        if rec is None:
+            return False, None
+        if not ver_ok(cur) or newer(rec["ver"], cur):
+            return True, dict(rec)
+        return False, None
 
 
 # ---------- 写入：上传 ----------

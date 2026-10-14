@@ -34,6 +34,11 @@ if errorlevel 1 (
 if not exist "%OUTDIR%\agent.ini" copy /y "%~dp0agent.ini.example" "%OUTDIR%\agent.ini" >nul
 echo.
 echo Built: %OUTDIR%\iscsi-broker-agent.exe
+rem 打印编译进 exe 的 VERSION —— 后台上传客户端时【版本号必须填这个数】，
+rem 填错会让客户机无限循环更新（换上去仍报旧版本，服务器以为它还有新版）。
+"%OUTDIR%\iscsi-broker-agent.exe" version
+echo ^^^^^^^^^^ 后台上传时“版本号”就填上面这个数（必须与 client\Agent.cs 里的 VERSION 一致）
+echo.
 echo Next : edit %OUTDIR%\agent.ini (server url + token), then
 echo        iscsi-broker-agent.exe test
 echo        iscsi-broker-agent.exe install
