@@ -315,6 +315,16 @@ def _adopt_locked(ver, tmp_path, source, notes=""):
     size = os.path.getsize(tmp_path)
     if size <= 0 or size > MAX_UPLOAD:
         raise ReleaseError("文件大小不合适：%d 字节" % size)
+    # 同一个文件用不同版本号重复发布：几乎一定是“没重新编译就把 dist 里的旧产物传上来了”
+    # （真实案例：build.bat 空跑没报错，dist 里还是 1.1 的旧 exe，被当成 1.2 发布，
+    #  客户机换上去仍报 1.1 -> 无限循环）。同一个版本号重复上传（重传同一份）仍然允许。
+    digest = _sha256_file(tmp_path)
+    for r in _index["releases"]:
+        if r["ver"] != ver and (r.get("sha256") or "").lower() == digest.lower():
+            raise ReleaseError(
+                "这个文件与已发布的 v%s 完全相同（sha256=%s…）：多半是你没重新编译，"
+                "client\\dist\\iscsi-broker-agent.exe 还是上一次的产物。请重跑 client\\build.bat"
+                "（它会打印版本号和 sha256）再上传。" % (r["ver"], digest[:16]))
     dst = _exe_path(ver)
     os.replace(tmp_path, dst)              # 同目录 rename，原子
     rec = _record(ver, dst, source, notes)

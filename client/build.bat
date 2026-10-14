@@ -21,6 +21,12 @@ set OUTDIR=%~dp0dist
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 set OUTEXE=%OUTDIR%\iscsi-broker-agent.exe
 
+rem Delete any previous output FIRST. If the compile below fails we must not leave a
+rem stale exe behind that looks like a fresh build - that once caused an old 1.1 build
+rem to be published under the version number 1.2 (identical sha256, clients kept
+rem reporting 1.1).
+del /F /Q "%OUTEXE%" >nul 2>&1
+
 "%CSC%" /nologo /target:exe /platform:anycpu /optimize+ /warn:4 ^
   /out:"%OUTEXE%" ^
   /win32icon:"%~dp0agent.ico" ^
@@ -47,6 +53,10 @@ echo Built: %OUTEXE%
 echo.
 echo VERSION compiled into this exe:
 "%OUTEXE%" version
+echo.
+echo SHA256 of this exe - after publishing, compare it with the web admin page
+echo to be sure the file you uploaded is really this build:
+certutil -hashfile "%OUTEXE%" SHA256
 echo.
 echo The number above is the client VERSION. When publishing from the web admin,
 echo fill in EXACTLY this number as the version, otherwise clients will loop
