@@ -49,6 +49,13 @@ Win10/11 自带）。`client\dist\` 是构建产物目录，不进仓库。
 
 > 想改代码：只改 `Agent.cs`（C# 5 语法，因为用的是系统内置的旧版 csc），重新跑 `build.bat`。
 
+> ### ⚠ `build.bat` 必须保持纯 ASCII
+>
+> cmd.exe 是按 **OEM 代码页**（简体中文系统是 GBK/936）读 `.bat` 的。往里写中文等非 ASCII 字节，
+> 解码错位会把后面的**引号、空格、换行一起吞掉**，`csc` 那条命令会被撕成 `'xe' is not recognized`
+> 之类的碎片，**结果什么都编不出来**（而且退出码还可能看起来是 0）。
+> 中文说明请写在本文件里，不要写进 `build.bat`。脚本现在也会在 csc 失败或产物缺失时返回非 0 退出码。
+
 > ### ⚠ 改了 `Agent.cs` 就必须把 `VERSION` 加一
 >
 > `Agent.cs` 里的 `internal const string VERSION = "1.2";` 是**唯一**的版本来源：
