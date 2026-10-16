@@ -90,6 +90,9 @@ def _mac_colon(mac12):
 
 # ---------- 初始化 / 配置读写 ----------
 
+_IFNAME_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+
+
 def setup(base_dir, lan_if="", wan_if="", full_takeover=True, reject=True):
     """配置模块。lan_if/wan_if 留空时由 init() 自动探测。"""
     global _base_dir, _backup_dir, _full_takeover, _reject, _cfg_lan, _cfg_wan
@@ -97,8 +100,10 @@ def setup(base_dir, lan_if="", wan_if="", full_takeover=True, reject=True):
     _backup_dir = os.path.join(base_dir, "netctrl_backup")
     _full_takeover = full_takeover
     _reject = reject
-    _cfg_lan = (lan_if or "").strip()
-    _cfg_wan = (wan_if or "").strip()
+    lan = (lan_if or "").strip()
+    wan = (wan_if or "").strip()
+    _cfg_lan = lan if _IFNAME_RE.match(lan) else ""
+    _cfg_wan = wan if _IFNAME_RE.match(wan) else ""
 
 
 def _parse_conf(text):
@@ -463,13 +468,14 @@ def known_clients(conns=None):
     with _lock:
         macs = set(_cfg["macs"]) | set(neigh) | set(_recent_boots) | set(conns)
         src_map = {m: ("手动" if m in _cfg["macs"] else "默认") for m in macs}
+        policy_map = {m: _effective_locked(m) for m in macs}
     rows = []
     for mac in sorted(macs):
         rows.append({
             "mac": mac,
             "ip": neigh.get(mac) or conns.get(mac, ""),
             "online": mac in neigh or mac in conns,
-            "policy": effective(mac),
+            "policy": policy_map[mac],
             "src": src_map[mac],
         })
     return rows

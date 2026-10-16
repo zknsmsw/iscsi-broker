@@ -98,8 +98,8 @@ EOF
 # ---------------- 参数 ----------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base-dir)    BASE_DIR="${2:-}"; BASE_DIR_GIVEN=1; shift 2;;
-    --install-dir) INSTALL_DIR="${2:-}"; shift 2;;
+    --base-dir)    [[ $# -ge 2 ]] || die "--base-dir 需要提供路径参数"; BASE_DIR="$2"; BASE_DIR_GIVEN=1; shift 2;;
+    --install-dir) [[ $# -ge 2 ]] || die "--install-dir 需要提供路径参数"; INSTALL_DIR="$2"; shift 2;;
     --no-deps)     DO_DEPS=0; shift;;
     --no-tftp)     DO_TFTP=0; shift;;
     --no-start)    DO_START=0; shift;;
