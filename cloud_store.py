@@ -292,8 +292,7 @@ def create_folder(user: str, rel: str, name: str) -> (bool, str):
         return False, "文件夹名不合法"
     if rel and (rel == VIRTUAL_COMMON or rel.startswith(VIRTUAL_COMMON + "/")):
         return False, "通用文件为只读"
-    if rel in ("", ".", None) and (name == VIRTUAL_COMMON
-                                   or name.startswith(VIRTUAL_COMMON)):
+    if rel in ("", ".", None) and name == VIRTUAL_COMMON:
         return False, "该名称与内置“通用文件”目录冲突"
     parent = resolve(user, rel)
     if parent is None:
@@ -349,7 +348,7 @@ def _split_params(value):
         k = k.strip().lower()
         v = v.strip()
         if len(v) >= 2 and v[:1] == b'"' and v[-1:] == b'"':
-            v = v[1:-1].replace(b'\\"', b'"').replace(b"\\\\", b"\\")
+            v = v[1:-1].replace(b"\\\\", b"\\").replace(b'\\"', b'"')
         if k:
             out[k] = v
     return out
@@ -601,8 +600,7 @@ def _receive(rfile, content_length, boundary, target_dir, limit, user_root=False
             return False, state["name_err"]
         if state["saved_name"] is None:
             return False, "未收到文件"
-        if user_root and (state["saved_name"] == VIRTUAL_COMMON
-                          or state["saved_name"].startswith(VIRTUAL_COMMON)):
+        if user_root and state["saved_name"] == VIRTUAL_COMMON:
             return False, "文件名与内置“通用文件”目录冲突"
         target = os.path.join(target_dir, state["saved_name"])
         os.replace(tmp_path, target)

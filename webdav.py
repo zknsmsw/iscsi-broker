@@ -326,6 +326,7 @@ def _do_put(handler, user, rel):
         _send_dav_error(handler, 400, "Content-Length 不合法")
         return
     if length > MAX_PUT_BYTES:
+        handler.close_connection = True
         _send_dav_error(handler, 413, "文件过大")
         return
     # 配额：已用 + 本次（覆盖写时先扣除旧文件大小）
@@ -333,6 +334,11 @@ def _do_put(handler, user, rel):
     if quota > 0:
         old = os.path.getsize(target) if os.path.isfile(target) else 0
         if cloud_store.quota_used(user) - old + length > quota:
+            handler.close_connection = True
+            try:
+                cloud_store._drain(handler.rfile, length, limit=cloud_store._DRAIN_AFTER_REJECT)
+            except Exception:
+                pass
             _send_dav_error(handler, 507, "配额不足")
             return
     existed = os.path.isfile(target)
@@ -365,10 +371,12 @@ def _do_put(handler, user, rel):
 
 
 def _cleanup(path):
+    if not path:
+        return
     try:
         if os.path.exists(path):
             os.remove(path)
-    except OSError:
+    except Exception:
         pass
 
 

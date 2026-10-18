@@ -57,6 +57,7 @@ TID_SPACE = 1_000_000   # tid 槽位数：原 800 在 30 台时碰撞概率约 4
 #
 # 强制指定模式：auto / reflink / qcow2
 FORCE_MODE = "auto"
+USE_REFLINK = False  # 启动时在 __main__ 中按 FORCE_MODE 与探测结果重置
 # reflink 模式下是否启用 thin(TRIM)：默认关闭。TRIM 打到与母盘共享的 extent 会触发
 # unshare(CoW 实体化)，不回收空间反而写放大；叠加盘空闲 5 分钟即删，回收无意义。
 THIN_ON_REFLINK = False
@@ -2265,7 +2266,7 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         back = "/web/drive" + (("?p=" + urllib.parse.quote(rel, safe="")) if rel else "")
 
         def _back_with(msg):
-            return back + (("&" if "?" in back else "?") + urllib.parse.quote(msg, safe=""))
+            return back + (("&" if "?" in back else "?") + "msg=" + urllib.parse.quote(msg, safe=""))
 
         replied = [False]
 
@@ -2616,7 +2617,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     # 先确定工作模式（此时模块已完整加载，list_images 等函数都可用）
-    global USE_REFLINK
     if FORCE_MODE == "reflink":
         USE_REFLINK = True
     elif FORCE_MODE == "qcow2":
