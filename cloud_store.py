@@ -17,6 +17,9 @@ cloud_store.py —— 个人网盘（云盘）存储模块（供 iscsi_broker.py
 5. 上传配额在流式写入过程中累计校验，超限立即中止并清理临时文件。
 6. 文件名解码兼容 RFC5987 filename*=UTF-8''<percent> 与浏览器原始 UTF-8 字节
    （header 为 latin-1 层字节时尝试按 UTF-8 重新解码）。
+7. 配额用量（quota_used）按用户做增量计数缓存：首次/每 _USAGE_TTL 秒全量扫描一次，
+   增删改由本模块内部记账（quota_adjust），避免每次上传、WebDAV PUT、网盘翻页都
+   递归遍历整个用户目录（文件多时是 O(文件数) 的开销）。
 
 使用前必须先调用 setup(cloud_root) 完成初始化。
 """
@@ -25,6 +28,8 @@ import inspect
 import os
 import shutil
 import tempfile
+import threading
+import time
 import urllib.parse
 
 # ---------- 常量 ----------
@@ -51,6 +56,23 @@ class _QuotaExceeded(Exception):
 
 # ---------- 模块级状态 ----------
 _CLOUD_ROOT = None  # 云盘根目录（setup 时由主程序注入）
+
+# ---------- 配额用量计数（增量维护，避免每次操作都全量 os.walk） ----------
+# 老实现每次 quota_used() 都递归统计整个用户目录。这个函数在三个热路径上：
+#   ① 网盘每翻一页（_drive_page）、② 每次上传前的剩余配额检查（_do_upload）、
+#   ③ WebDAV 映射成网络驱动器后的每一次 PUT（_do_put，复制 N 个文件就是 N 次）。
+# 文件一多（实测 2400 个文件约 0.5 秒/次）整个网盘就明显卡顿，而且耗时随文件数线性增长。
+#
+# 现在改成「首次全量扫描一次 + 之后按增量维护」：所有会让用户目录字节数变化的操作
+# （上传/WebDAV PUT/删除文件/删除目录）都在本模块内，改名/移动不改变总量，所以平时
+# 计数是精确的。_USAGE_TTL 秒后下一次查询会做一次全量重扫兜底，用来纠正管理员绕开
+# 本服务（直接在服务器上 ssh/文件管理器）改动文件造成的漂移——这也是一个软配额，
+# 短暂偏差不影响正确性。
+_USAGE_TTL = 300.0          # 秒：缓存有效期；到期后下一次查询做一次全量重扫
+_usage = {}                 # user -> 已用字节数（缓存值）
+_usage_ts = {}              # user -> 缓存刷新时刻（time.monotonic 基准）
+_usage_gen = {}             # user -> 增量代数：全量扫描期间发生增删时丢弃过期结果
+_usage_lock = threading.Lock()
 
 
 def _require_setup():
@@ -82,6 +104,10 @@ def setup(cloud_root: str) -> None:
     os.makedirs(_CLOUD_ROOT, exist_ok=True)
     os.makedirs(os.path.join(_CLOUD_ROOT, COMMON_DIR_NAME), exist_ok=True)
     os.makedirs(os.path.join(_CLOUD_ROOT, TMP_DIR_NAME), exist_ok=True)
+    with _usage_lock:          # 换了云盘根，旧的用量缓存全部作废
+        _usage.clear()
+        _usage_ts.clear()
+        _usage_gen.clear()
 
 
 def user_home(user: str) -> str:
@@ -260,17 +286,12 @@ def list_dir(user: str, rel: str) -> dict:
             "folders": folders, "files": files, "common": []}
 
 
-def quota_used(user: str) -> int:
-    """递归统计用户目录内普通文件字节总和（os.walk，跳过符号链接）。"""
-    _require_setup()
-    try:
-        home = user_home(user)
-    except ValueError:
-        return 0
+def _tree_size(path) -> int:
+    """递归统计目录内普通文件字节总和（os.walk，跳过符号链接）。"""
     total = 0
-    if not os.path.isdir(home):
+    if not os.path.isdir(path):
         return 0
-    for root, _dirs, files in os.walk(home, followlinks=False):
+    for root, _dirs, files in os.walk(path, followlinks=False):
         for fn in files:
             p = os.path.join(root, fn)
             if os.path.islink(p):
@@ -280,6 +301,56 @@ def quota_used(user: str) -> int:
             except OSError:
                 continue
     return total
+
+
+def quota_used(user: str) -> int:
+    """用户目录内普通文件字节总和（带缓存）。
+
+    首次访问（或缓存超过 _USAGE_TTL）做一次全量 os.walk 得到真值，之后直接返回
+    增量维护的计数；因此上传/WebDAV 写入/网盘翻页都不再是 O(文件数)。
+    """
+    _require_setup()
+    try:
+        home = user_home(user)          # 非法用户名立刻返回 0，不进缓存
+    except ValueError:
+        return 0
+    started = time.monotonic()
+    with _usage_lock:
+        ts = _usage_ts.get(user)
+        if ts is not None and started - ts < _USAGE_TTL:
+            return _usage.get(user, 0)
+        gen = _usage_gen.get(user, 0)
+    total = _tree_size(home)
+    with _usage_lock:
+        if _usage_gen.get(user, 0) == gen:
+            # 扫描期间没有增删记账（或记账在扫描开始前就已完成）→ 结果可直接采纳
+            _usage[user] = total
+            _usage_ts[user] = started
+            return total
+        # 扫描期间有增删：以增量维护的缓存值为准（它反映的是更新的状态）
+        return _usage.get(user, 0)
+
+
+def quota_adjust(user: str, delta: int) -> None:
+    """内部记账：把用户的已用字节数增加/减少 delta（供上传、PUT、删除调用）。
+
+    只在缓存有效时更新；缓存不存在或已过期就什么都不做 —— 下一次 quota_used()
+    会全量重扫，本来就能拿到包含本次改动在内的真值，不会算错。
+    并发覆盖写同一个文件时，两个请求各自读到的“旧大小”可能都不包含对方，会短暂多计
+    （方向是更保守，不会放行超额写入）；_USAGE_TTL 后的全量重扫会自动纠正。
+    """
+    if not delta:
+        return
+    try:
+        user_home(user)
+    except ValueError:
+        return
+    with _usage_lock:
+        ts = _usage_ts.get(user)
+        if ts is None or time.monotonic() - ts >= _USAGE_TTL:
+            return
+        _usage[user] = max(0, _usage.get(user, 0) + delta)
+        _usage_gen[user] = _usage_gen.get(user, 0) + 1
 
 
 def create_folder(user: str, rel: str, name: str) -> (bool, str):
@@ -557,7 +628,7 @@ def _parse_multipart(rfile, content_length, boundary, on_headers, on_body,
 
 # ---------- 上传/下载/删除 ----------
 def _receive(rfile, content_length, boundary, target_dir, limit, user_root=False,
-             on_quota_exceeded=None):
+             on_quota_exceeded=None, user=None):
     """流式接收一个 multipart 请求并保存第一个文件 part。
 
     返回 (True, "上传成功") 或 (False, 中文原因)；任何失败路径都清理临时文件。
@@ -565,6 +636,7 @@ def _receive(rfile, content_length, boundary, target_dir, limit, user_root=False
     "通用文件" 目录同名的文件（该文件将无法通过 resolve 下载，造成死文件）。
     on_quota_exceeded：配额超限时先回调（调用方用来把错误响应发出去，避免浏览器
     只看到 TCP RST）。
+    user：所属用户（用于上传成功后增量更新配额计数）；None 表示不计（通用文件）。
     """
     tmp_dir = os.path.join(_CLOUD_ROOT, TMP_DIR_NAME)
     os.makedirs(tmp_dir, exist_ok=True)
@@ -603,7 +675,15 @@ def _receive(rfile, content_length, boundary, target_dir, limit, user_root=False
         if user_root and state["saved_name"] == VIRTUAL_COMMON:
             return False, "文件名与内置“通用文件”目录冲突"
         target = os.path.join(target_dir, state["saved_name"])
+        old_size = 0
+        if user is not None:
+            try:
+                old_size = os.path.getsize(target)   # 覆盖同名文件时先记下旧大小
+            except OSError:
+                old_size = 0
         os.replace(tmp_path, target)
+        if user is not None:
+            quota_adjust(user, written[0] - old_size)   # 增量维护配额计数
     except _QuotaExceeded:
         return False, "超出配额"
     except ValueError as e:
@@ -652,7 +732,7 @@ def save_upload(user: str, rel: str, rfile, content_length: int, content_type: s
         return False, "配额参数不合法"
     return _receive(rfile, content_length, boundary, target_dir, quota_remaining,
                     user_root=rel in ("", ".", None),
-                    on_quota_exceeded=on_quota_exceeded)
+                    on_quota_exceeded=on_quota_exceeded, user=user)
 
 
 def save_common_upload(rfile, content_length: int, content_type: str,
@@ -724,9 +804,14 @@ def delete_file(user: str, rel: str) -> (bool, str):
     if not _inside(real, os.path.realpath(base)):
         return False, "路径不合法"
     try:
+        size = os.stat(norm, follow_symlinks=False).st_size
+    except OSError:
+        size = 0
+    try:
         os.unlink(norm)
     except OSError as e:
         return False, "删除失败：%s" % e
+    quota_adjust(user, -size)          # 增量维护配额计数
     return True, "删除成功"
 
 
@@ -753,6 +838,7 @@ def delete_folder(user: str, rel: str) -> (bool, str):
     real = os.path.realpath(norm)
     if not _inside(real, os.path.realpath(base)):
         return False, "路径不合法"
+    freed = _tree_size(norm)           # 删之前先算这份子树占了多少（与配额统计口径一致）
     try:
         if _RMTREE_NOFOLLOW_KW:
             shutil.rmtree(norm, **{_RMTREE_NOFOLLOW_KW: False})
@@ -760,4 +846,5 @@ def delete_folder(user: str, rel: str) -> (bool, str):
             shutil.rmtree(norm)  # Python 3.12：fd 安全实现本身不跟随符号链接
     except OSError as e:
         return False, "删除失败：%s" % e
+    quota_adjust(user, -freed)         # 增量维护配额计数
     return True, "删除成功"

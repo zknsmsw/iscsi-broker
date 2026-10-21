@@ -547,28 +547,67 @@ def init_cleanup():
             pass
     print(f"[{datetime.datetime.now()}] [INIT] Cleanup done.")
 
-def parse_idle_tids():
-    """解析 tgtadm 输出，返回 {tid: mac} 的字典，仅包含当前没有任何 I_T nexus（无客户端连接）的 target"""
-    try:
-        out = subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "show"],
-                             capture_output=True, text=True, timeout=5)
-    except Exception:
-        return {}
+def tgt_show():
+    """执行一次 `tgtadm --op show` 并返回 stdout；失败返回 None。
 
-    idle = {}
+    巡检/后台页面需要的都是同一份 target 列表，老实现为此在同一次循环里反复起
+    tgtadm 子进程（每次几十毫秒）。这里把「取输出」和「解析输出」分开，调用方可以
+    一次取、一次解析出全部信息（见 tgt_snapshot）。
+    """
+    try:
+        return subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "show"],
+                              capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return None
+
+def _parse_tgt_show(text):
+    """解析 tgtadm --op show 的输出，返回 (idle, active, conn, tids)。
+
+    idle   : {tid: mac}  当前没有任何 I_T nexus（无客户端连接）的 target
+    active : set(tid)    当前**有** I_T nexus（有客户机连着）的 tid
+    conn   : {mac: ip}   有 I_T nexus 的客户机及其 IP（解析不到 IP 时为 "?"）
+    tids   : set(tid)    tgtadm 里存在的全部 target 的 tid
+    前三者与老版本 parse_idle_tids / parse_active_nexus_tids / get_client_ips 的口径
+    完全一致，区别只在于共用同一次命令输出。无法识别的行一律忽略。
+    """
+    idle, conn = {}, {}
+    active, tids = set(), set()
     # 按 "Target N: iqn..." 切分成每个 target 的文本块
-    blocks = re.split(r"(?=^Target \d+: )", out.stdout, flags=re.MULTILINE)
-    for block in blocks:
-        m = re.match(r"Target (\d+): iqn\.[\d.\-]+\.storage:([0-9a-f]+)", block)
+    for block in re.split(r"(?=^Target \d+: )", text or "", flags=re.MULTILINE):
+        m = re.match(r"Target (\d+): ", block)
         if not m:
             continue
-        tid, mac = m.group(1), m.group(2)
+        tid = m.group(1)
+        tids.add(tid)
         # 截取 "I_T nexus information:" 到 "LUN information:" 之间的内容
         nexus_section = re.search(r"I_T nexus information:(.*?)LUN information:", block, re.DOTALL)
         nexus_text = nexus_section.group(1) if nexus_section else ""
-        if "I_T nexus:" not in nexus_text:
-            idle[tid] = mac
-    return idle
+        # mac 取自 IQN：iqn.<date>.storage:<12位hex>（只有这种 target 才是本程序的客户机）
+        iqn_m = re.match(r"Target \d+: iqn\.[\d.\-]+\.storage:([0-9a-f]+)", block)
+        if "I_T nexus:" in nexus_text:
+            active.add(tid)
+            if iqn_m:
+                ipm = re.search(r"IP Address: ([\d\.]+)", nexus_text)
+                conn[iqn_m.group(1)] = ipm.group(1) if ipm else "?"
+        elif iqn_m:
+            idle[tid] = iqn_m.group(1)
+    return idle, active, conn, tids
+
+def tgt_snapshot():
+    """一次 tgtadm 查询拿到 (idle, active, conn, tids)；查询失败返回 None。
+
+    巡检线程每轮只需要一份 tgt 状态：老实现分别调用 parse_idle_tids()、
+    parse_active_nexus_tids()、get_client_ips()（各起一次 tgtadm 子进程），现在合并成一次。
+    """
+    text = tgt_show()
+    if text is None:
+        return None
+    return _parse_tgt_show(text)
+
+def parse_idle_tids():
+    """返回 {tid: mac}，仅包含当前没有任何 I_T nexus（无客户端连接）的 target。"""
+    out = tgt_show()
+    return _parse_tgt_show(out)[0] if out is not None else {}
 
 def parse_active_nexus_tids():
     """返回当前**有** I_T nexus（有客户机连着）的 tid 集合（尽力而为）。
@@ -576,48 +615,13 @@ def parse_active_nexus_tids():
     与 parse_idle_tids 互补：本函数只看“还在连的”，用于判断某个 target 现在到底
     有没有人在用（回写占用是否该继续保留）。tgtadm 查询失败时返回空集合。
     """
-    tids = set()
-    try:
-        out = subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "show"],
-                             capture_output=True, text=True, timeout=5).stdout
-    except Exception:
-        return tids
-    for block in re.split(r"(?=^Target \d+: )", out, flags=re.MULTILINE):
-        m = re.match(r"Target (\d+): ", block)
-        if not m:
-            continue
-        nexus_section = re.search(r"I_T nexus information:(.*?)LUN information:", block, re.DOTALL)
-        if nexus_section and "I_T nexus:" in nexus_section.group(1):
-            tids.add(m.group(1))
-    return tids
-
-def target_exists(tid):
-    """tgtadm 里是否还存在该 tid 的 target。查询失败时返回 True（保守：不确定就别当它不存在）。"""
-    try:
-        out = subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "show"],
-                             capture_output=True, text=True, timeout=5).stdout
-    except Exception:
-        return True
-    return re.search(r"^Target %d: " % int(tid), out, re.MULTILINE) is not None
+    out = tgt_show()
+    return _parse_tgt_show(out)[1] if out is not None else set()
 
 def get_client_ips():
     """返回 {mac: ip}：tgt 当前有 I_T nexus 的客户机（尽力而为）。"""
-    conn = {}
-    try:
-        out = subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target", "--op", "show"],
-                             capture_output=True, text=True, timeout=5).stdout
-        blocks = re.split(r"(?=^Target \d+: )", out, flags=re.MULTILINE)
-        for block in blocks:
-            m = re.match(r"Target \d+: iqn\.[\d.\-]+\.storage:([0-9a-f]+)", block)
-            if not m:
-                continue
-            nexus = re.search(r"I_T nexus information:(.*?)LUN information:", block, re.DOTALL)
-            if nexus and "I_T nexus:" in nexus.group(1):
-                ipm = re.search(r"IP Address: ([\d\.]+)", nexus.group(1))
-                conn[m.group(1)] = ipm.group(1) if ipm else "?"
-    except Exception:
-        pass
-    return conn
+    out = tgt_show()
+    return _parse_tgt_show(out)[2] if out is not None else {}
 
 def _ss_peer_host(field):
     """解析 ss 的连接端字段（Peer Address:Port）-> 主机字符串；无法识别返回 ""。
@@ -749,7 +753,7 @@ def release_writeback_lock(img_name, reason):
           f"target tid={stable_tid(owner)} removed so the client cannot reconnect to the base image")
     return owner
 
-def writeback_lock_stale(img_name, owner, no_nexus_since):
+def writeback_lock_stale(img_name, owner, no_nexus_since, snapshot=None):
     """回写占用是否已过期可解除。返回 (可解除, 原因)。
 
     判据是“还有没有人在写这张母盘”，也就是 iSCSI 会话（I_T nexus）：
@@ -759,6 +763,9 @@ def writeback_lock_stale(img_name, owner, no_nexus_since):
       - 有 nexus 或还在宽限期内 -> 不能解除（临时掉线要留时间重连）。
 
     no_nexus_since：本 target 首次被观测到“没有 I_T nexus”的时间戳（由巡检维护）。
+    snapshot：已取好的 tgt_snapshot() 结果（巡检每轮只查一次 tgtadm）；None 表示
+    自己查一次。查询失败时与老代码一致：会话按空集合处理，但“target 是否存在”按
+    保守值 True（不确定就不当成幽灵占用）。
     """
     if not owner or not no_nexus_since:
         return False, ""
@@ -768,7 +775,14 @@ def writeback_lock_stale(img_name, owner, no_nexus_since):
     age = time.time() - no_nexus_since
     if age < WRITEBACK_LOCK_GRACE:
         return False, ""
-    if not parse_active_nexus_tids() and not target_exists(stable_tid(owner)):
+    if snapshot is None:
+        snapshot = tgt_snapshot()
+    if snapshot is None:
+        active, target_known_missing = set(), False   # 查不到 tgt 状态：保守处理
+    else:
+        active = snapshot[1]
+        target_known_missing = str(stable_tid(owner)) not in snapshot[3]
+    if not active and target_known_missing:
         return True, f"占用者 {owner} 既无在线 iSCSI 会话、target 也不存在，持续 {int(age)}s"
     return True, f"{owner} 已无 I_T nexus 持续 {int(age)}s（会话已结束）"
 
@@ -786,10 +800,16 @@ def idle_cleanup_worker():
         try:
             now_ts = time.time()
 
+            # 每轮只查一次 tgtadm：三个通道都要用同一份 target 列表（会话集合、空闲靶盘、
+            # 客户机 IP）。老实现为每个通道各起一次 tgtadm 子进程，纯属重复开销。
+            # 查询失败时 ret=None，三个通道都按“空集合”处理，与老代码逐次查询失败的语义一致。
+            ret = tgt_snapshot()
+            active, idle_now, conn = (ret[1], ret[0], ret[2]) if ret is not None \
+                else (set(), {}, {})
+
             # ---- 通道 0：回写占用只活在会话期间 ----
             # 母盘正被回写时，只要发起端断开（关机/重启/拔电/重连失败），就尽快放开占用，
             # 不能让一台已经关机的机器把母盘锁到 IDLE_TIMEOUT_SECONDS 甚至更久。
-            active = parse_active_nexus_tids()
             with global_lock:
                 wb_now = dict(writeback_active)
             for img_name, owner in wb_now.items():
@@ -801,7 +821,8 @@ def idle_cleanup_worker():
                 if tid not in wb_no_nexus_since:
                     wb_no_nexus_since[tid] = now_ts    # 本通道语义：target 无 nexus 的起点
                     continue
-                ok, why = writeback_lock_stale(img_name, owner, wb_no_nexus_since.get(tid))
+                ok, why = writeback_lock_stale(img_name, owner, wb_no_nexus_since.get(tid),
+                                               snapshot=ret)
                 if ok:
                     release_writeback_lock(img_name, why)
                     wb_no_nexus_since.pop(tid, None)
@@ -813,7 +834,6 @@ def idle_cleanup_worker():
                     wb_no_nexus_since.pop(tid, None)
 
             # ---- 通道 1：正常 logout（nexus 消失）后的空闲清理 ----
-            idle_now = parse_idle_tids()
             for tid in list(idle_since.keys()):
                 if tid not in idle_now:
                     idle_since.pop(tid, None)
@@ -828,8 +848,8 @@ def idle_cleanup_worker():
                 no_traffic_since.pop(mac, None)
 
             # ---- 通道 2：无流量检测（客户机不主动断开时的关机/断电识别）----
-            conn = get_client_ips()
-            ages = parse_3260_lastrcv()   # {ip: 距最后收包秒数}
+            # 没有任何客户机登记时不必起 ss 子进程（空列表下面这个循环本来也不做任何事）。
+            ages = parse_3260_lastrcv() if mac_state else {}   # {ip: 距最后收包秒数}
             for mac in list(mac_state.keys()):
                 ip = conn.get(mac)
                 if not ip or ip not in ages:
@@ -1058,9 +1078,14 @@ def _overlay_img(mac, overlay):
             base = base[:-len(suf)]
     return base
 
-def collect_client_info():
-    """汇总客户机信息供 Web 后台展示：mac_state 内存记录 + tgtadm 在线连接（尽力而为）。"""
-    conn = get_client_ips()  # mac -> ip（tgtadm 当前有 I_T nexus 的在线客户机）
+def collect_client_info(conn=None):
+    """汇总客户机信息供 Web 后台展示：mac_state 内存记录 + tgtadm 在线连接（尽力而为）。
+
+    conn：已取好的 {mac: ip}（后台页面同时要展示回写占用状态，可以传进来复用，
+    避免一次页面渲染起两次 tgtadm 子进程）；None 表示自己查一次。
+    """
+    if conn is None:
+        conn = get_client_ips()  # mac -> ip（tgtadm 当前有 I_T nexus 的在线客户机）
     rows = []
     for mac, st in sorted(mac_state.items()):
         img, mode = "", ""
@@ -1161,7 +1186,24 @@ def export_image_unmount(img_name):
     print(f"[{now}] [SUCCESS] Manual iSCSI export removed: {rec['iqn']} (tid={rec['tid']})")
     return True, f"已卸载：{rec['iqn']}"
 
+class _BrokerHTTPServer(ThreadingHTTPServer):
+    """两个 HTTP 服务共用的 TCP 参数。
+
+    - request_queue_size：socketserver 默认监听队列只有 5。几十台客户机同时 PXE/iPXE
+      开机（或多人同时刷新后台）时 accept 队列会溢出、连接被内核丢弃，表现为“偶尔打不开
+      需要重试”。放宽到 128，把瞬时并发吃下来。
+    - daemon_threads：连接线程不阻塞进程退出（服务本来就是常驻的）。
+    """
+    daemon_threads = True
+    request_queue_size = 128
+    allow_reuse_address = True
+
+
 class Handler(BaseHTTPRequestHandler):
+    # 响应头和正文分两次写出，Nagle + 延迟 ACK 会给每个响应平白加约 40ms。
+    # 关掉 Nagle（TCP_NODELAY）对 iPXE 菜单/脚本这种小响应是明显的手感提升。
+    disable_nagle_algorithm = True
+
     def log_message(self, format, *args): return
 
     def _scheme(self):
@@ -1476,20 +1518,13 @@ class Handler(BaseHTTPRequestHandler):
                 if owner not in (None, mac):
                     # 占用者若已经没有 iSCSI 会话（关机/拔电/掉线没重连），把它当过期占用夺过来，
                     # 否则一台关机的机器能把这个母盘锁很久。判据只看 tgtadm：该 MAC 的 target
-                    # 当前没有 I_T nexus（get_client_ips() 就是从 tgtadm 输出里解析 nexus 的），
+                    # 当前没有 I_T nexus（conn 就是从 tgtadm 输出里解析 nexus 的），
                     # 与巡检 writeback_lock_stale() 的口径一致——母盘在“有没有人在写”这件事上
                     # 只取决于会话。
-                    # 额外要求 tgtadm show 本身返回成功：get_client_ips() 查询失败时也会返回空
-                    # 字典，那种“查不到”不能当成“没有会话”，否则 tgt 抽风时会误抢别人的锁。
-                    stale = False
-                    try:
-                        shown = subprocess.run(["tgtadm", "--lld", "iscsi", "--mode", "target",
-                                                "--op", "show"],
-                                               capture_output=True, text=True, timeout=5)
-                        if shown.returncode == 0 and owner not in get_client_ips():
-                            stale = True
-                    except Exception:
-                        stale = False
+                    # 额外要求 tgtadm show 本身返回成功：查询失败时 conn 也是空字典，
+                    # 那种“查不到”不能当成“没有会话”，否则 tgt 抽风时会误抢别人的锁。
+                    snap = tgt_snapshot()   # 一次 tgtadm 查询即可（老实现查了两次）
+                    stale = snap is not None and owner not in snap[2]
                     if stale:
                         print(f"[{datetime.datetime.now()}] [CLEANUP] write-back lock taken over from "
                               f"{owner} (no active iSCSI session) by {mac} for {img_name}")
@@ -1653,6 +1688,10 @@ class Handler(BaseHTTPRequestHandler):
 
 class WebAdminHandler(BaseHTTPRequestHandler):
     """简易 Web 管理后台：修改密码 / 创建空白盘 / 查看客户机名单 / 多账号与个人网盘。"""
+
+    # 同 Handler：响应头与正文分两次写，关掉 Nagle 省掉每个响应的延迟 ACK 等待。
+    disable_nagle_algorithm = True
+
     def log_message(self, fmt, *args):
         return  # 静默访问日志
 
@@ -1718,7 +1757,8 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         self._send_html(_page_html("登录 - " + WEB_TITLE, body, None))
 
     def _dashboard(self, msg=None):
-        rows = collect_client_info()
+        conn = get_client_ips()          # 一次 tgtadm 查询：客户机名单和回写占用共用
+        rows = collect_client_info(conn)
         trs = "".join(
             '<tr><td>{mac}</td><td>{img}</td><td>{mode}</td><td>{st}</td><td>{ip}</td>'
             '<td class="small">{detail}</td></tr>'.format(
@@ -1728,7 +1768,6 @@ class WebAdminHandler(BaseHTTPRequestHandler):
             for r in rows) or '<tr><td colspan="6">暂无客户机记录</td></tr>'
         # 回写占用：标明占用者现在还有没有 iSCSI 会话（没有=占用已过期，巡检会自动解除），
         # 并给管理员一个手动解除的兜底按钮（客户机拔电/状态卡住时不用等巡检）。
-        conn = get_client_ips()
         wb_lines = []
         for img_name, owner in sorted(writeback_active.items()):
             live = owner in conn
@@ -2336,7 +2375,11 @@ class WebAdminHandler(BaseHTTPRequestHandler):
                                + urllib.parse.quote(msg, safe="")))
 
     def _send_file(self, path, notfound_html):
-        """以 64KB 分块发送本地文件；path 为 None/不存在时返回 notfound_html 页面。"""
+        """以 1MiB 分块发送本地文件；path 为 None/不存在时返回 notfound_html 页面。
+
+        分块从 64KiB 提到 1MiB：wfile 是无缓冲的，每块就是一次 send() 系统调用，
+        下载大文件时能少一个数量级的系统调用（WebDAV 的 GET 同理）。
+        """
         if path is None or not os.path.isfile(path):
             self._send_html(notfound_html)
             return
@@ -2353,13 +2396,14 @@ class WebAdminHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition",
                          'attachment; filename="' + enc + '"; filename*=UTF-8\'\'' + enc)
         self.end_headers()
+        write = self.wfile.write
         try:
-            with open(path, "rb") as f:
+            with open(path, "rb", buffering=0) as f:
                 while True:
-                    chunk = f.read(64 * 1024)
+                    chunk = f.read(1024 * 1024)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
+                    write(chunk)
         except Exception:
             pass  # 客户端提前断开等，忽略
 
@@ -2656,7 +2700,7 @@ if __name__ == "__main__":
     threading.Thread(target=idle_cleanup_worker, daemon=True).start()
     web_srv = None
     if WEB_ENABLED:
-        web_srv = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), WebAdminHandler)
+        web_srv = _BrokerHTTPServer(("0.0.0.0", WEB_PORT), WebAdminHandler)
         _maybe_wrap_tls(web_srv)
         threading.Thread(target=web_srv.serve_forever, daemon=True).start()
     mode_name = "reflink (直出 raw，无 qemu)" if USE_REFLINK else "qcow2 (回退叠加盘)"
@@ -2664,6 +2708,6 @@ if __name__ == "__main__":
     if web_srv:
         log_scheme = "https" if HTTPS_ENABLED else "http"
         print(f"[{datetime.datetime.now()}] [START] Web admin: {log_scheme}://0.0.0.0:{WEB_PORT}/  (password file: {ADMIN_PASS_FILE})")
-    main_srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    main_srv = _BrokerHTTPServer(("0.0.0.0", PORT), Handler)
     _maybe_wrap_tls(main_srv)
     main_srv.serve_forever()

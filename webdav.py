@@ -133,13 +133,21 @@ def _send_dav_error(handler, code, msg=""):
 
 
 # ---------- 属性（PROPFIND 用） ----------
-def _prop_xml(rel, path, is_dir):
-    """一个 <D:response> 内的属性集合。"""
-    try:
-        st = os.stat(path)
-        mtime, size = st.st_mtime, (0 if is_dir else st.st_size)
-    except OSError:
+def _prop_xml(rel, path, is_dir, st=None):
+    """一个 <D:response> 内的属性集合。
+
+    st：已经取到的 stat 结果（PROPFIND 列目录时由 scandir 顺手带上，省掉每项一次
+    os.stat 路径解析）；None 表示自己 stat 一次。
+    """
+    if st is None:
+        try:
+            st = os.stat(path)
+        except OSError:
+            st = None
+    if st is None:
         mtime, size = 0, 0
+    else:
+        mtime, size = st.st_mtime, (0 if is_dir else st.st_size)
     name = rel.rsplit("/", 1)[-1] if rel else ""
     props = [
         '<D:displayname>%s</D:displayname>' % _xml_escape(name),
@@ -163,8 +171,10 @@ def _prop_xml(rel, path, is_dir):
 
 
 def _list_children(user, rel):
-    """列出目录下的直接子项（跳过符号链接），返回 [(rel, path, is_dir)]。
+    """列出目录下的直接子项（跳过符号链接），返回 [(rel, path, is_dir, stat)]。
 
+    stat 由 scandir 的 DirEntry 顺手取（Windows 上列表时内核本就返回了这些信息），
+    让 PROPFIND 不必再对每个子项重新 os.stat 一遍。
     登录用户在根目录会额外看到只读的“通用文件”目录（与网页版网盘一致）。
     """
     out = []
@@ -181,15 +191,20 @@ def _list_children(user, rel):
                 is_dir = entry.is_dir(follow_symlinks=False)
                 if not is_dir and not entry.is_file(follow_symlinks=False):
                     continue          # 跳过符号链接等特殊项
+                st = entry.stat(follow_symlinks=False)
             except OSError:
                 continue
             crel = entry.name if not rel else rel + "/" + entry.name
-            out.append((crel, entry.path, is_dir))
+            out.append((crel, entry.path, is_dir, st))
     # 登录用户（rel 为空）的根目录里塞一个只读“通用文件”
     if rel == "":
         cpath = cloud_store.resolve(user, COMMON)
         if cpath and os.path.isdir(cpath):
-            out.insert(0, (COMMON, cpath, True))
+            try:
+                cst = os.stat(cpath)
+            except OSError:
+                cst = None
+            out.insert(0, (COMMON, cpath, True, cst))
     out.sort(key=lambda t: (not t[2], t[0]))
     return out
 
@@ -215,8 +230,8 @@ def _do_propfind(handler, user, rel):
     is_dir = os.path.isdir(path)
     items = [_prop_xml(rel, path, is_dir)]
     if is_dir and depth != "0":          # Depth: infinity 也按 1 层处理（够 Windows 用）
-        for crel, cpath, cdir in _list_children(user, rel):
-            items.append(_prop_xml(crel, cpath, cdir))
+        for crel, cpath, cdir, cst in _list_children(user, rel):
+            items.append(_prop_xml(crel, cpath, cdir, cst))
     body = (_XML_HEADER + '<D:multistatus xmlns:D="DAV:">' + "".join(items) + '</D:multistatus>')
     _resp(handler, 207, body, "application/xml; charset=utf-8")
 
@@ -251,7 +266,7 @@ def _do_get(handler, user, rel, head=False):
             _resp(handler, 301, b"", None, {"Location": _quote(rel, True)})
             return
         rows = "".join('<li><a href="%s">%s</a></li>' % (_quote(cr, cd), _xml_escape(os.path.basename(cr)))
-                       for cr, _p, cd in _list_children(user, rel))
+                       for cr, _p, cd, _st in _list_children(user, rel))
         _resp(handler, 200, "<html><body><ul>%s</ul></body></html>" % rows,
               "text/html; charset=utf-8")
         return
@@ -279,13 +294,14 @@ def _do_get(handler, user, rel, head=False):
         handler.send_header(k, v)
     handler.end_headers()
     remaining = end - start + 1
-    with open(path, "rb") as f:
+    with open(path, "rb", buffering=0) as f:
         f.seek(start)
+        write = handler.wfile.write
         while remaining > 0:
-            chunk = f.read(min(256 * 1024, remaining))
+            chunk = f.read(min(1024 * 1024, remaining))
             if not chunk:
                 break
-            handler.wfile.write(chunk)
+            write(chunk)
             remaining -= len(chunk)
 
 
@@ -331,8 +347,9 @@ def _do_put(handler, user, rel):
         return
     # 配额：已用 + 本次（覆盖写时先扣除旧文件大小）
     quota = users_auth.quota_of(user)
+    existed = os.path.isfile(target)
+    old = os.path.getsize(target) if existed else 0
     if quota > 0:
-        old = os.path.getsize(target) if os.path.isfile(target) else 0
         if cloud_store.quota_used(user) - old + length > quota:
             handler.close_connection = True
             try:
@@ -341,7 +358,6 @@ def _do_put(handler, user, rel):
                 pass
             _send_dav_error(handler, 507, "配额不足")
             return
-    existed = os.path.isfile(target)
     # 临时文件必须是唯一名：老代码用固定名 target + ".davtmp"，并发写同一路径会互相
     # 覆盖，失败残留在用户目录里还会被列表/配额统计到。tempfile.mkstemp 在目标目录内
     # 建唯一文件（与 target 同目录，保证 os.replace 是同一文件系统内的原子改名）。
@@ -359,6 +375,7 @@ def _do_put(handler, user, rel):
                 remaining -= len(chunk)
         os.replace(tmp, target)
         tmp = None                      # 已经改名成功，不需要清理
+        cloud_store.quota_adjust(user, length - old)   # 增量维护配额计数（覆盖写按差值算）
     except _Abort as e:
         _cleanup(tmp)
         _send_dav_error(handler, e.code, e.msg)
